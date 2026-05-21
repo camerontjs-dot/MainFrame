@@ -1,0 +1,43 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Personal Working State & Logs
+STATE.md
+01_ingest/ingest-log.md
+
+# Inbox (ignore all personal captures, keep any control files if added later)
+00_inbox/*
+!00_inbox/AGENTS.md
+!00_inbox/index.md
+
+# Ingest Pipelines (ignore files being processed)
+01_ingest/queue/*
+01_ingest/processing/*
+01_ingest/renamed/*
+01_ingest/rejected/*
+
+# Knowledge Domains (ignore personal topics, keep base control files)
+10_knowledge/*
+!10_knowledge/index.md
+!10_knowledge/AGENTS.md
+
+# Live State (ignore personal dashboards and logs, keep base control files)
+20_live/*
+!20_live/index.md
+!20_live/AGENTS.md
+
+# Projects (ignore personal projects, keep base control files)
+30_projects/*
+!30_projects/index.md
+!30_projects/AGENTS.md
+
+# Archive (ignore archived files, keep base control files)
+90_archive/*
+!90_archive/index.md
+!90_archive/AGENTS.md
