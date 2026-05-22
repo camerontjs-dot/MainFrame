@@ -1,4 +1,4 @@
-# Second Brain - Global Operating Contract
+# Mainframe - Global Operating Contract
 
 ## System Purpose
 This system organizes knowledge by its **information lifecycle** first, and topic second. The goal is accurate recall, low-friction capture, and safe updates.

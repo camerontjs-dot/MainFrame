@@ -1,6 +1,6 @@
 # Context Primitives & Metadata
 
-This file defines the basic object types and the required metadata schema for the Second Brain.
+This file defines the basic object types and the required metadata schema for the Mainframe.
 
 ## Simplified Metadata Schema
 For the initial markdown-first phase, we use a simplified YAML frontmatter schema. This prevents manual entry burnout while still providing enough structure for ingestion and routing.

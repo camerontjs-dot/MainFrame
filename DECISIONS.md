@@ -12,9 +12,9 @@ This file captures meaningful project choices, especially trade-offs affecting r
 ## ADR-002: MindGraph Integration Strategy
 **Status**: Accepted
 **Date**: 2026-05-20
-**Context**: Should the MindGraph GraphRAG system be deeply coupled into the Second Brain ingest pipeline?
-**Decision**: MindGraph will remain a separate project and will be wired in as a complementary RAG feature. The Second Brain will have its own ingest pipeline, but will use the same tracking/metadata schema so MindGraph can index it effectively.
-**Rationale**: Keeps the Second Brain ingestion simple and markdown-first, separating the graph database concerns from the file organization concerns.
+**Context**: Should the MindGraph GraphRAG system be deeply coupled into the Mainframe ingest pipeline?
+**Decision**: MindGraph will remain a separate project and will be wired in as a complementary RAG feature. The Mainframe will have its own ingest pipeline, but will use the same tracking/metadata schema so MindGraph can index it effectively.
+**Rationale**: Keeps the Mainframe ingestion simple and markdown-first, separating the graph database concerns from the file organization concerns.
 
 ## ADR-003: Automation Tooling for Ingest
 **Status**: Accepted (Deferred)

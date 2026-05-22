@@ -1,6 +1,6 @@
 # Epistemic Stance
 
-This document establishes the claim discipline for the `Second-Brain` portfolio. It dictates how work is described, what counts as support, and when a claim must remain conditional.
+This document establishes the claim discipline for the `Mainframe` portfolio. It dictates how work is described, what counts as support, and when a claim must remain conditional.
 
 ## Core Rules
 
