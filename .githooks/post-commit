@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+LOG_DIR="$ROOT/20_live/workflow-metrics"
+mkdir -p "$LOG_DIR"
+
+nohup "$ROOT/bin/mindgraph-refresh" >>"$LOG_DIR/mindgraph-refresh.log" 2>&1 &

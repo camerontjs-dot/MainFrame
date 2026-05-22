@@ -1,8 +1,5 @@
 # Projects Index
 
-Active work with outcomes.
+Generated from project README metadata. Do not edit by hand; run `bin/sync-project-index --write`.
 
-Every project inside this folder should have:
-- A clear goal.
-- Current state/next actions.
-- Local decisions and raw materials.
+_No project README files found._

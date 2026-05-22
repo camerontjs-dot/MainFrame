@@ -37,6 +37,7 @@ tags: ["sensitivity", "etc"]
 - **Type:** `project`
 - **Location:** `30_projects`
 - **Rule:** Tracks active outcomes. Requires a state, goal, and next action.
+- **README Metadata Extension:** `project_state`, `goal`, `next_action`, and `updated` drive `30_projects/index.md` via `bin/sync-project-index`.
 
 ### 5. Decision
 - **Type:** `decision`

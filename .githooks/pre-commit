@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+git -C "$ROOT" diff --check --cached
+"$ROOT/bin/sync-project-index" --check

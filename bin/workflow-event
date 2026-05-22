@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Append redacted Claude hook event telemetry to 20_live."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DIR = ROOT / "20_live" / "workflow-metrics" / "events"
+TZ = ZoneInfo("America/Toronto")
+
+
+def digest(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def path_class(path_value: object) -> dict[str, str | None]:
+    if not path_value:
+        return {"path_zone": None, "extension": None}
+    try:
+        path = Path(str(path_value)).expanduser()
+        if not path.is_absolute():
+            path = (ROOT / path).resolve()
+        relative = path.relative_to(ROOT)
+        zone = relative.parts[0] if relative.parts else "."
+    except Exception:
+        zone = "external"
+        path = Path(str(path_value))
+    return {"path_zone": zone, "extension": path.suffix or None}
+
+
+def bash_summary(tool_input: dict) -> dict[str, object]:
+    command = str(tool_input.get("command", "")).strip()
+    head = command.split()[0] if command else None
+    return {
+        "command_head": Path(head).name if head else None,
+        "command_hash": digest(command),
+        "timeout": tool_input.get("timeout"),
+        "background": tool_input.get("run_in_background"),
+    }
+
+
+def input_summary(tool_name: str | None, tool_input: dict) -> dict[str, object]:
+    if tool_name == "Bash":
+        return bash_summary(tool_input)
+    if tool_name in {"Read", "Edit", "Write", "MultiEdit"}:
+        return path_class(tool_input.get("file_path"))
+    if tool_name in {"Glob", "Grep"}:
+        summary = path_class(tool_input.get("path"))
+        summary["pattern_hash"] = digest(tool_input.get("pattern"))
+        summary["glob_hash"] = digest(tool_input.get("glob"))
+        return summary
+    if tool_name:
+        return {"input_hash": digest(json.dumps(tool_input, sort_keys=True, default=str))}
+    return {}
+
+
+def safe_event(raw: dict) -> dict[str, object]:
+    now = datetime.now(TZ)
+    tool_name = raw.get("tool_name")
+    tool_input = raw.get("tool_input") if isinstance(raw.get("tool_input"), dict) else {}
+    event = {
+        "logged_at": now.isoformat(timespec="seconds"),
+        "as_of": now.date().isoformat(),
+        "event": raw.get("hook_event_name"),
+        "session_hash": digest(raw.get("session_id")),
+        "transcript_hash": digest(raw.get("transcript_path")),
+        "cwd_zone": path_class(raw.get("cwd")).get("path_zone"),
+        "permission_mode": raw.get("permission_mode"),
+        "effort": (raw.get("effort") or {}).get("level")
+        if isinstance(raw.get("effort"), dict)
+        else None,
+        "tool_name": tool_name,
+        "tool_use_hash": digest(raw.get("tool_use_id")),
+        "duration_ms": raw.get("duration_ms"),
+        "input_summary": input_summary(tool_name, tool_input),
+    }
+    if raw.get("hook_event_name") == "PostToolUseFailure":
+        event["success"] = False
+    elif raw.get("hook_event_name") == "PostToolUse":
+        event["success"] = True
+    return event
+
+
+def main() -> int:
+    if any(arg in {"--help", "-h"} for arg in sys.argv[1:]):
+        print("Read Claude hook JSON from stdin and append redacted JSONL telemetry.")
+        return 0
+
+    try:
+        payload = sys.stdin.read()
+        if not payload.strip():
+            return 0
+        raw = json.loads(payload)
+        out_dir = Path(os.environ.get("WORKFLOW_METRICS_DIR", DEFAULT_DIR))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        event = safe_event(raw)
+        log_path = out_dir / f"{event['as_of']}.jsonl"
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    except Exception as exc:
+        print(f"workflow-event telemetry skipped: {exc}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

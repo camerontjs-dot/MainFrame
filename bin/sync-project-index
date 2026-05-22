@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Generate or check 30_projects/index.md from project README metadata."""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import re
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS_DIR = ROOT / "30_projects"
+INDEX_PATH = PROJECTS_DIR / "index.md"
+
+
+def parse_frontmatter(path: Path) -> dict[str, str]:
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    metadata: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip().strip('"').strip("'")
+        metadata[key.strip()] = value
+    return metadata
+
+
+def first_heading(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^#\s+(.+)$", line)
+        if match:
+            return match.group(1).strip()
+    return path.parent.name
+
+
+def project_rows() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for readme in sorted(PROJECTS_DIR.glob("*/README.md")):
+        metadata = parse_frontmatter(readme)
+        rows.append(
+            {
+                "name": metadata.get("title") or first_heading(readme),
+                "path": readme.parent.name,
+                "state": metadata.get("project_state") or metadata.get("status") or "unknown",
+                "goal": metadata.get("goal") or "",
+                "next_action": metadata.get("next_action") or "",
+                "updated": metadata.get("updated") or metadata.get("last_updated") or "",
+            }
+        )
+    return rows
+
+
+def cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ").strip() or "-"
+
+
+def render() -> str:
+    lines = [
+        "# Projects Index",
+        "",
+        "Generated from project README metadata. Do not edit by hand; run `bin/sync-project-index --write`.",
+        "",
+    ]
+    rows = project_rows()
+    if not rows:
+        lines.extend(["_No project README files found._", ""])
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "| Project | State | Goal | Next action | Updated |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
+    for row in rows:
+        project = f"[{cell(row['name'])}]({cell(row['path'])}/README.md)"
+        lines.append(
+            f"| {project} | {cell(row['state'])} | {cell(row['goal'])} | "
+            f"{cell(row['next_action'])} | {cell(row['updated'])} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--check", action="store_true", help="fail if index is stale")
+    group.add_argument("--write", action="store_true", help="write generated index")
+    args = parser.parse_args()
+
+    generated = render()
+    if args.write:
+        INDEX_PATH.write_text(generated, encoding="utf-8")
+        print(f"wrote {INDEX_PATH.relative_to(ROOT)}")
+        return 0
+
+    current = INDEX_PATH.read_text(encoding="utf-8") if INDEX_PATH.exists() else ""
+    if current != generated:
+        print("30_projects/index.md is stale; run `bin/sync-project-index --write`.", file=sys.stderr)
+        for line in difflib.unified_diff(
+            current.splitlines(),
+            generated.splitlines(),
+            fromfile="current",
+            tofile="generated",
+            lineterm="",
+        ):
+            print(line, file=sys.stderr)
+        return 1
+    print("30_projects/index.md is current")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

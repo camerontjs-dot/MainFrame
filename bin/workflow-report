@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Summarize local workflow telemetry without exposing raw prompts or outputs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections import Counter
+from datetime import date, timedelta
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DIR = ROOT / "20_live" / "workflow-metrics" / "events"
+
+
+def load_events(log_dir: Path, days: int) -> list[dict]:
+    start = date.today() - timedelta(days=days - 1)
+    events: list[dict] = []
+    for path in sorted(log_dir.glob("*.jsonl")):
+        try:
+            if date.fromisoformat(path.stem) < start:
+                continue
+        except ValueError:
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+    return events
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--dir", type=Path, default=DEFAULT_DIR)
+    args = parser.parse_args()
+
+    events = load_events(args.dir, args.days)
+    if not events:
+        print(f"No workflow telemetry found in {args.dir} for the last {args.days} days.")
+        return 0
+
+    by_event = Counter(event.get("event") or "unknown" for event in events)
+    by_tool = Counter(event.get("tool_name") or "none" for event in events)
+    failures = [event for event in events if event.get("success") is False]
+    durations = [
+        (event.get("duration_ms"), event.get("tool_name") or "unknown")
+        for event in events
+        if isinstance(event.get("duration_ms"), (int, float))
+    ]
+    durations.sort(reverse=True)
+
+    print(f"Workflow telemetry summary, last {args.days} days")
+    print(f"Events: {len(events)}")
+    print(f"Sessions: {len({event.get('session_hash') for event in events if event.get('session_hash')})}")
+    print(f"Failures: {len(failures)}")
+    print("")
+    print("Events by type:")
+    for name, count in by_event.most_common():
+        print(f"- {name}: {count}")
+    print("")
+    print("Tool calls:")
+    for name, count in by_tool.most_common(10):
+        print(f"- {name}: {count}")
+    if durations:
+        print("")
+        print("Slowest tool calls:")
+        for duration, name in durations[:10]:
+            print(f"- {name}: {duration} ms")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

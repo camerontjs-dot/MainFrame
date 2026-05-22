@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+SCOPE="${MAINFRAME_MINDGRAPH_SCOPE:-$ROOT/10_knowledge}"
+DB_PATH="${MINDGRAPH_DB_PATH:-$HOME/.mindgraph/mainframe.sqlite}"
+DRY_RUN=0
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN=1
+fi
+
+if [[ ! -d "$SCOPE" ]]; then
+  echo "MindGraph ingest scope does not exist: $SCOPE" >&2
+  exit 1
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "DB: $DB_PATH"
+  echo "Scope: $SCOPE"
+  echo "Commands:"
+  echo "  $ROOT/bin/mindgraph init"
+  echo "  $ROOT/bin/mindgraph ingest \"$SCOPE\""
+  exit 0
+fi
+
+mkdir -p "$(dirname "$DB_PATH")"
+
+if [[ ! -f "$DB_PATH" ]]; then
+  "$ROOT/bin/mindgraph" init
+fi
+
+"$ROOT/bin/mindgraph" ingest "$SCOPE"

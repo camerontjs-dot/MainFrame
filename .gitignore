@@ -7,9 +7,23 @@
 ehthumbs.db
 Thumbs.db
 
+# Python generated files
+__pycache__/
+*.pyc
+
 # Personal Working State & Logs
 STATE.md
 01_ingest/ingest-log.md
+
+# Local tool configuration and generated telemetry
+.mcp.json
+.claude/settings.local.json
+20_live/workflow-metrics/
+
+# Local databases
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # Inbox (ignore all personal captures, keep any control files if added later)
 00_inbox/*

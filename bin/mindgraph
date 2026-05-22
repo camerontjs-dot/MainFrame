@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MINDGRAPH_BIN="${MINDGRAPH_BIN:-}"
+DB_PATH="${MINDGRAPH_DB_PATH:-$HOME/.mindgraph/mainframe.sqlite}"
+
+if [[ -z "$MINDGRAPH_BIN" ]]; then
+  MINDGRAPH_BIN="$(git config --get mainframe.mindgraphBin 2>/dev/null || true)"
+fi
+
+if [[ -z "$MINDGRAPH_BIN" ]]; then
+  if command -v mindgraph >/dev/null 2>&1; then
+    MINDGRAPH_BIN="$(command -v mindgraph)"
+  else
+    echo "MindGraph binary not found. Set MINDGRAPH_BIN=/path/to/mindgraph, git config mainframe.mindgraphBin /path/to/mindgraph, or install mindgraph on PATH." >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -x "$MINDGRAPH_BIN" ]]; then
+  echo "MindGraph binary is not executable: $MINDGRAPH_BIN" >&2
+  exit 1
+fi
+
+if [[ $# -eq 0 || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  exec "$MINDGRAPH_BIN" "$@"
+fi
+
+for arg in "$@"; do
+  if [[ "$arg" == "--help" || "$arg" == "-h" || "$arg" == "--db" ]]; then
+    exec "$MINDGRAPH_BIN" "$@"
+  fi
+done
+
+case "$1" in
+  init|ingest|query|neighbors|serve-mcp)
+    mkdir -p "$(dirname "$DB_PATH")"
+    exec "$MINDGRAPH_BIN" "$@" --db "$DB_PATH"
+    ;;
+  *)
+    exec "$MINDGRAPH_BIN" "$@"
+    ;;
+esac
