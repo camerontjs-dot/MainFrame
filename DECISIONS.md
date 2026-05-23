@@ -17,7 +17,7 @@ This file captures meaningful project choices, especially trade-offs affecting r
 **Rationale**: Keeps the Mainframe ingestion simple and markdown-first, separating the graph database concerns from the file organization concerns.
 
 ## ADR-003: Automation Tooling for Ingest
-**Status**: Accepted (Deferred)
+**Status**: Superseded by ADR-007
 **Date**: 2026-05-20
 **Context**: The `01_ingest` pipeline requires metadata validation and graph extraction. Relying entirely on LLMs for this is token-heavy.
 **Decision**: We will plan to create lightweight CLI/bash scripts ("Minions") in a future session to handle deterministic routing.
@@ -43,3 +43,10 @@ This file captures meaningful project choices, especially trade-offs affecting r
 **Context**: We want to improve workflow efficiency over time, including tool-call patterns, without confusing Git hooks with AI-client hooks or leaking sensitive content into logs.
 **Decision**: Git hooks enforce deterministic repository hygiene: project index checks before commit and nonblocking MindGraph refresh after commit. Tool-call telemetry lives in Claude Code hook configuration at `.claude/settings.json`, which calls `bin/workflow-event` for session and tool lifecycle events. Telemetry is metadata-only, append-only, local, and ignored under `20_live/workflow-metrics/`.
 **Rationale**: Git hooks can see repository transitions but not AI tool-call intent or duration. Claude Code hooks can see tool lifecycle metadata, including post-tool timing, so they are the right layer for workflow measurement. Keeping logs redacted and ignored respects the volatility constraints of `20_live`.
+
+## ADR-007: Deterministic Ingest Minion V1
+**Status**: Accepted
+**Date**: 2026-05-23
+**Context**: Files captured in `00_inbox/` need deterministic staging, metadata validation, routing, and raw-evidence stub generation without spending LLM tokens on repeatable work.
+**Decision**: Mainframe will use `bin/ingest-minion` as a manual, dry-run-first CLI for the v1 ingest path. The script stages files through `01_ingest/queue/`, validates Markdown against the approved metadata schema, routes `note` and `raw` Markdown into existing `10_knowledge/<domain>/` directories, and converts convention-named PDFs into immutable raw files plus MindGraph-compatible Markdown stubs.
+**Rationale**: A manual CLI keeps ingest behavior inspectable and low-risk while preserving provenance. Existing knowledge-domain directories act as the whitelist, and MindGraph refresh remains a separate workflow.
