@@ -16,6 +16,11 @@
 ### Changed
 
 - Replaced stale legacy naming in `20_live/AGENTS.md` and `.context/workflows/session-open.md` so guidance refers to the current Mainframe primitives.
+- Reframed the README MindGraph section to make the paired-but-separate-repo relationship with MindGraph explicit.
+
+### Security
+
+- Hardened `bin/workflow-event` command-head redaction. Leading shell env-var assignments (e.g. `FOO=/tmp/bar cmd`) are skipped and path-shaped heads collapse to `<path>`, so filesystem basenames no longer leak into telemetry. Covered by new `tests/test_workflow_event.py`.
 
 ### Notes
 

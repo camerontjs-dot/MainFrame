@@ -122,8 +122,8 @@ python3 -m unittest tests/test_ingest_minion.py
 
 ## MindGraph boundary
 
-MindGraph is an external retrieval layer for Mainframe. The operating boundary is recorded in ADR-002 and ADR-005 in [DECISIONS.md](DECISIONS.md).
+Mainframe and [MindGraph](https://github.com/<MINDGRAPH_URL>) are paired projects published in separate repositories. Mainframe is the markdown-first workspace; MindGraph is the complementary retrieval engine. They are designed to be used together, but each remains useful on its own and each evolves independently. The operating boundary is recorded in ADR-002 and ADR-005 in [DECISIONS.md](DECISIONS.md).
 
-By default, `bin/mindgraph-refresh` ingests `10_knowledge/` into `~/.mindgraph/mainframe.sqlite`. The wrapper `bin/mindgraph` resolves the real MindGraph binary from `MINDGRAPH_BIN`, `git config mainframe.mindgraphBin`, or `PATH`.
+By default, `bin/mindgraph-refresh` ingests `10_knowledge/` into `~/.mindgraph/mainframe.sqlite`. The wrapper `bin/mindgraph` resolves the real MindGraph binary from `MINDGRAPH_BIN`, `git config mainframe.mindgraphBin`, or `PATH`; the binary itself is built and shipped from the paired MindGraph repository.
 
 Returned chunks are retrieval nominations, not verification. Inspect the underlying note and source evidence before treating a result as true.
