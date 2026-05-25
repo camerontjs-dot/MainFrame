@@ -1,0 +1,23 @@
+# Changelog
+
+## Unreleased
+
+### Added
+
+- `bin/ingest-minion` for dry-run-first routing from `00_inbox/` and `01_ingest/queue/` into existing `10_knowledge/<domain>/` folders.
+- Markdown frontmatter validation against the standard Mainframe metadata keys defined in [.context/primitives.md](.context/primitives.md).
+- Raw PDF handling that preserves the PDF under `10_knowledge/<domain>/raw/` and writes a MindGraph-compatible Markdown stub beside it.
+- Ingest workflow documentation in [.context/workflows/ingest-minion.md](.context/workflows/ingest-minion.md).
+- ADR-007 in [DECISIONS.md](DECISIONS.md) for the deterministic ingest Minion v1 boundary.
+- `unittest` coverage for ingest routing guardrails, including dry runs, missing metadata, unknown domains, raw PDF stubs, and destination collisions.
+- Public `README.md` covering the lifecycle model, metadata schema, deterministic scripts, safe operating rules, and the MindGraph boundary.
+- MIT `LICENSE`.
+
+### Changed
+
+- Replaced stale legacy naming in `20_live/AGENTS.md` and `.context/workflows/session-open.md` so guidance refers to the current Mainframe primitives.
+
+### Notes
+
+- The ingest Minion is manual and deterministic in v1. It does not process `20_live/` state or `30_projects/` records.
+- MindGraph remains a complementary retrieval layer. Raw evidence and markdown files in the lifecycle tree remain the source of truth.
