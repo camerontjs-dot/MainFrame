@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,15 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIR = ROOT / "20_live" / "workflow-metrics" / "events"
 TZ = ZoneInfo("America/Toronto")
+
+# A leading shell token shaped like NAME=value is an inline env assignment
+# (e.g. ``FOO=/tmp/bar cmd``). Skip it when picking the command head so the
+# assignment value does not leak into telemetry.
+ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A safe command head is a plain program name: alphanumerics with the usual
+# punctuation, no slashes, no path separators. Anything outside this shape is
+# collapsed before it is written to disk.
+SAFE_HEAD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 
 def digest(value: object) -> str | None:
@@ -38,11 +48,31 @@ def path_class(path_value: object) -> dict[str, str | None]:
     return {"path_zone": zone, "extension": path.suffix or None}
 
 
+def command_head(command: str) -> str | None:
+    """Pick the bare program name from a shell command line.
+
+    Skips leading env-var assignments (``FOO=/tmp/bar cmd`` -> ``cmd``) so
+    inline assignment values do not leak. Collapses path-shaped heads to
+    ``"<path>"`` and anything else unexpected to ``"<other>"`` so only the
+    shape of the call is recorded, never a filesystem basename.
+    """
+    tokens = command.split()
+    while tokens and ENV_ASSIGNMENT_RE.match(tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    head = tokens[0]
+    if "/" in head:
+        return "<path>"
+    if not SAFE_HEAD_RE.match(head):
+        return "<other>"
+    return head
+
+
 def bash_summary(tool_input: dict) -> dict[str, object]:
     command = str(tool_input.get("command", "")).strip()
-    head = command.split()[0] if command else None
     return {
-        "command_head": Path(head).name if head else None,
+        "command_head": command_head(command) if command else None,
         "command_hash": digest(command),
         "timeout": tool_input.get("timeout"),
         "background": tool_input.get("run_in_background"),
