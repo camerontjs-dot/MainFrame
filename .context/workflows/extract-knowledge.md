@@ -2,6 +2,13 @@
 
 Use this workflow at project closeout or after a repeated pattern becomes clear.
 
+## Script
+- Command: `bin/extract-knowledge`
+- Check mode: `bin/extract-knowledge --project <slug> --domain <domain> --title <title> --check`
+- Write mode: `bin/extract-knowledge --project <slug> --domain <domain> --title <title> --write`
+- Scaffolds a note with correct metadata; knowledge content stays manual
+- Run `bin/mindgraph-refresh` after filling in the note
+
 ## Steps
 1. Review the project `README.md`, `log.md`, `decisions.md`, and final outputs.
 2. Identify reusable practices, failure modes, command patterns, and standards.

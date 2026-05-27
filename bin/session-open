@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Load session context files in a fixed order for progressive disclosure."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class ContextEntry:
+    order: int
+    path: str
+    exists: bool
+    size: int | None
+    note: str
+
+
+@dataclass
+class SessionOpenResult:
+    entries: list[ContextEntry] = field(default_factory=list)
+    project: str | None = None
+    project_source: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        required = {"AGENTS.md", "STATE.md"}
+        found = {e.path for e in self.entries if e.exists}
+        return required.issubset(found)
+
+
+def detect_project_from_state(state_path: Path) -> str | None:
+    if not state_path.exists():
+        return None
+    found_heading = False
+    for line in state_path.read_text(encoding="utf-8").splitlines():
+        if line.strip().lower() == "## active project":
+            found_heading = True
+            continue
+        if found_heading:
+            value = line.strip()
+            if value and not value.startswith("#"):
+                return value
+            if value.startswith("#"):
+                break
+    return None
+
+
+def find_active_phase_plan(plans_dir: Path) -> Path | None:
+    if not plans_dir.is_dir():
+        return None
+    for plan in sorted(plans_dir.glob("*.md")):
+        text = plan.read_text(encoding="utf-8")
+        if not text.startswith("---\n"):
+            continue
+        end = text.find("\n---", 4)
+        if end == -1:
+            continue
+        for fm_line in text[4:end].splitlines():
+            if ":" not in fm_line:
+                continue
+            key, value = fm_line.split(":", 1)
+            if key.strip() == "status" and value.strip().strip('"').strip("'") == "active":
+                return plan
+    return None
+
+
+def entry(order: int, rel: str, root: Path, note: str) -> ContextEntry:
+    full = root / rel
+    exists = full.exists()
+    size = full.stat().st_size if exists else None
+    return ContextEntry(order=order, path=rel, exists=exists, size=size, note=note)
+
+
+def build_context(root: Path, project: str | None = None) -> SessionOpenResult:
+    result = SessionOpenResult()
+
+    if project:
+        result.project = project
+        result.project_source = "flag"
+    else:
+        detected = detect_project_from_state(root / "STATE.md")
+        if detected:
+            result.project = detected
+            result.project_source = "state"
+
+    order = 0
+
+    order += 1
+    result.entries.append(entry(order, "AGENTS.md", root, "root control file"))
+
+    order += 1
+    result.entries.append(entry(order, "STATE.md", root, "workspace state"))
+
+    if result.project:
+        slug = result.project.lower().replace(" ", "-")
+        project_dir = root / "30_projects" / slug
+
+        order += 1
+        readme_rel = f"30_projects/{slug}/README.md"
+        result.entries.append(entry(order, readme_rel, root, "active project"))
+
+        plans_dir = project_dir / "plans"
+        phase_plan = find_active_phase_plan(plans_dir)
+        if phase_plan:
+            order += 1
+            plan_rel = str(phase_plan.relative_to(root))
+            result.entries.append(entry(order, plan_rel, root, "active phase plan"))
+
+    order += 1
+    result.entries.append(
+        ContextEntry(order=order, path="(task-local)", exists=False, size=None,
+                     note="load task-local docs manually when ready")
+    )
+
+    order += 1
+    result.entries.append(
+        ContextEntry(order=order, path="(evidence)", exists=False, size=None,
+                     note="evidence loading deferred")
+    )
+
+    return result
+
+
+def print_result(result: SessionOpenResult, root: Path,
+                 print_contents: bool = False) -> None:
+    if result.project:
+        print(f"project: {result.project} (from {result.project_source})")
+    else:
+        print("project: none")
+    print()
+
+    for e in result.entries:
+        if e.exists:
+            size_str = f"{e.size} bytes" if e.size is not None else ""
+            print(f"  {e.order}. [{size_str:>10}] {e.path}  — {e.note}")
+        elif e.path.startswith("("):
+            print(f"  {e.order}. {'':>12} {e.path}  — {e.note}")
+        else:
+            print(f"  {e.order}. {'[MISSING]':>12} {e.path}  — {e.note}")
+
+    if print_contents:
+        print()
+        for e in result.entries:
+            if not e.exists or e.path.startswith("("):
+                continue
+            full = root / e.path
+            print(f"--- BEGIN {e.path} ---")
+            print(full.read_text(encoding="utf-8"), end="")
+            print(f"--- END {e.path} ---")
+            print()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Load session context files in fixed order."
+    )
+    parser.add_argument("--project", help="project slug under 30_projects/")
+    parser.add_argument("--print-contents", action="store_true",
+                        help="print file contents after the checklist")
+    parser.add_argument("--json", action="store_true",
+                        help="emit structured JSON instead of human text")
+    args = parser.parse_args()
+
+    result = build_context(ROOT, project=args.project)
+
+    if args.json:
+        out = {
+            "ok": result.ok,
+            "project": result.project,
+            "project_source": result.project_source,
+            "entries": [asdict(e) for e in result.entries],
+        }
+        json.dump(out, sys.stdout, indent=2)
+        print()
+    else:
+        print_result(result, ROOT, print_contents=args.print_contents)
+
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

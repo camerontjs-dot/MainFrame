@@ -44,8 +44,11 @@ Architecture and workflow changes belong in [DECISIONS.md](DECISIONS.md). Claim 
 | `bin/sync-project-index` | Generates or checks `30_projects/index.md` from project README metadata. |
 | `bin/mindgraph-refresh` | Refreshes the external MindGraph database from `10_knowledge/`. Supports `--dry-run`. |
 | `bin/workflow-report` | Summarizes redacted local workflow telemetry from ignored `20_live/workflow-metrics/events/`. |
+| `bin/session-open` | Loads session context files in a fixed order. Auto-detects active project from `STATE.md`; supports `--project`, `--print-contents`, and `--json`. |
+| `bin/session-close` | Runs end-of-session checks and triggers downstream scripts. `--check` reports what needs doing; `--apply` runs auto actions. |
+| `bin/extract-knowledge` | Validates prerequisites and scaffolds a knowledge note from a project. `--check` validates; `--write` creates the scaffold. |
 
-The ingest Minion workflow is documented in [.context/workflows/ingest-minion.md](.context/workflows/ingest-minion.md). ADR-007 in [DECISIONS.md](DECISIONS.md) records why v1 is manual, dry-run-first, and limited to deterministic routing.
+The ingest Minion workflow is documented in [.context/workflows/ingest-minion.md](.context/workflows/ingest-minion.md). ADR-007 in [DECISIONS.md](DECISIONS.md) records why v1 is manual, dry-run-first, and limited to deterministic routing. ADR-008 records the session lifecycle scripts boundary.
 
 ## Safe operating rules
 
@@ -114,10 +117,46 @@ Review local workflow telemetry:
 bin/workflow-report --days 7
 ```
 
-Run the ingest Minion unit tests:
+Load session context at the start of a work session:
 
 ```bash
-python3 -m unittest tests/test_ingest_minion.py
+bin/session-open
+```
+
+Load context with file contents for a specific project:
+
+```bash
+bin/session-open --project my-project --print-contents
+```
+
+Check what needs doing before closing a session:
+
+```bash
+bin/session-close --check
+```
+
+Run end-of-session auto actions (index sync, MindGraph refresh, telemetry):
+
+```bash
+bin/session-close --apply
+```
+
+Validate prerequisites for extracting knowledge from a project:
+
+```bash
+bin/extract-knowledge --project my-project --domain ai-systems --title "Lessons from My Project" --check
+```
+
+Scaffold the knowledge note after validation passes:
+
+```bash
+bin/extract-knowledge --project my-project --domain ai-systems --title "Lessons from My Project" --write
+```
+
+Run the full test suite:
+
+```bash
+python3 -m unittest discover -s tests
 ```
 
 ## MindGraph boundary

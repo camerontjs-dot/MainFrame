@@ -2,6 +2,13 @@
 
 A session-close workflow should always update state, write a concise handoff note, record meaningful changes in a log, and identify the exact next reentry point.
 
+## Script
+- Command: `bin/session-close`
+- Check mode: `bin/session-close --check` (report what needs doing, exit 1 if auto actions pending)
+- Apply mode: `bin/session-close --apply` (run auto actions: sync-project-index, mindgraph-refresh, workflow-report)
+- Auto-detect project: reads `## Active Project` from `STATE.md`
+- Manual actions (STATE.md narrative, DECISIONS.md review) are always reminded but never automated
+
 ## Required Actions:
 1. **Update `STATE.md`:** 
    - What changed?

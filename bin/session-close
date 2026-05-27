@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Run deterministic end-of-session checks and downstream script triggers."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Callable
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class CloseAction:
+    name: str
+    kind: str
+    needed: bool
+    reason: str
+    ran: bool = False
+    success: bool | None = None
+
+
+@dataclass
+class SessionCloseResult:
+    actions: list[CloseAction] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return all(
+            a.success is not False
+            for a in self.actions
+            if a.kind == "auto" and a.ran
+        )
+
+
+RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
+
+
+def default_run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd, capture_output=True, text=True, cwd=str(ROOT),
+    )
+
+
+def detect_project_from_state(state_path: Path) -> str | None:
+    if not state_path.exists():
+        return None
+    found_heading = False
+    for line in state_path.read_text(encoding="utf-8").splitlines():
+        if line.strip().lower() == "## active project":
+            found_heading = True
+            continue
+        if found_heading:
+            value = line.strip()
+            if value and not value.startswith("#"):
+                return value
+            if value.startswith("#"):
+                break
+    return None
+
+
+def git_changed_files(run_command: RunCommand) -> set[str]:
+    files: set[str] = set()
+    for cmd in (
+        ["git", "diff", "--name-only"],
+        ["git", "diff", "--name-only", "--cached"],
+    ):
+        proc = run_command(cmd)
+        if proc.returncode == 0:
+            files.update(f for f in proc.stdout.strip().splitlines() if f)
+    proc = run_command(["git", "status", "--porcelain"])
+    if proc.returncode == 0:
+        for line in proc.stdout.strip().splitlines():
+            if len(line) > 3:
+                files.add(line[3:].strip())
+    return files
+
+
+def check_session(root: Path, project: str | None = None,
+                  run_command: RunCommand = default_run_command,
+                  apply: bool = False) -> SessionCloseResult:
+    result = SessionCloseResult()
+
+    state_path = root / "STATE.md"
+    state_exists = state_path.exists()
+    if not state_exists:
+        result.actions.append(CloseAction(
+            name="state-md", kind="warn", needed=True,
+            reason="STATE.md is missing — create it with a handoff note",
+        ))
+    else:
+        result.actions.append(CloseAction(
+            name="state-md-narrative", kind="manual", needed=True,
+            reason="update STATE.md narrative (what changed, what remains, blockers, handoff)",
+        ))
+
+    if project is None:
+        project = detect_project_from_state(state_path) if state_exists else None
+
+    changed = git_changed_files(run_command)
+
+    dirty_count = len(changed)
+    if dirty_count > 0:
+        result.actions.append(CloseAction(
+            name="working-tree", kind="warn", needed=True,
+            reason=f"{dirty_count} changed file(s) in working tree",
+        ))
+
+    project_meta_changed = any(
+        f.startswith("30_projects/") and f.endswith("/README.md")
+        for f in changed
+    )
+    if project_meta_changed:
+        action = CloseAction(
+            name="sync-project-index", kind="auto", needed=True,
+            reason="project README metadata changed",
+        )
+        if apply:
+            proc = run_command([str(root / "bin" / "sync-project-index"), "--write"])
+            action = CloseAction(
+                name="sync-project-index", kind="auto", needed=True,
+                reason="project README metadata changed",
+                ran=True, success=proc.returncode == 0,
+            )
+        result.actions.append(action)
+    else:
+        result.actions.append(CloseAction(
+            name="sync-project-index", kind="auto", needed=False,
+            reason="no project metadata changes detected",
+        ))
+
+    knowledge_changed = any(f.startswith("10_knowledge/") for f in changed)
+    if knowledge_changed:
+        action = CloseAction(
+            name="mindgraph-refresh", kind="auto", needed=True,
+            reason="10_knowledge/ content changed",
+        )
+        if apply:
+            proc = run_command([str(root / "bin" / "mindgraph-refresh")])
+            action = CloseAction(
+                name="mindgraph-refresh", kind="auto", needed=True,
+                reason="10_knowledge/ content changed",
+                ran=True, success=proc.returncode == 0,
+            )
+        result.actions.append(action)
+    else:
+        result.actions.append(CloseAction(
+            name="mindgraph-refresh", kind="auto", needed=False,
+            reason="no knowledge changes detected",
+        ))
+
+    events_dir = root / "20_live" / "workflow-metrics" / "events"
+    today_log = events_dir / f"{date.today().isoformat()}.jsonl"
+    if today_log.exists():
+        action = CloseAction(
+            name="workflow-report", kind="auto", needed=True,
+            reason=f"telemetry available ({today_log.name})",
+        )
+        if apply:
+            proc = run_command([str(root / "bin" / "workflow-report"), "--days", "1"])
+            action = CloseAction(
+                name="workflow-report", kind="auto", needed=True,
+                reason=f"telemetry available ({today_log.name})",
+                ran=True, success=proc.returncode == 0,
+            )
+        result.actions.append(action)
+    else:
+        result.actions.append(CloseAction(
+            name="workflow-report", kind="auto", needed=False,
+            reason="no telemetry for today",
+        ))
+
+    result.actions.append(CloseAction(
+        name="decisions-review", kind="manual", needed=True,
+        reason="review DECISIONS.md if architecture or workflow choices were made",
+    ))
+
+    return result
+
+
+def print_result(result: SessionCloseResult) -> None:
+    for a in result.actions:
+        tag = a.kind.upper()
+        if a.kind == "auto" and a.ran:
+            status = "OK" if a.success else "FAIL"
+            print(f"  [{tag:>6}] {a.name}: {status} — {a.reason}")
+        elif a.needed:
+            print(f"  [{tag:>6}] {a.name}: needed — {a.reason}")
+        else:
+            print(f"  [{tag:>6}] {a.name}: not needed — {a.reason}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run end-of-session checks and downstream triggers."
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true",
+                      help="report what needs doing (exit 1 if auto actions needed)")
+    mode.add_argument("--apply", action="store_true",
+                      help="run auto actions")
+    parser.add_argument("--project", help="project slug under 30_projects/")
+    args = parser.parse_args()
+
+    result = check_session(ROOT, project=args.project, apply=args.apply)
+    print_result(result)
+
+    if args.check:
+        has_pending_auto = any(
+            a.kind == "auto" and a.needed and not a.ran
+            for a in result.actions
+        )
+        return 1 if has_pending_auto else 0
+
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -4,6 +4,12 @@
 
 ### Added
 
+- `bin/session-open` for deterministic session context loading in a fixed order with auto-detection of active project from `STATE.md`.
+- `bin/session-close` for end-of-session checks and downstream script triggers (`sync-project-index`, `mindgraph-refresh`, `workflow-report`) with `--check`/`--apply` modes.
+- `bin/extract-knowledge` for validating prerequisites and scaffolding knowledge notes extracted from projects with correct metadata.
+- `unittest` coverage for session-open (14 tests), session-close (13 tests), and extract-knowledge (14 tests).
+- ADR-008 in [DECISIONS.md](DECISIONS.md) for the session lifecycle scripts boundary.
+- Script sections in workflow docs for `session-open`, `session-close`, and `extract-knowledge`.
 - `bin/ingest-minion` for dry-run-first routing from `00_inbox/` and `01_ingest/queue/` into existing `10_knowledge/<domain>/` folders.
 - Markdown frontmatter validation against the standard Mainframe metadata keys defined in [.context/primitives.md](.context/primitives.md).
 - Raw PDF handling that preserves the PDF under `10_knowledge/<domain>/raw/` and writes a MindGraph-compatible Markdown stub beside it.

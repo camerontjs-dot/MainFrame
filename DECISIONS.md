@@ -50,3 +50,10 @@ This file captures meaningful project choices, especially trade-offs affecting r
 **Context**: Files captured in `00_inbox/` need deterministic staging, metadata validation, routing, and raw-evidence stub generation without spending LLM tokens on repeatable work.
 **Decision**: Mainframe will use `bin/ingest-minion` as a manual, dry-run-first CLI for the v1 ingest path. The script stages files through `01_ingest/queue/`, validates Markdown against the approved metadata schema, routes `note` and `raw` Markdown into existing `10_knowledge/<domain>/` directories, and converts convention-named PDFs into immutable raw files plus MindGraph-compatible Markdown stubs.
 **Rationale**: A manual CLI keeps ingest behavior inspectable and low-risk while preserving provenance. Existing knowledge-domain directories act as the whitelist, and MindGraph refresh remains a separate workflow.
+
+## ADR-008: Session Lifecycle Scripts
+**Status**: Accepted
+**Date**: 2026-05-27
+**Context**: The session-open, session-close, and extract-knowledge workflows are manual checklists in `.context/workflows/`. Their deterministic steps (file existence checks, downstream script invocation, context ordering, scaffold generation) can be scripted without removing judgment from the agent.
+**Decision**: Add `bin/session-open`, `bin/session-close`, and `bin/extract-knowledge` as self-contained Python scripts following the existing conventions (check/apply modes, structured result objects, no shared library). The scripts automate only deterministic operations. Narrative judgment (STATE.md writing, DECISIONS.md review, knowledge content) remains explicitly manual.
+**Rationale**: Consistent with ADR-007's approach of scripting deterministic work while keeping judgment manual. Session boundaries are the highest-frequency workflows and the most prone to step omission.
