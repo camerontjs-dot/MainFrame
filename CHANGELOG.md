@@ -4,8 +4,8 @@
 
 ### Added
 
-- ADR-009 (Proposed) in [DECISIONS.md](DECISIONS.md): two-pass ingest with agent-driven middle. Extends ADR-007 by adding a sub-agent enrichment step between deterministic minion passes; preserves the strict `queue/ → 10_knowledge/` quality gate.
-- ADR-010 (Proposed) in [DECISIONS.md](DECISIONS.md): cross-tool agent layout (`.agents/skills/` for portable skills, `agents/` for subagent definitions). Keeps Claude-Code-specific config under `.claude/`.
+- ADR-009 (Accepted) in [DECISIONS.md](DECISIONS.md): two-pass ingest with agent-driven middle. Extends ADR-007 by adding a sub-agent enrichment step between deterministic minion passes; preserves the strict `queue/ → 10_knowledge/` quality gate.
+- ADR-010 (Accepted) in [DECISIONS.md](DECISIONS.md): cross-tool agent layout (`.agents/skills/` for portable skills, `agents/` for subagent definitions). Keeps Claude-Code-specific config under `.claude/`.
 - [agents/ingest-agent.md](agents/ingest-agent.md): subagent definition for the ingest enrichment middle pass — role, tools, procedure, guardrails.
 - [01_ingest/AGENTS.md](01_ingest/AGENTS.md): defensive constraints for the ingest layer (no auto-routing, no body modification, raw items immutable, no domain guessing, read-only access to durable knowledge).
 - [.agents/skills/](.agents/skills/) stubs for the planned ingest skill set: `ingest-source`, `rename-material`, `classify-note`, `extract-metadata`, `create-source-summary`.
