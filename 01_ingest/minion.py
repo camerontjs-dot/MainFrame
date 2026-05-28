@@ -17,12 +17,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_KEYS = ("title", "domain", "type", "status", "source", "tags")
 ALLOWED_TYPES = {"raw", "note", "live", "project", "decision"}
-ALLOWED_STATUSES = {"queued", "active", "stable", "archived"}
+ALLOWED_STATUSES = {
+    "queued",
+    "skimmed",
+    "routed",
+    "extracted",
+    "active",
+    "synthesized",
+    "stable",
+    "archived",
+    "parked",
+}
 KNOWLEDGE_TYPES = {"note", "raw"}
 RAW_PDF_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})__(?P<domain>[^_]+)__raw__(?P<slug>.+)\.pdf$",
     re.IGNORECASE,
 )
+WIKILINK_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
+CANONICAL_FM_ORDER = ("title", "domain", "type", "status", "source", "tags", "links")
+NORMALIZED_DEFAULT_STATUS = "skimmed"
+NORMALIZED_DEFAULT_TYPE = "note"
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,14 @@ class FrontmatterError(ValueError):
     """Raised when a Markdown file does not match the approved schema."""
 
 
+@dataclass
+class ParsedFrontmatter:
+    metadata: dict[str, Any]
+    body_lines: list[str]
+    has_frontmatter: bool
+    trailing_newline: bool
+
+
 def strip_quotes(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -64,21 +86,42 @@ def strip_quotes(value: str) -> str:
     return value
 
 
-def parse_tags(value: str) -> list[str]:
+def parse_list_value(value: str, key: str) -> list[str]:
+    value = value.strip()
+    if not value:
+        return []
     try:
         parsed = ast.literal_eval(value)
     except (SyntaxError, ValueError) as exc:
-        raise FrontmatterError("tags must be an inline string list") from exc
+        raise FrontmatterError(f"{key} must be an inline string list") from exc
     if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
-        raise FrontmatterError("tags must be an inline string list")
+        raise FrontmatterError(f"{key} must be an inline string list")
     return parsed
 
 
-def parse_frontmatter(path: Path) -> dict[str, Any]:
+def parse_tags(value: str) -> list[str]:
+    return parse_list_value(value, "tags")
+
+
+def read_frontmatter(path: Path) -> ParsedFrontmatter:
+    """Parse a Markdown file's frontmatter permissively.
+
+    Returns the parsed metadata, body lines (verbatim), and whether the file
+    had a frontmatter block at all. Does not raise on missing required keys or
+    unknown values — only on truly malformed YAML structure (no closing ``---``,
+    duplicate keys, bad ``tags``/``links`` list syntax, etc.).
+    """
     text = path.read_text(encoding="utf-8")
+    trailing_newline = text.endswith("\n")
     lines = text.splitlines()
+
     if not lines or lines[0].strip() != "---":
-        raise FrontmatterError("missing YAML frontmatter")
+        return ParsedFrontmatter(
+            metadata={},
+            body_lines=lines,
+            has_frontmatter=False,
+            trailing_newline=trailing_newline,
+        )
 
     try:
         end = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
@@ -96,11 +139,21 @@ def parse_frontmatter(path: Path) -> dict[str, Any]:
         key = key.strip()
         if key in metadata:
             raise FrontmatterError(f"duplicate frontmatter key: {key}")
-        if key == "tags":
-            metadata[key] = parse_tags(raw_value.strip())
+        if key in ("tags", "links"):
+            metadata[key] = parse_list_value(raw_value, key)
         else:
             metadata[key] = strip_quotes(raw_value)
 
+    return ParsedFrontmatter(
+        metadata=metadata,
+        body_lines=lines[end + 1:],
+        has_frontmatter=True,
+        trailing_newline=trailing_newline,
+    )
+
+
+def validate_strict(metadata: dict[str, Any]) -> None:
+    """Raise ``FrontmatterError`` if metadata fails the strict v1 schema check."""
     missing = [key for key in REQUIRED_KEYS if key not in metadata]
     if missing:
         raise FrontmatterError(f"missing required metadata: {', '.join(missing)}")
@@ -116,7 +169,137 @@ def parse_frontmatter(path: Path) -> dict[str, Any]:
         raise FrontmatterError(f"unsupported type: {metadata['type']}")
     if metadata["status"] not in ALLOWED_STATUSES:
         raise FrontmatterError(f"unsupported status: {metadata['status']}")
-    return metadata
+
+
+def parse_frontmatter(path: Path) -> dict[str, Any]:
+    """Read + strict-validate a Markdown file's frontmatter.
+
+    Backward-compatible entry point used by the strict ``queue/ → 10_knowledge/``
+    routing gate. Raises ``FrontmatterError`` on any schema deviation.
+    """
+    parsed = read_frontmatter(path)
+    if not parsed.has_frontmatter:
+        raise FrontmatterError("missing YAML frontmatter")
+    validate_strict(parsed.metadata)
+    return parsed.metadata
+
+
+def extract_wikilinks(body: str) -> list[str]:
+    """Return ``[[wikilink]]`` targets from body text, deduplicated and ordered.
+
+    Strips alias suffix (``[[target|alias]]`` → ``target``). Empty targets and
+    repeats are dropped.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in WIKILINK_RE.findall(body):
+        target = match.split("|", 1)[0].strip()
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        out.append(target)
+    return out
+
+
+def _format_string_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _format_list_value(value: list[str]) -> str:
+    if not value:
+        return "[]"
+    items = ", ".join(_format_string_value(item) for item in value)
+    return f"[{items}]"
+
+
+def render_frontmatter(metadata: dict[str, Any]) -> str:
+    """Render a metadata dict as a canonical YAML frontmatter block."""
+    lines = ["---"]
+    seen: set[str] = set()
+
+    def emit(key: str, value: Any) -> None:
+        if isinstance(value, list):
+            lines.append(f"{key}: {_format_list_value(value)}")
+        else:
+            lines.append(f"{key}: {_format_string_value(str(value))}")
+
+    for key in CANONICAL_FM_ORDER:
+        if key in metadata:
+            emit(key, metadata[key])
+            seen.add(key)
+    for key, value in metadata.items():
+        if key not in seen:
+            emit(key, value)
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def _infer_title(body_lines: list[str], path: Path) -> str:
+    for line in body_lines:
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            inferred = stripped[2:].strip()
+            if inferred:
+                return inferred
+    return slug_to_title(path.stem)
+
+
+def normalize_metadata(
+    metadata: dict[str, Any],
+    body: str,
+    body_lines: list[str],
+    original_filename: str,
+    *,
+    force_skimmed: bool,
+) -> dict[str, Any]:
+    """Fill missing required keys with defaults and merge ``links`` from body."""
+    md = dict(metadata)
+
+    if not md.get("title"):
+        md["title"] = _infer_title(body_lines, Path(original_filename))
+    if "domain" not in md:
+        md["domain"] = ""
+    if not md.get("type"):
+        md["type"] = NORMALIZED_DEFAULT_TYPE
+    if force_skimmed or not md.get("status"):
+        md["status"] = NORMALIZED_DEFAULT_STATUS
+    if not md.get("source"):
+        md["source"] = f"00_inbox/{original_filename}"
+    if not isinstance(md.get("tags"), list):
+        md["tags"] = []
+
+    body_links = extract_wikilinks(body)
+    existing_links = md.get("links") if isinstance(md.get("links"), list) else []
+    seen: set[str] = set()
+    merged: list[str] = []
+    for link in list(existing_links) + body_links:
+        if not isinstance(link, str):
+            continue
+        target = link.strip()
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        merged.append(target)
+    md["links"] = merged
+
+    return md
+
+
+def render_normalized_text(metadata: dict[str, Any], body_lines: list[str], trailing_newline: bool) -> str:
+    """Combine a metadata dict and body lines into a normalized Markdown file."""
+    fm_block = render_frontmatter(metadata)
+    if not body_lines:
+        body_text = ""
+    else:
+        body_text = "\n".join(body_lines)
+    if body_text:
+        text = fm_block + "\n" + body_text
+    else:
+        text = fm_block
+    if trailing_newline and not text.endswith("\n"):
+        text += "\n"
+    return text
 
 
 def slug_to_title(slug: str) -> str:
@@ -150,6 +333,7 @@ class IngestMinion:
         self.inbox = self.root / "00_inbox"
         self.ingest = self.root / "01_ingest"
         self.queue = self.ingest / "queue"
+        self.ready = self.ingest / "ready"
         self.rejected = self.ingest / "rejected"
         self.knowledge = self.root / "10_knowledge"
         self.log_path = self.ingest / "ingest-log.md"
@@ -179,6 +363,7 @@ class IngestMinion:
 
         if apply:
             self.queue.mkdir(parents=True, exist_ok=True)
+            self.ready.mkdir(parents=True, exist_ok=True)
             self.rejected.mkdir(parents=True, exist_ok=True)
 
         existing_queue = self._files_in(self.queue)
@@ -204,6 +389,13 @@ class IngestMinion:
     def _stage_inbox(self, result: RunResult, apply: bool) -> list[Path]:
         staged: list[Path] = []
         for source in self._files_in(self.inbox):
+            if source.suffix.lower() == ".md":
+                staged_path = self._stage_inbox_markdown(source, result, apply)
+                if staged_path is not None:
+                    staged.append(staged_path)
+                continue
+
+            # Non-markdown files (PDFs and others) stage straight to queue/.
             target = self.queue / source.name
             if target.exists() or target in staged:
                 result.add(
@@ -221,6 +413,96 @@ class IngestMinion:
             else:
                 staged.append(source)
         return staged
+
+    def _stage_inbox_markdown(
+        self,
+        source: Path,
+        result: RunResult,
+        apply: bool,
+    ) -> Path | None:
+        """Read frontmatter, normalize, and route to queue/ or ready/.
+
+        Returns the queue-bound path for further routing on the same run, or
+        ``None`` when the file lands in ``ready/`` (awaiting agent enrichment)
+        or is blocked/rejected.
+        """
+        try:
+            parsed = read_frontmatter(source)
+        except (OSError, UnicodeDecodeError) as exc:
+            self._reject(source, result, apply, f"unreadable file: {exc}")
+            return None
+        except FrontmatterError as exc:
+            self._reject(source, result, apply, f"malformed frontmatter: {exc}")
+            return None
+
+        was_strict_valid = False
+        if parsed.has_frontmatter:
+            try:
+                validate_strict(parsed.metadata)
+                was_strict_valid = True
+            except FrontmatterError:
+                was_strict_valid = False
+
+        body = "\n".join(parsed.body_lines)
+
+        if was_strict_valid:
+            md = normalize_metadata(
+                parsed.metadata,
+                body,
+                parsed.body_lines,
+                source.name,
+                force_skimmed=False,
+            )
+            target = self.queue / source.name
+            if target.exists():
+                result.add(
+                    "blocked",
+                    source,
+                    target,
+                    "queue destination already exists",
+                    "error",
+                )
+                return None
+            result.add("stage", source, target, "stage inbox file in ingest queue")
+            if apply:
+                source.write_text(
+                    render_normalized_text(md, parsed.body_lines, parsed.trailing_newline),
+                    encoding="utf-8",
+                )
+                shutil.move(str(source), target)
+                return target
+            return source
+
+        md = normalize_metadata(
+            parsed.metadata,
+            body,
+            parsed.body_lines,
+            source.name,
+            force_skimmed=True,
+        )
+        target = self.ready / source.name
+        if target.exists():
+            result.add(
+                "blocked",
+                source,
+                target,
+                "ready destination already exists",
+                "error",
+            )
+            return None
+        result.add(
+            "normalize",
+            source,
+            target,
+            "normalize frontmatter and stage for agent enrichment",
+        )
+        if apply:
+            source.write_text(
+                render_normalized_text(md, parsed.body_lines, parsed.trailing_newline),
+                encoding="utf-8",
+            )
+            shutil.move(str(source), target)
+        return None
 
     def _process_candidate(
         self,

@@ -4,6 +4,9 @@
 
 ### Added
 
+- Agent-ingest v2 pass-1 normalization in [01_ingest/minion.py](01_ingest/minion.py): missing/partial frontmatter is filled with deterministic defaults and routed to `01_ingest/ready/` with `status: "skimmed"` instead of being rejected. Strict-valid files continue to stage to `01_ingest/queue/` for pass-2 routing. Body `[[wikilinks]]` are extracted into a `links:` array during normalization.
+- New `normalize` event kind for files routed to `01_ingest/ready/`.
+- `tests/test_ingest_minion.py` coverage for inbox normalization (no frontmatter, partial frontmatter, wikilink extraction) and `status: extracted` direct-to-queue routing.
 - ADR-009 (Accepted) in [DECISIONS.md](DECISIONS.md): two-pass ingest with agent-driven middle. Extends ADR-007 by adding a sub-agent enrichment step between deterministic minion passes; preserves the strict `queue/ → 10_knowledge/` quality gate.
 - ADR-010 (Accepted) in [DECISIONS.md](DECISIONS.md): cross-tool agent layout (`.agents/skills/` for portable skills, `agents/` for subagent definitions). Keeps Claude-Code-specific config under `.claude/`.
 - [agents/ingest-agent.md](agents/ingest-agent.md): subagent definition for the ingest enrichment middle pass — role, tools, procedure, guardrails.
@@ -27,8 +30,9 @@
 
 ### Changed
 
+- [01_ingest/minion.py](01_ingest/minion.py): split frontmatter parsing into permissive `read_frontmatter()` + strict `validate_strict()`; added `extract_wikilinks()`, `render_frontmatter()`, and `normalize_metadata()`. Status enum extended to include the v2 lifecycle values (`skimmed`, `routed`, `extracted`, `synthesized`, `parked`) per ADR-009.
+- [.context/workflows/ingest-minion.md](.context/workflows/ingest-minion.md): documents the now-current two-pass behavior; the "Pending changes (ADR-009)" preamble is removed.
 - Root [AGENTS.md](AGENTS.md): updated centralized-skills reference from `/skills` to `.agents/skills/`; added `agents/` line for subagent definitions per ADR-010.
-- [.context/workflows/ingest-minion.md](.context/workflows/ingest-minion.md): added "Pending changes (ADR-009)" section describing the v2 normalize-instead-of-reject behavior and link extraction. V1 behavior remains current until ADR-009 ratifies.
 - Removed empty `skills/` folder; replaced by `.agents/skills/` per ADR-010.
 - Replaced stale legacy naming in `20_live/AGENTS.md` and `.context/workflows/session-open.md` so guidance refers to the current Mainframe primitives.
 - Reframed the README MindGraph section to make the paired-but-separate-repo relationship with MindGraph explicit.
