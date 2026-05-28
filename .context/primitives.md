@@ -10,11 +10,28 @@ For the initial markdown-first phase, we use a simplified YAML frontmatter schem
 title: "Name of the file"
 domain: "Broad area (e.g. ai-systems, productivity)"
 type: raw | note | live | project | decision
-status: queued | active | stable | archived
+status: queued | skimmed | routed | extracted | active | synthesized | stable | archived | parked
 source: "URL or local path to raw evidence"
 tags: ["sensitivity", "etc"]
+links: ["wikilink-targets-extracted-from-body"]  # populated by ingest-minion during normalization
 ---
 ```
+
+## Status Lifecycle
+
+The `status` field encodes where a file is in its lifecycle. Pending ADR-009 ratification:
+
+| Status | Location | Meaning |
+|---|---|---|
+| `queued` | `01_ingest/queue/` or `01_ingest/ready/` | In ingest pipeline, awaiting any work |
+| `skimmed` | `01_ingest/ready/` | Minion normalized; agent pending |
+| `routed` | `01_ingest/ready/` | Agent has assigned domain/tags; enrichment in progress |
+| `extracted` | `01_ingest/queue/` | Agent enrichment complete; ready for minion pass-2 |
+| `synthesized` | `10_knowledge/<domain>/` | Durable knowledge, agent-enriched |
+| `active` | `20_live/` | Current state, live record |
+| `stable` | `10_knowledge/` | Settled durable knowledge |
+| `archived` | `90_archive/` | Preserved, not active |
+| `parked` | any | Set aside; not useful yet, duplicate, or too speculative |
 
 ## Primitives
 

@@ -57,3 +57,27 @@ This file captures meaningful project choices, especially trade-offs affecting r
 **Context**: The session-open, session-close, and extract-knowledge workflows are manual checklists in `.context/workflows/`. Their deterministic steps (file existence checks, downstream script invocation, context ordering, scaffold generation) can be scripted without removing judgment from the agent.
 **Decision**: Add `bin/session-open`, `bin/session-close`, and `bin/extract-knowledge` as self-contained Python scripts following the existing conventions (check/apply modes, structured result objects, no shared library). The scripts automate only deterministic operations. Narrative judgment (STATE.md writing, DECISIONS.md review, knowledge content) remains explicitly manual.
 **Rationale**: Consistent with ADR-007's approach of scripting deterministic work while keeping judgment manual. Session boundaries are the highest-frequency workflows and the most prone to step omission.
+
+## ADR-009: Two-Pass Ingest with Agent-Driven Middle
+**Status**: Proposed
+**Date**: 2026-05-27
+**Context**: The v1 ingest minion (ADR-007) is a strict file sorter — files in `00_inbox/` without complete YAML frontmatter are rejected to `01_ingest/rejected/`. This defeats `00_inbox/` as a fast capture zone. The original second-brain planning (`/Users/admin/Desktop/Workbench planning/second-brain-redesign/raw-processing.md`) defined a `new → skimmed → routed → extracted → synthesized` lifecycle with judgment-driven enrichment between deterministic passes; only the deterministic pass exists today.
+**Decision**: Extend the ingest pipeline to a two-pass architecture:
+1. **Minion pass 1 (deterministic):** Normalize frontmatter (instead of rejecting), extract `[[wikilinks]]` from body into a `links:` array, stage to `01_ingest/ready/` with `status: skimmed`.
+2. **Ingest-agent (subagent, judgment):** Reads files in `ready/`, classifies (domain/type/tags), proposes connections (using `links:` + MindGraph when operational), discusses with user, enriches, renames to convention, sets `status: extracted`.
+3. **`bin/prep-ingest` (deterministic):** Validates extracted files and moves to `01_ingest/queue/`.
+4. **Minion pass 2 (deterministic):** Existing strict routing from `queue/ → 10_knowledge/<domain>/`. Unchanged from ADR-007.
+
+Extends the status enum in `.context/primitives.md` with: `skimmed`, `routed`, `extracted`, `synthesized`, `parked`.
+**Rationale**: Applies the "Minions vs Sub-agents" routing rule from `/Users/admin/Desktop/Workbench planning/second-brain-redesign/gbrain-adaptations.md` — deterministic work in scripts, judgment work in sub-agents. Preserves the v1 quality gate at `queue/ → 10_knowledge/` (the strict ADR-007 routing is unchanged) while loosening the entry point so `00_inbox/` can be a real capture zone. Deterministic link extraction (also from gbrain-adaptations §2) means connection-finding doesn't depend on MindGraph being operational.
+
+## ADR-010: Cross-Tool Agent Layout (`.agents/` and `agents/`)
+**Status**: Proposed
+**Date**: 2026-05-27
+**Context**: The empty `live-asset/Mainframe/skills/` folder doesn't follow a clear convention. Mainframe is used across multiple agent tools (Claude, Codex, occasionally Google), so a Claude-Code-native layout (`.claude/agents/`, `.claude/skills/`) would not be portable. We need a layout that's recognized across agent tooling.
+**Decision**: Adopt the cross-tool convention:
+- **`.agents/skills/`** — reusable skill definitions (dotfile because skills are agent configuration, not user-facing content).
+- **`agents/`** — top-level named subagent definitions (visible at root because subagents are first-class collaborators).
+
+Claude-Code-specific settings continue to live in `.claude/`. The empty `skills/` folder is deleted and replaced by `.agents/skills/`. Root `AGENTS.md` is updated to reference the new layout.
+**Rationale**: `.agents/` and `agents/` are recognized across Claude, Codex, and other agent runtimes. Keeping multi-tool config under `.agents/` and Claude-specific config under `.claude/` cleanly separates portable agent contracts from tool-specific settings. The `agents/` folder being visible signals that subagents are part of the system's public contract, not internal config.

@@ -2,6 +2,17 @@
 
 Use this workflow when moving captured files from `00_inbox/` into durable knowledge storage.
 
+## Pending changes (ADR-009)
+
+A v2 design is proposed in [DECISIONS.md ADR-009](../../DECISIONS.md). When ratified:
+- Missing/partial frontmatter is **normalized** (not rejected) and staged to `01_ingest/ready/` with `status: skimmed`.
+- The minion extracts `[[wikilinks]]` from body content into a `links:` array during normalization.
+- The agent-driven middle (see `agents/ingest-agent.md`) handles classification and enrichment.
+- `bin/prep-ingest` validates and moves files from `ready/ → queue/` after agent enrichment.
+- Strict routing from `queue/ → 10_knowledge/` (documented below) is unchanged.
+
+The v1 behavior below remains current until ADR-009 is accepted and Phase 3 of the plan ([planning/mainframe-agent-ingest-plan.md](../../../../planning/mainframe-agent-ingest-plan.md)) ships.
+
 ## Defaults
 - Script: `bin/ingest-minion`
 - Mode: dry-run unless `--apply` is passed
