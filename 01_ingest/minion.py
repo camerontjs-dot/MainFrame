@@ -184,15 +184,33 @@ def parse_frontmatter(path: Path) -> dict[str, Any]:
     return parsed.metadata
 
 
+_FENCED_CODE_RE = re.compile(r"^([`~]{3,})[^\n]*\n.*?\n\1[ \t]*$", re.DOTALL | re.MULTILINE)
+_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+
+
+def _strip_code_spans(text: str) -> str:
+    """Remove fenced code blocks and inline code spans.
+
+    Wikilinks inside code (e.g. notes that discuss the ``[[target]]`` syntax)
+    are not real connections — they should not appear in the ``links:`` array.
+    """
+    text = _FENCED_CODE_RE.sub("", text)
+    text = _INLINE_CODE_RE.sub("", text)
+    return text
+
+
 def extract_wikilinks(body: str) -> list[str]:
     """Return ``[[wikilink]]`` targets from body text, deduplicated and ordered.
 
-    Strips alias suffix (``[[target|alias]]`` → ``target``). Empty targets and
+    Strips alias suffix (``[[target|alias]]`` → ``target``). Wikilinks that
+    appear inside fenced code blocks or inline code spans are ignored — they
+    are discussion of the syntax, not real connections. Empty targets and
     repeats are dropped.
     """
+    cleaned = _strip_code_spans(body)
     seen: set[str] = set()
     out: list[str] = []
-    for match in WIKILINK_RE.findall(body):
+    for match in WIKILINK_RE.findall(cleaned):
         target = match.split("|", 1)[0].strip()
         if not target or target in seen:
             continue

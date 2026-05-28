@@ -156,6 +156,43 @@ class IngestMinionTests(unittest.TestCase):
         self.assertIn("links: []", body)
         self.assertIn("normalize", [event.kind for event in result.events])
 
+    def test_wikilinks_inside_code_spans_are_ignored(self) -> None:
+        source = self.root / "00_inbox" / "discusses-wikilinks.md"
+        source.write_text(
+            "\n".join(
+                [
+                    "# Note that talks about wikilinks",
+                    "",
+                    "Body refers to [[real-target]] as a real connection.",
+                    "",
+                    "But `[[inline-syntax-example]]` is just talking about the syntax.",
+                    "",
+                    "And the fenced block below is illustrative:",
+                    "",
+                    "```",
+                    "tags: [\"author:[[@somebody]]\"]",
+                    "see also [[fenced-example]]",
+                    "```",
+                    "",
+                    "End paragraph also has [[real-target]] again (dedup).",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.minion.run(apply=True)
+
+        ready_target = self.root / "01_ingest" / "ready" / source.name
+        self.assertTrue(result.ok)
+        self.assertTrue(ready_target.exists())
+
+        body = ready_target.read_text(encoding="utf-8")
+        self.assertIn('links: ["real-target"]', body)
+        # Body itself is preserved verbatim — the code spans/blocks still appear.
+        self.assertIn("`[[inline-syntax-example]]`", body)
+        self.assertIn("[[fenced-example]]", body)
+
     def test_inbox_wikilinks_extracted_to_links_field(self) -> None:
         source = self.root / "00_inbox" / "with-links.md"
         source.write_text(
