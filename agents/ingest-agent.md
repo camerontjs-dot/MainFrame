@@ -33,23 +33,25 @@ Do not invoke automatically on minion runs. The user controls when judgment work
 
 ## Procedure (per file)
 
-1. **List** files in `01_ingest/ready/`. Process one at a time unless the user asks for a batch pass.
+1. **List** files in `01_ingest/ready/`. Process one at a time unless the user asks for a batch pass. Skip any file already at `status: extracted`. Those are awaiting `bin/prep-ingest`, not another agent pass — surface a one-line nudge and move on.
 2. **Read** the full content of the next file.
 3. **Propose metadata**:
-   - `domain` — which `10_knowledge/<domain>/` does this belong in? Use the existing whitelist; don't invent new domains.
+   - `domain` — which `10_knowledge/<domain>/` does this belong in? Use the existing whitelist; don't invent new domains. The downstream gate at `bin/prep-ingest` rejects empty domains with a clear error. Fill this before setting `status: extracted`; if you genuinely don't know, stop and ask rather than guessing.
    - `tags` — what topics does this cover? Free-form, lowercase, kebab-case.
    - `source` — preserve if set; otherwise infer from filename or content.
    - `type` — usually `note` for synthesized content, `raw` for unprocessed material.
 4. **Find connections**:
-   - Read the `links:` array the minion extracted. This is the deterministic floor.
+   - Read the `links:` array the minion extracted. This is the deterministic floor — your job is to *extend* it with judgment-driven connections (MindGraph nominations, cross-domain pointers), not to re-extract from body.
    - If MindGraph is operational, query for related notes: `bin/mindgraph query "<key terms>"`.
    - Cross-reference proposed `domain` with existing notes in `10_knowledge/<domain>/`.
    - Propose `[[wikilinks]]` to add to the body.
-5. **Discuss with user**:
-   - What's new here vs what we already know?
-   - Does this change any existing understanding?
-   - Should this be one note or split into multiple?
-   - Confirm proposed metadata.
+5. **Discuss with user** — present the full proposed enrichment as a single confirm-or-correct surface:
+   - Proposed frontmatter: `domain`, `tags`, `source`, `type`.
+   - Proposed new filename: `YYYY-MM-DD__domain__type__slug.md`.
+   - Draft `## Connections` section text (if any).
+   - Open questions: what's new vs known? Does this change existing understanding? Split or keep as one note?
+
+   Wait for explicit confirmation or specific corrections before proceeding to step 6.
 6. **Enrich** the file after user confirmation:
    - Update frontmatter: `domain`, `tags`, `source`, populate `links: [...]` with confirmed connections, set `status: routed` then `status: extracted` when done.
    - Append a `## Connections` section at the bottom of the file with prose explanation of relationships and `[[wikilinks]]` to related notes.
@@ -57,7 +59,7 @@ Do not invoke automatically on minion runs. The user controls when judgment work
      - **Raw items (`type: raw`)** — never modify the body. All connection signal lives in `links:` frontmatter + appended `## Connections` section.
      - **Notes (`type: note`)** — same default: don't touch the body. Only add inline `[[wikilinks]]` to the body when (a) the file is the user's own draft, AND (b) the user explicitly approves body modification for this file. Default to frontmatter + Connections section.
      - If a raw source would benefit from a synthesized companion note (inline wikilinks, summary, key claims), use the [create-source-summary](../.agents/skills/create-source-summary.md) skill to create a sibling `note`-type file rather than modifying the raw item.
-7. **Rename** to `YYYY-MM-DD__domain__type__slug.md` using the captured date (from frontmatter or current date if missing).
+7. **Rename** to `YYYY-MM-DD__domain__type__slug.md` using the captured date (from frontmatter or current date if missing). The rename must be atomic — after this step, only the new-named file exists in `ready/`. If using Write + delete, write the new path first, verify, then remove the old path.
 8. **Hand off** to the deterministic pipeline:
    - Run `bin/prep-ingest run --dry-run` to validate the file is ready for promotion. The script checks: strict-valid frontmatter, `status: extracted`, canonical filename, domain in the `10_knowledge/` whitelist, no queue collision.
    - If clean, run `bin/prep-ingest run --apply` to move the file from `01_ingest/ready/` to `01_ingest/queue/`.
@@ -72,6 +74,7 @@ Do not invoke automatically on minion runs. The user controls when judgment work
 - **Read-only access to `10_knowledge/`.** Write only inside `01_ingest/`.
 - **Calibrate claims** per [EPISTEMIC_STANCE.md](../EPISTEMIC_STANCE.md). MindGraph nominations are not assertions of relationship.
 - **One file at a time** by default. Batch processing only when the user explicitly opts in.
+- **Empty `domain` is rejected downstream.** The deterministic gate at `bin/prep-ingest` blocks any file with `domain: ""` even if everything else is filled. Don't ship to `status: extracted` without a real domain.
 
 ## Safety rules
 
