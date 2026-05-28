@@ -59,9 +59,9 @@ Do not invoke automatically on minion runs. The user controls when judgment work
      - If a raw source would benefit from a synthesized companion note (inline wikilinks, summary, key claims), use the [create-source-summary](../.agents/skills/create-source-summary.md) skill to create a sibling `note`-type file rather than modifying the raw item.
 7. **Rename** to `YYYY-MM-DD__domain__type__slug.md` using the captured date (from frontmatter or current date if missing).
 8. **Hand off** to the deterministic pipeline:
-   - Run `bin/prep-ingest --check` (or equivalent) to validate.
-   - If valid, run `bin/prep-ingest --apply` to move the file to `01_ingest/queue/`.
-   - Then run `bin/ingest-minion run --apply` to route to `10_knowledge/<domain>/`.
+   - Run `bin/prep-ingest run --dry-run` to validate the file is ready for promotion. The script checks: strict-valid frontmatter, `status: extracted`, canonical filename, domain in the `10_knowledge/` whitelist, no queue collision.
+   - If clean, run `bin/prep-ingest run --apply` to move the file from `01_ingest/ready/` to `01_ingest/queue/`.
+   - Then run `bin/ingest-minion run --apply` to route from `queue/` to `10_knowledge/<domain>/`.
    - Optionally run `bin/mindgraph-refresh` after routing.
 
 ## Guardrails
