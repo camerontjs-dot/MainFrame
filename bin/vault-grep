@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# search gitignored knowledge, project, and inbox directories using rg --no-ignore, while excluding massive cache and dependency paths.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if ! command -v rg >/dev/null 2>&1; then
+  echo "Error: ripgrep (rg) is required but not found on PATH." >&2
+  exit 1
+fi
+
+exec rg --no-ignore \
+  -g '!.git/' \
+  -g '!.venv/' \
+  -g '!.antigravity/' \
+  -g '!.claude/' \
+  -g '!.codex/' \
+  -g '!.grok/' \
+  -g '!node_modules/' \
+  -g '!.ruff_cache/' \
+  "$@" "$ROOT"

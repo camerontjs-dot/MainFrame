@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Post-route enrichment: pull OA full text into raw stubs, then refresh MindGraph.
+#
+# Run after bin/ingest-minion run --apply routes files into 10_knowledge/.
+# Uses UNPAYWALL_EMAIL or MAINFRAME_UNPAYWALL_EMAIL when set (free API).
+#
+# Usage:
+#   bin/post-route-enrich --subset healthcare-practice
+#   bin/post-route-enrich --subset healthcare-practice --dry-run
+#   bin/post-route-enrich --file 10_knowledge/.../stub.md
+set -euo pipefail
+
+if ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  :
+else
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+
+DRY_RUN=0
+SUBSET=""
+FILE=""
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --subset) SUBSET="${2:-}"; shift 2 ;;
+    --file) FILE="${2:-}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    -h|--help)
+      sed -n '2,12p' "$0"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$SUBSET" && -z "$FILE" ]]; then
+  echo "post-route-enrich: pass --subset <domain> or --file <path>" >&2
+  exit 2
+fi
+
+FETCH_ARGS=()
+if [[ -n "$SUBSET" ]]; then
+  FETCH_ARGS+=(--subset "$SUBSET")
+fi
+if [[ -n "$FILE" ]]; then
+  FETCH_ARGS+=(--file "$FILE")
+fi
+if [[ "$FORCE" -eq 1 ]]; then
+  FETCH_ARGS+=(--force)
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  FETCH_ARGS+=(--dry-run)
+  echo "post-route-enrich dry-run"
+  "$ROOT/bin/fetch-source-text" "${FETCH_ARGS[@]}"
+  echo ""
+  echo "Would run: bin/mindgraph-refresh"
+  exit 0
+fi
+
+echo "post-route-enrich: fetch-source-text"
+"$ROOT/bin/fetch-source-text" --apply "${FETCH_ARGS[@]}"
+
+echo ""
+echo "post-route-enrich: mindgraph-refresh"
+"$ROOT/bin/mindgraph-refresh"
+
+echo ""
+echo "post-route-enrich: done"

@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "description": "Deterministic routing hints for task packets. Graduation still requires agent-harness-eval receipts per category × profile × harness.",
+  "category_defaults": {
+    "mechanical-edit": {
+      "executor": "local",
+      "harness_recommendation": "H1-packet",
+      "agent_profile": "local-qwen25-coder-14b",
+      "allow_fusion_plan": false
+    },
+    "multi-file-coordination": {
+      "executor": "local",
+      "harness_recommendation": "H2-repair",
+      "agent_profile": "local-qwen25-coder-14b",
+      "allow_fusion_plan": false
+    },
+    "failure-recovery": {
+      "executor": "local",
+      "harness_recommendation": "H2-repair",
+      "agent_profile": "local-qwen25-coder-14b",
+      "allow_fusion_plan": false
+    },
+    "scope-enforcement": {
+      "executor": "local",
+      "harness_recommendation": "H1-packet",
+      "agent_profile": "local-qwen25-coder-14b",
+      "allow_fusion_plan": false
+    },
+    "research-synthesis": {
+      "executor": "cloud",
+      "harness_recommendation": "H1-packet",
+      "allow_fusion_plan": true,
+      "needs_deliberation": true
+    },
+    "environment-setup": {
+      "executor": "auto",
+      "harness_recommendation": "H1-packet",
+      "allow_fusion_plan": false
+    },
+    "long-horizon-build": {
+      "executor": "cloud",
+      "harness_recommendation": "H1-packet",
+      "allow_fusion_plan": true
+    }
+  },
+  "inference_rules": [
+    {
+      "when": {
+        "task_kind": "research",
+        "min_total_files": 0
+      },
+      "task_category": "research-synthesis"
+    },
+    {
+      "when": {
+        "task_kind": "code",
+        "min_editable_files": 2
+      },
+      "task_category": "multi-file-coordination"
+    },
+    {
+      "when": {
+        "task_kind": "code",
+        "max_editable_files": 1
+      },
+      "task_category": "mechanical-edit"
+    }
+  ]
+}

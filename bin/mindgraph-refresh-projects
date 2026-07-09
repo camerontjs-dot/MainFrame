@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+DB_PATH="${MINDGRAPH_DB_PATH:-$HOME/.mindgraph/mainframe-projects.sqlite}"
+PROJECT_MANIFEST="${MAINFRAME_MINDGRAPH_PROJECTS_MANIFEST:-$ROOT/30_projects/mindgraph-projects.json}"
+DRY_RUN=0
+FULL=0
+
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN=1
+  shift
+fi
+
+if [[ "${1:-}" == "--full" ]]; then
+  FULL=1
+  shift
+fi
+
+TMP_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/mindgraph-projects.XXXXXX.json")"
+trap 'rm -f "$TMP_MANIFEST"' EXIT
+
+python3 - "$ROOT" "$TMP_MANIFEST" "$PROJECT_MANIFEST" "$FULL" "${MAINFRAME_MINDGRAPH_PROJECTS:-}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+out_path = Path(sys.argv[2])
+manifest_path = Path(sys.argv[3]).expanduser()
+full = sys.argv[4] == "1"
+override = sys.argv[5].strip()
+projects_dir = root / "30_projects"
+
+default_projects = [
+    "agent-harness-eval",
+    "agent-tracker-eval",
+    "local-agent",
+    "mindgraph",
+    "mindgraph-eval",
+    "mainframe-process-eval",
+]
+include = [
+    "README.md",
+    "AGENTS.md",
+    "log.md",
+    "decisions.md",
+    "plans/*.md",
+    "plans/**/*.md",
+    "outputs/*.md",
+    "outputs/**/*.md",
+]
+exclude = [
+    ".git/*",
+    ".git/**/*",
+    ".venv/*",
+    ".venv/**/*",
+    "__pycache__/*",
+    "__pycache__/**/*",
+    ".pytest_cache/*",
+    ".pytest_cache/**/*",
+    "workbench/*",
+    "workbench/**/*",
+    "raw-materials/*",
+    "raw-materials/**/*",
+]
+
+if full:
+    projects = sorted(p.name for p in projects_dir.iterdir() if p.is_dir())
+elif override:
+    projects = override.split()
+elif manifest_path.exists():
+    payload = json.loads(manifest_path.read_text())
+    if not isinstance(payload, dict):
+        raise SystemExit(f"project manifest must be a JSON object: {manifest_path}")
+    projects = payload.get("projects", default_projects)
+    include = payload.get("include", include)
+    exclude = payload.get("exclude", exclude)
+else:
+    projects = default_projects
+
+if not isinstance(projects, list) or not all(isinstance(p, str) for p in projects):
+    raise SystemExit("project manifest field 'projects' must be a string list")
+if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
+    raise SystemExit("project manifest field 'include' must be a string list")
+if not isinstance(exclude, list) or not all(isinstance(p, str) for p in exclude):
+    raise SystemExit("project manifest field 'exclude' must be a string list")
+
+scopes = []
+for slug in projects:
+    project_path = projects_dir / slug
+    if not project_path.is_dir():
+        print(f"warn: project scope missing, skipping: {project_path}", file=sys.stderr)
+        continue
+    scopes.append(
+        {
+            "namespace": slug,
+            "root": str(project_path),
+            "source_root": str(project_path),
+            "display_prefix": f"30_projects/{slug}",
+        }
+    )
+
+if not scopes:
+    raise SystemExit("MindGraph projects ingest scope is empty.")
+
+out = {
+    "index_id": "mainframe-projects",
+    "trust_profile": "project_status",
+    "include": include,
+    "exclude": exclude,
+    "scopes": scopes,
+}
+out_path.write_text(json.dumps(out, indent=2) + "\n")
+PY
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "DB: $DB_PATH"
+  echo "Trust profile: project_status (see HARNESS.md)"
+  if [[ "$FULL" -eq 1 ]]; then
+    echo "Scope mode: full project coordination surfaces"
+  elif [[ -n "${MAINFRAME_MINDGRAPH_PROJECTS:-}" ]]; then
+    echo "Scope mode: MAINFRAME_MINDGRAPH_PROJECTS override"
+  else
+    echo "Scope mode: curated manifest"
+    echo "Manifest: $PROJECT_MANIFEST"
+  fi
+  echo "Scopes:"
+  python3 - "$TMP_MANIFEST" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1]))
+for scope in payload["scopes"]:
+    print(f"  {scope['namespace']}: {scope['root']}")
+PY
+  echo "Includes:"
+  python3 - "$TMP_MANIFEST" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1]))
+for pattern in payload["include"]:
+    print(f"  {pattern}")
+PY
+  echo "Commands:"
+  echo "  MINDGRAPH_DB_PATH=\"$DB_PATH\" $ROOT/bin/mindgraph init"
+  echo "  MINDGRAPH_DB_PATH=\"$DB_PATH\" $ROOT/bin/mindgraph ingest-many <generated-project-manifest> --allow-failures"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$DB_PATH")"
+
+if [[ ! -f "$DB_PATH" ]]; then
+  MINDGRAPH_DB_PATH="$DB_PATH" "$ROOT/bin/mindgraph" init
+fi
+
+MINDGRAPH_DB_PATH="$DB_PATH" "$ROOT/bin/mindgraph" ingest-many "$TMP_MANIFEST" --allow-failures

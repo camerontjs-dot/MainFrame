@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+# MindGraph ingests 10_knowledge/ only. Bail unless the just-committed change
+# actually touched that scope, so commits to live state, project files, or
+# tooling don't trigger a no-op refresh (and the concurrent-refresh window that
+# rapid unrelated commits would otherwise open). Capture-then-grep avoids the
+# pipefail + `grep -q` SIGPIPE gotcha; --root makes the initial commit correct.
+CHANGED="$(git diff-tree --no-commit-id --name-only -r --root HEAD 2>/dev/null || true)"
+
+LOG_DIR="$ROOT/20_live/workflow-metrics"
+mkdir -p "$LOG_DIR"
+
+# 1. MindGraph refresh for 10_knowledge/
+if grep -q '^10_knowledge/' <<<"$CHANGED"; then
+    nohup "$ROOT/bin/mindgraph-refresh" >>"$LOG_DIR/mindgraph-refresh.log" 2>&1 &
+fi
+
+# 2. Skill evaluation static checks (lint + stub) on commit
+if grep -q '^\.agents/skills/' <<<"$CHANGED"; then
+    nohup "$ROOT/bin/skill-eval" stub --changed "$CHANGED" >>"$LOG_DIR/skill-eval.log" 2>&1 &
+fi

@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""Automate task packet delegation, execution, and repair for local coder agents."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+# Profile details mapped to Ollama models and settings
+PROFILES = {
+    "local-qwen25-coder-14b": {
+        "model": "ollama_chat/qwen2.5-coder:14b",
+        "ollama_model": "qwen2.5-coder:14b",
+        "edit_format": "diff",
+        "map_tokens": 4096,
+    },
+    "local-qwen3-14b": {
+        "model": "ollama_chat/qwen3:14b",
+        "ollama_model": "qwen3:14b",
+        "edit_format": "diff",
+        "map_tokens": 4096,
+    },
+    "local-qwen35-9b": {
+        "model": "ollama_chat/qwen3.5:9b",
+        "ollama_model": "qwen3.5:9b",
+        "edit_format": "whole",
+        "map_tokens": 4096,
+    },
+    "local-qwen3-coder-30b": {
+        "model": "ollama_chat/qwen3-coder:30b",
+        "ollama_model": "qwen3-coder:30b",
+        "edit_format": "diff",
+        "map_tokens": 4096,
+    },
+}
+
+def detect_project(cwd: Path) -> tuple[str, Path]:
+    """Find the MainFrame root and current project slug if running within one."""
+    curr = cwd.resolve()
+    root = None
+    for _ in range(10):
+        if (curr / "30_projects").is_dir():
+            root = curr
+            break
+        if curr.parent == curr:
+            break
+        curr = curr.parent
+
+    if root:
+        try:
+            rel = cwd.relative_to(root / "30_projects")
+            parts = rel.parts
+            if parts:
+                return parts[0], root
+        except ValueError:
+            pass
+        return "local-agent", root
+
+    # Fallback: directory that contains this bin/ wrapper (MainFrame root).
+    default_root = Path(__file__).resolve().parent.parent
+    if default_root.is_dir():
+        return "local-agent", default_root
+    return "local-agent", cwd
+
+def check_git_status(cwd: Path) -> bool:
+    """Check if git working tree has uncommitted changes."""
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False
+    )
+    if proc.returncode != 0:
+        return False
+    return bool(proc.stdout.strip())
+
+def health_check(profile_name: str, profile: dict[str, any]) -> tuple[bool, str]:
+    """Verify that Aider and Ollama with the requested model are available."""
+    if not shutil_which("aider"):
+        return False, "aider CLI not found in PATH"
+    if not shutil_which("ollama"):
+        return False, "ollama CLI not found in PATH"
+
+    # Check Ollama status
+    proc = subprocess.run(
+        ["ollama", "list"],
+        capture_output=True,
+        text=True,
+        check=False
+    )
+    if proc.returncode != 0:
+        return False, "Failed to communicate with Ollama daemon (ollama list failed)"
+
+    model = profile["ollama_model"]
+    if model and model not in proc.stdout:
+        return False, f"Ollama model '{model}' is not pulled/installed. Run 'ollama pull {model}' first."
+
+    return True, "health check passed"
+
+def shutil_which(cmd: str) -> bool:
+    """Simple check for executable presence."""
+    for path in os.environ.get("PATH", "").split(os.pathsep):
+        p = Path(path) / cmd
+        if p.is_file() and os.access(p, os.X_OK):
+            return True
+    return False
+
+def get_git_diff(cwd: Path, editable_files: list[str]) -> str:
+    """Retrieve current git diff including any untracked files in editable_files."""
+    proc = subprocess.run(["git", "diff", "HEAD"], cwd=cwd, capture_output=True, text=True, check=False)
+    diff = proc.stdout or ""
+
+    for f in editable_files:
+        status_proc = subprocess.run(["git", "status", "--porcelain", f], cwd=cwd, capture_output=True, text=True, check=False)
+        if status_proc.stdout.startswith("??"):
+            diff_proc = subprocess.run(["git", "diff", "--no-index", "--", "/dev/null", f], cwd=cwd, capture_output=True, text=True, check=False)
+            if diff_proc.stdout:
+                diff += "\n" + diff_proc.stdout
+    return diff
+
+def render_prompt(packet: dict[str, any], repair_context: str = "") -> str:
+    """Generate the instructions file content for Aider."""
+    metadata = packet["metadata"]
+    sections = packet["sections"]
+    if repair_context:
+        return (
+            "Perform one fresh-context repair attempt. Use only the failed "
+            "verifier summary, current diff, and scope below. Do not broaden "
+            "scope, commit, or run/claim external verification.\n\n"
+            f"Editable files: {json.dumps(metadata['editable_files'])}\n"
+            f"Files allowed to be created: {json.dumps(metadata['create_files'])}\n"
+            f"Read-only context: {json.dumps(metadata['read_only_files'])}\n\n"
+            "## Failed verification and current diff\n"
+            f"{repair_context}\n\n"
+            "End with exactly these fields:\n"
+            "TASK_STATUS: complete|blocked\n"
+            "VERIFICATION_CLAIM: not_run\n"
+            "TASK_SUMMARY: one concise line\n"
+        )
+
+    rendered_sections = "\n\n".join(
+        f"## {name}\n{sections[name]}" for name in sections
+    )
+    return (
+        "Implement this reviewed task packet exactly. Do not broaden scope, "
+        "commit, or run/claim external verification.\n\n"
+        f"Editable files: {json.dumps(metadata['editable_files'])}\n"
+        f"Files allowed to be created: {json.dumps(metadata['create_files'])}\n"
+        f"Read-only context: {json.dumps(metadata['read_only_files'])}\n\n"
+        f"{rendered_sections}\n\n"
+        "End with exactly these fields:\n"
+        "TASK_STATUS: complete|blocked\n"
+        "VERIFICATION_CLAIM: not_run\n"
+        "TASK_SUMMARY: one concise line\n"
+    )
+
+def parse_claims(stdout: str) -> dict[str, str | None]:
+    """Extract completion, verification, and summary fields from output."""
+    status = re.search(r"^TASK_STATUS:\s*(complete|blocked)\s*$", stdout, re.MULTILINE)
+    verification = re.search(r"^VERIFICATION_CLAIM:\s*(not_run|passed|failed)\s*$", stdout, re.MULTILINE)
+    summary = re.search(r"^TASK_SUMMARY:\s*(.+)$", stdout, re.MULTILINE)
+    return {
+        "completion": status.group(1) if status else None,
+        "verification": verification.group(1) if verification else None,
+        "summary": summary.group(1).strip() if summary else None,
+    }
+
+def run_verification_commands(workdir: Path, commands: list[str]) -> list[tuple[str, int, str]]:
+    """Execute each verification command and gather output."""
+    results = []
+    for cmd in commands:
+        print(f"\n\033[1;34m[Verification] Running command:\033[0m {cmd}")
+        argv = shlex.split(cmd)
+        proc = subprocess.run(
+            argv,
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        combined_output = f"--- STDOUT ---\n{proc.stdout or ''}\n--- STDERR ---\n{proc.stderr or ''}"
+        results.append((cmd, proc.returncode, combined_output))
+        if proc.returncode == 0:
+            print("\033[1;32m[Verification] Command passed.\033[0m")
+        else:
+            print(f"\033[1;31m[Verification] Command failed with exit code {proc.returncode}.\033[0m")
+    return results
+
+def run_aider(
+    workdir: Path,
+    profile_name: str,
+    profile: dict[str, any],
+    prompt_path: Path,
+    raw_dir: Path,
+    attempt: int,
+    editable_files: list[str],
+    read_only_files: list[str]
+) -> tuple[int, str]:
+    """Execute Aider with standard parameters, streaming output to console."""
+    cmd = [
+        "aider",
+        "--model", profile["model"],
+        "--edit-format", profile["edit_format"],
+        "--map-tokens", str(profile["map_tokens"]),
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--no-auto-lint",
+        "--no-auto-test",
+        "--no-restore-chat-history",
+        "--no-suggest-shell-commands",
+        "--no-analytics",
+        "--no-pretty",
+        "--no-stream",
+        "--yes-always",
+        "--message-file", str(prompt_path),
+        "--chat-history-file", str(raw_dir / f"chat-attempt-{attempt}.md"),
+        "--input-history-file", str(raw_dir / f"input-attempt-{attempt}"),
+        "--llm-history-file", str(raw_dir / f"llm-attempt-{attempt}.log"),
+    ]
+
+    # Use absolute paths for target files to make Aider editing unambiguous
+    for f in editable_files:
+        cmd.extend(["--file", str(workdir / f)])
+    for f in read_only_files:
+        cmd.extend(["--read", str(workdir / f)])
+
+    print(f"\n\033[1;34m[Aider] Starting Aider execution (Attempt {attempt})...\033[0m")
+    print(f"Command: {' '.join(shlex.quote(arg) for arg in cmd)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=workdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    stdout_lines = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        stdout_lines.append(line)
+    proc.wait()
+
+    return proc.returncode, "".join(stdout_lines)
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Delegate and execute small coding tasks using local coder agents.")
+    parser.add_argument("--title", required=True, help="Title of the task")
+    parser.add_argument("--goal", required=True, help="Goal/outcome description")
+    parser.add_argument("--implementation", required=True, help="Required implementation details")
+    parser.add_argument("--editable", required=True, nargs="+", help="Editable file path(s) relative to project root")
+    parser.add_argument("--read-only", nargs="+", default=[], help="Read-only context file path(s) relative to project root")
+    parser.add_argument("--verify", required=True, nargs="+", help="Deterministic verification command(s)")
+    parser.add_argument("--project", help="Project slug (e.g. content-engine). Automatically detected if omitted")
+    parser.add_argument("--task-id", help="Task ID. Autogenerated if omitted")
+    parser.add_argument("--profile", default="local-qwen25-coder-14b", choices=list(PROFILES.keys()), help="Model profile to use")
+    parser.add_argument("--task-category", help="Harness task category override (see .context/harness-routing.json)")
+    parser.add_argument("--run", action="store_true", help="Immediately run and verify the task packet on active worktree")
+
+    args = parser.parse_args()
+    profile_overridden = any(
+        arg == "--profile" or arg.startswith("--profile=")
+        for arg in sys.argv[1:]
+    )
+
+    # 1. Project Detection
+    project_slug, root_dir = detect_project(Path.cwd())
+    if args.project:
+        project_slug = args.project
+
+    project_dir = root_dir / "30_projects" / project_slug
+    if not project_dir.is_dir():
+        print(f"\033[1;31mError: Project folder '{project_dir}' does not exist.\033[0m")
+        return 1
+
+    routing_policy_path = root_dir / ".context" / "harness-routing.json"
+    routing_metadata = {
+        "task_kind": "code",
+        "editable_files": args.editable,
+        "create_files": [],
+    }
+    routing_hints = {}
+    if routing_policy_path.is_file():
+        try:
+            task_packet_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(root_dir / "bin" / "task-packet"),
+                    "routing-hints",
+                    "--policy",
+                    str(routing_policy_path),
+                    "--metadata-json",
+                    json.dumps(routing_metadata),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if task_packet_proc.returncode == 0 and task_packet_proc.stdout.strip():
+                routing_hints = json.loads(task_packet_proc.stdout)
+            elif task_packet_proc.returncode != 0:
+                stderr = task_packet_proc.stderr.strip()
+                print(
+                    "\033[1;33mWarning: routing-hints failed "
+                    f"(exit {task_packet_proc.returncode})"
+                    + (f": {stderr}" if stderr else "")
+                    + ".\033[0m"
+                )
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"\033[1;33mWarning: routing-hints failed: {exc}.\033[0m")
+            routing_hints = {}
+
+    if args.task_category:
+        inferred_category = routing_hints.get("task_category")
+        if inferred_category and inferred_category != args.task_category:
+            print(
+                "\033[1;33mWarning: --task-category overrides inferred "
+                f"'{inferred_category}' for this packet shape.\033[0m"
+            )
+        routing_metadata["task_category"] = args.task_category
+        try:
+            override_proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(root_dir / "bin" / "task-packet"),
+                    "routing-hints",
+                    "--policy",
+                    str(routing_policy_path),
+                    "--metadata-json",
+                    json.dumps(routing_metadata),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if override_proc.returncode == 0 and override_proc.stdout.strip():
+                routing_hints = json.loads(override_proc.stdout)
+            else:
+                routing_hints["task_category"] = args.task_category
+        except (json.JSONDecodeError, OSError):
+            routing_hints["task_category"] = args.task_category
+
+    recommended_profile = routing_hints.get("agent_profile")
+    if (
+        recommended_profile
+        and recommended_profile in PROFILES
+        and not profile_overridden
+        and args.profile != recommended_profile
+    ):
+        print(
+            f"\033[1;33mRouting: {routing_hints.get('task_category', 'unknown')} "
+            f"→ profile '{recommended_profile}' "
+            f"(harness {routing_hints.get('harness_recommendation', 'n/a')}).\033[0m"
+        )
+        args.profile = recommended_profile
+    elif len(args.editable) > 1 and args.profile != "local-qwen25-coder-14b":
+        print(
+            "\033[1;33mWarning: Coordinated multi-file changes are restricted to "
+            "'local-qwen25-coder-14b'. Forcing profile to 'local-qwen25-coder-14b'.\033[0m"
+        )
+        args.profile = "local-qwen25-coder-14b"
+    elif args.profile == "local-qwen25-coder-14b":
+        # Check context limits warning
+        read_only_lines = 0
+        for f in args.read_only:
+            f_path = project_dir / f
+            if f_path.is_file():
+                with open(f_path, "rb") as fh:
+                    read_only_lines += sum(1 for _ in fh)
+        if read_only_lines > 100:
+            print(f"\033[1;33mWarning: Read-only context size is {read_only_lines} lines. Qwen2.5-coder is sensitive to contexts > 100 lines. Consider trimming context.\033[0m")
+
+    # 2. Task ID Setup
+    task_id = args.task_id
+    if not task_id:
+        timestamp = datetime.now(UTC).strftime("%Y%m%dt%H%M%Sz")
+        task_id = f"coder-task-{timestamp}"
+
+    print(f"\033[1;32mConfiguring task packet: {task_id} under project: {project_slug}\033[0m")
+
+    # 3. Create Task Packet File
+    packet_dir = project_dir / "plans" / "task-packets"
+    packet_dir.mkdir(parents=True, exist_ok=True)
+    packet_path = packet_dir / f"{task_id}.md"
+
+    packet_metadata = {
+        "packet_version": 1,
+        "task_id": task_id,
+        "project_slug": project_slug,
+        "title": args.title,
+        "status": "ready",
+        "task_kind": "code",
+        "agent_profile": args.profile,
+        "workdir": ".",
+        "timeout_seconds": 900,
+        "editable_files": args.editable,
+        "create_files": [],
+        "read_only_files": args.read_only,
+        "verification_commands": args.verify,
+        "mindgraph_mode": "off",
+        "knowledge_queries": [],
+    }
+    for key in (
+        "task_category",
+        "executor",
+        "harness_recommendation",
+        "allow_fusion_plan",
+        "needs_deliberation",
+    ):
+        if key in routing_hints:
+            packet_metadata[key] = routing_hints[key]
+
+    packet_sections = {
+        "Goal": args.goal,
+        "Context and plan references": "Delegated via bin/delegate-coder.",
+        "Required implementation": args.implementation,
+        "Non-negotiable boundaries": "Do not commit. Do not claim tests passed.",
+        "Acceptance criteria": f"Verification commands must exit with 0:\n" + "\n".join(f"- {c}" for c in args.verify),
+        "Stop conditions": "Estimated context exceeds limits, edit failures, or unexpected exceptions.",
+        "Expected handoff": "Concise summary of changes and verification outcome.",
+    }
+
+    # Format markdown
+    yaml_lines = ["---"]
+    for k, v in packet_metadata.items():
+        yaml_lines.append(f"{k}: {json.dumps(v)}")
+    yaml_lines.append("---")
+
+    md_content = "\n".join(yaml_lines) + "\n\n# Task Packet\n\n"
+    for name, content in packet_sections.items():
+        md_content += f"## {name}\n\n{content}\n\n"
+
+    packet_path.write_text(md_content, encoding="utf-8")
+    print(f"Written packet to {packet_path}")
+
+    # 4. Validate and Compile Packet
+    print("\n\033[1;34m[Validate & Compile] Running validation...\033[0m")
+    val_proc = subprocess.run(
+        [sys.executable, str(root_dir / "bin" / "task-packet"), "validate", str(packet_path), "--require-ready"],
+        check=False
+    )
+    if val_proc.returncode != 0:
+        print("\033[1;31mError: Task packet validation failed.\033[0m")
+        return 1
+
+    comp_proc = subprocess.run(
+        [sys.executable, str(root_dir / "bin" / "task-packet"), "compile"],
+        check=False
+    )
+    if comp_proc.returncode != 0:
+        print("\033[1;31mError: Manifest compilation failed.\033[0m")
+        return 1
+
+    print("\033[1;32mPacket successfully validated and compiled into manifest.\033[0m")
+
+    if not args.run:
+        print("\033[1;32mDelegation setup complete. To run it, run again with --run flag, or use the harness eval workbench.\033[0m")
+        return 0
+
+    # 5. Live Execution Loop (if --run set)
+    print("\n\033[1;34m[Execution] Starting execution flow...\033[0m")
+
+    # Git Clean check
+    if check_git_status(root_dir):
+        print("\033[1;33mWarning: The working tree has uncommitted changes.\033[0m")
+        if sys.stdin.isatty():
+            ans = input("Do you want to proceed with the run anyway? [y/N]: ").strip().lower()
+            if ans not in ("y", "yes"):
+                print("Aborting.")
+                return 0
+        else:
+            print("Non-interactive terminal: Proceeding with warnings.")
+
+    # Health check
+    profile = PROFILES[args.profile]
+    healthy, msg = health_check(args.profile, profile)
+    if not healthy:
+        print(f"\033[1;31mHealth Check Failed: {msg}\033[0m")
+        return 1
+
+    # Setup runs folder
+    run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + f"-{task_id}"
+    raw_dir = project_dir / "raw-materials" / "runs" / run_id
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write first attempt prompt
+    prompt_file = raw_dir / "prompt-attempt-1.md"
+    prompt_file.write_text(render_prompt({"metadata": packet_metadata, "sections": packet_sections}), encoding="utf-8")
+
+    # RUN ATTEMPT 1
+    aider_code, stdout = run_aider(
+        workdir=project_dir,
+        profile_name=args.profile,
+        profile=profile,
+        prompt_path=prompt_file,
+        raw_dir=raw_dir,
+        attempt=1,
+        editable_files=args.editable,
+        read_only_files=args.read_only
+    )
+
+    # Save stdout/stderr
+    (raw_dir / "agent-attempt-1.stdout").write_text(stdout, encoding="utf-8")
+
+    # Parse claims
+    claims = parse_claims(stdout)
+    print(f"\n\033[1;34m[Analysis] Aider attempt 1 finished. Parsing claims...\033[0m")
+    print(f"TASK_STATUS claim: {claims['completion']}")
+    print(f"TASK_SUMMARY claim: {claims['summary']}")
+
+    # Run Verifiers
+    verifications = run_verification_commands(project_dir, args.verify)
+    passed = all(res[1] == 0 for res in verifications)
+
+    # Save verifier logs
+    for idx, (cmd, rc, output) in enumerate(verifications, start=1):
+        (raw_dir / f"verify-1-{idx}.stdout").write_text(output, encoding="utf-8")
+
+    if passed:
+        print("\n\033[1;32m[Success] Task completed and all verification commands passed successfully!\033[0m")
+        return 0
+
+    # RUN ATTEMPT 2 (REPAIR LOOP)
+    print("\n\033[1;33m[Repair] Verification failed. Initiating H2-repair loop...\033[0m")
+    failures = [(cmd, rc, output) for cmd, rc, output in verifications if rc != 0]
+    current_diff = get_git_diff(project_dir, args.editable)
+
+    repair_summary = []
+    for cmd, rc, output in failures:
+        repair_summary.append(f"Command: {json.dumps(cmd)}\nExit: {rc}\nOutput:\n{output[:4000]}")
+    repair_ctx_str = "\n\n".join(repair_summary) + "\n\nCurrent diff:\n" + current_diff[:8000]
+
+    repair_prompt = render_prompt({"metadata": packet_metadata, "sections": packet_sections}, repair_context=repair_ctx_str)
+    prompt_file_2 = raw_dir / "prompt-attempt-2.md"
+    prompt_file_2.write_text(repair_prompt, encoding="utf-8")
+
+    aider_code_2, stdout_2 = run_aider(
+        workdir=project_dir,
+        profile_name=args.profile,
+        profile=profile,
+        prompt_path=prompt_file_2,
+        raw_dir=raw_dir,
+        attempt=2,
+        editable_files=args.editable,
+        read_only_files=args.read_only
+    )
+
+    # Save repair logs
+    (raw_dir / "agent-attempt-2.stdout").write_text(stdout_2, encoding="utf-8")
+
+    # Re-run verifications
+    verifications_2 = run_verification_commands(project_dir, args.verify)
+    for idx, (cmd, rc, output) in enumerate(verifications_2, start=1):
+        (raw_dir / f"verify-2-{idx}.stdout").write_text(output, encoding="utf-8")
+
+    passed_2 = all(res[1] == 0 for res in verifications_2)
+    if passed_2:
+        print("\n\033[1;32m[Success] Task completed and verified successfully after repair attempt!\033[0m")
+        return 0
+    else:
+        print("\n\033[1;31m[Failure] Task failed verification even after repair attempt. Inspect files and diff.\033[0m")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())

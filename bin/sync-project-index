@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Generate or check the local/private 30_projects/index.md.
+
+`--check` also validates project-state truth (ADR-041): `active` requires
+activity evidence (file mtimes or nested-repo commits) within the window,
+the active count must respect the WIP cap, and every project needs valid
+frontmatter. Evidence rules match bin/session-close's checkpoint derivation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import os
+import re
+import subprocess
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS_DIR = ROOT / "30_projects"
+INDEX_PATH = PROJECTS_DIR / "index.md"
+
+VALID_STATES = {
+    "active", "paused", "planned", "blocked", "suspended", "shipped", "trashed",
+}
+WIP_CAP = 5
+ACTIVITY_WINDOW_DAYS = 14
+# Bounded scan, parity with bin/session-close latest_mtime.
+SCAN_ENTRY_CAP = 600
+SKIP_DIR_NAMES = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    ".pytest_cache", "dist", "build", ".cache",
+}
+
+
+def parse_frontmatter(path: Path) -> dict[str, str]:
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    metadata: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip().strip('"').strip("'")
+        metadata[key.strip()] = value
+    return metadata
+
+
+def first_heading(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^#\s+(.+)$", line)
+        if match:
+            return match.group(1).strip()
+    return path.parent.name
+
+
+def latest_mtime(project_dir: Path) -> float | None:
+    newest: float | None = None
+    scanned = 0
+    stack = [project_dir]
+    while stack and scanned < SCAN_ENTRY_CAP:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned >= SCAN_ENTRY_CAP:
+                        break
+                    if entry.name in SKIP_DIR_NAMES or entry.name.startswith("."):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                            if newest is None or mtime > newest:
+                                newest = mtime
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return newest
+
+
+def nested_repo_last_commit(project_dir: Path) -> float | None:
+    if not (project_dir / ".git").exists():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(project_dir), "log", "-1", "--format=%ct"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return float(proc.stdout.strip().splitlines()[-1])
+    except ValueError:
+        return None
+
+
+def activity_evidence(project_dir: Path) -> float | None:
+    """Newest evidence timestamp: file mtimes or nested-repo last commit."""
+    signals = [ts for ts in (latest_mtime(project_dir),
+                             nested_repo_last_commit(project_dir))
+               if ts is not None]
+    return max(signals) if signals else None
+
+
+def project_rows(projects_dir: Path = PROJECTS_DIR) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for readme in sorted(projects_dir.glob("*/README.md")):
+        metadata = parse_frontmatter(readme)
+        evidence = activity_evidence(readme.parent)
+        rows.append(
+            {
+                "name": metadata.get("title") or first_heading(readme),
+                "path": readme.parent.name,
+                "state": metadata.get("project_state") or metadata.get("status") or "unknown",
+                "goal": metadata.get("goal") or "",
+                "next_action": metadata.get("next_action") or "",
+                "updated": metadata.get("updated") or metadata.get("last_updated") or "",
+                "evidence": (date.fromtimestamp(evidence).isoformat()
+                             if evidence is not None else ""),
+            }
+        )
+    return rows
+
+
+def cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", " ").strip() or "-"
+
+
+def render(projects_dir: Path = PROJECTS_DIR) -> str:
+    lines = [
+        "# Projects Index",
+        "",
+        "Generated from project README metadata. This local file is ignored by Git; do not edit by hand.",
+        "Run `bin/sync-project-index --write` to regenerate it.",
+        "`Evidence` is the last observed activity (file mtimes / nested-repo commit), not self-report.",
+        "",
+    ]
+    rows = project_rows(projects_dir)
+    if not rows:
+        lines.extend(["_No project README files found._", ""])
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            "| Project | State | Goal | Next action | Updated | Evidence |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for row in rows:
+        project = f"[{cell(row['name'])}]({cell(row['path'])}/README.md)"
+        lines.append(
+            f"| {project} | {cell(row['state'])} | {cell(row['goal'])} | "
+            f"{cell(row['next_action'])} | {cell(row['updated'])} | "
+            f"{cell(row['evidence'])} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def validate_projects(projects_dir: Path = PROJECTS_DIR,
+                      now_ts: float | None = None,
+                      window_days: int = ACTIVITY_WINDOW_DAYS,
+                      wip_cap: int = WIP_CAP) -> list[str]:
+    """Project-state truth rules (ADR-041). Returns human-readable problems."""
+    if now_ts is None:
+        now_ts = datetime.now().timestamp()
+    problems: list[str] = []
+    active_names: list[str] = []
+    for entry in sorted(projects_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        readme = entry / "README.md"
+        if not readme.exists():
+            problems.append(f"{entry.name}: missing README.md")
+            continue
+        metadata = parse_frontmatter(readme)
+        state = (metadata.get("project_state") or metadata.get("status") or "").strip()
+        if not state:
+            problems.append(
+                f"{entry.name}: missing project_state frontmatter "
+                "(README must start with a `---` block)")
+            continue
+        if state not in VALID_STATES:
+            problems.append(
+                f"{entry.name}: unknown project_state '{state}' "
+                f"(valid: {', '.join(sorted(VALID_STATES))})")
+            continue
+        next_action = (metadata.get("next_action") or "").strip()
+        if state == "active":
+            active_names.append(entry.name)
+            evidence = activity_evidence(entry)
+            if evidence is None:
+                problems.append(f"{entry.name}: active but no activity evidence found")
+            else:
+                age_days = (now_ts - evidence) / 86400
+                if age_days > window_days:
+                    problems.append(
+                        f"{entry.name}: active but idle {age_days:.1f}d "
+                        f"(> {window_days}d window) — pause it with a "
+                        "next_action reentry pointer or resume work")
+            if not next_action:
+                problems.append(f"{entry.name}: active without next_action")
+        elif state == "paused" and not next_action:
+            problems.append(
+                f"{entry.name}: paused without next_action reentry pointer")
+    if len(active_names) > wip_cap:
+        problems.append(
+            f"WIP cap breach: {len(active_names)} active projects "
+            f"(cap {wip_cap}): {', '.join(active_names)}")
+    return problems
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--check", action="store_true", help="fail if index is stale")
+    group.add_argument("--write", action="store_true", help="write generated index")
+    args = parser.parse_args()
+
+    generated = render()
+    problems = validate_projects()
+    if args.write:
+        INDEX_PATH.write_text(generated, encoding="utf-8")
+        print(f"wrote {INDEX_PATH.relative_to(ROOT)}")
+        if problems:
+            print("project-state problems (--check fails until fixed):",
+                  file=sys.stderr)
+            for problem in problems:
+                print(f"  - {problem}", file=sys.stderr)
+        return 0
+
+    failed = False
+    current = INDEX_PATH.read_text(encoding="utf-8") if INDEX_PATH.exists() else ""
+    if current != generated:
+        failed = True
+        print("local 30_projects/index.md is stale; run `bin/sync-project-index --write`.", file=sys.stderr)
+        for line in difflib.unified_diff(
+            current.splitlines(),
+            generated.splitlines(),
+            fromfile="current",
+            tofile="generated",
+            lineterm="",
+        ):
+            print(line, file=sys.stderr)
+    if problems:
+        failed = True
+        print("project-state problems (ADR-041):", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+    if failed:
+        return 1
+    print("local 30_projects/index.md is current; project states verified")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""Crawl project directories for task lists and compile them into a unified manifest."""
+
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS_DIR = ROOT / "30_projects"
+MANIFEST_PATH = PROJECTS_DIR / "tasks_manifest.json"
+PACKET_MANIFEST_PATH = PROJECTS_DIR / "task_packets_manifest.json"
+
+# Only explicit checkbox lines become tasks. Decision-log bullets (promoted
+# ADRs and the like) are records, not work items.
+MAX_TASK_TITLE_LENGTH = 200
+SKIP_TITLE_PREFIXES = ("**Promoted", "ADR-")
+
+
+def normalize_task_title(raw_title: str) -> str | None:
+    title = raw_title.strip()
+    if not title or title.startswith(SKIP_TITLE_PREFIXES):
+        return None
+    if len(title) > MAX_TASK_TITLE_LENGTH:
+        title = title[: MAX_TASK_TITLE_LENGTH - 1].rstrip() + "…"
+    return title
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    metadata = {}
+    for line in text[4:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip().strip('"').strip("'")
+        metadata[key.strip()] = value
+    return metadata
+
+
+def extract_readme_tasks(readme_path: Path, project_slug: str) -> list[dict]:
+    if not readme_path.exists():
+        return []
+
+    text = readme_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    tasks = []
+    in_tasks_section = False
+    task_counter = 1
+
+    for line in lines:
+        stripped = line.strip()
+        # Toggle section
+        if stripped.startswith("## "):
+            header = stripped[3:].strip().lower()
+            if header in ("tasks", "todo", "todo list", "checklist", "roadmap"):
+                in_tasks_section = True
+            else:
+                in_tasks_section = False
+        elif stripped.startswith("# "):
+            in_tasks_section = False
+
+        if in_tasks_section:
+            match = re.match(r"^[-*]\s+\[([ x/])\]\s+(.+)$", stripped)
+            if match:
+                state_char = match.group(1)
+                title = normalize_task_title(match.group(2))
+                if title is None:
+                    continue
+
+                # Deduce status
+                if state_char == "x":
+                    status = "done"
+                elif state_char == "/":
+                    status = "active"
+                else:
+                    status = "active"
+
+                tasks.append(
+                    {
+                        "id": f"task-{project_slug}-readme-{task_counter}",
+                        "title": title,
+                        "status": status,
+                        "priority": "normal",
+                        "owner_agent_id": "agent-local-coder",
+                        "phase": "README Tasks",
+                        "next_action": title,
+                        "blocker": "",
+                        "unresolved_decisions": [],
+                        "mainframe_target": f"30_projects/{project_slug}/README.md",
+                        "evidence": [],
+                        "updated": "today",
+                    }
+                )
+                task_counter += 1
+
+    return tasks
+
+
+def packet_tasks(packet_manifest_path: Path = PACKET_MANIFEST_PATH) -> list[dict]:
+    if not packet_manifest_path.exists():
+        return []
+    payload = json.loads(packet_manifest_path.read_text(encoding="utf-8"))
+    tasks = []
+    for packet in payload.get("packets", []):
+        status = packet.get("status", "draft")
+        if status == "retired":
+            task_status = "done"
+        elif status == "ready":
+            task_status = "active"
+        else:
+            task_status = "review"
+        tasks.append(
+            {
+                "id": packet["id"],
+                "title": packet["title"],
+                "status": task_status,
+                "priority": "normal",
+                "owner_agent_id": "agent-local-coder",
+                "phase": f"Delegation packet ({status})",
+                "goal": packet.get("goal", ""),
+                "next_action": packet.get("next_action", ""),
+                "blocker": "",
+                "unresolved_decisions": [],
+                "mainframe_target": packet["packet_path"],
+                "evidence": [
+                    {
+                        "label": "Delegation packet contract",
+                        "session_id": "task-packet",
+                        "event_id": packet["task_id"],
+                    }
+                ],
+                "updated": "generated",
+                "task_kind": packet.get("task_kind"),
+                "agent_profile": packet.get("agent_profile"),
+                "packet_path": packet["packet_path"],
+            }
+        )
+    return tasks
+
+
+def extract_phase_tasks(plan_path: Path, project_slug: str) -> list[dict]:
+    try:
+        content = plan_path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"Error reading {plan_path}: {e}", file=sys.stderr)
+        return []
+
+    # Try to parse frontmatter or top metadata lines
+    metadata = {}
+    if content.startswith("---\n") or content.startswith("---\r\n"):
+        metadata = parse_frontmatter(content)
+    else:
+        # Fallback to simple colon matching in the first 15 lines
+        for line in content.splitlines()[:15]:
+            match = re.match(r"^([a-zA-Z0-9_-]+):\s*(.+)$", line.strip())
+            if match:
+                key = match.group(1).lower()
+                val = match.group(2).strip().strip('"').strip("'")
+                metadata[key] = val
+            match_bold = re.match(r"^\*\*([a-zA-Z0-9_-]+):\*\*\s*(.+)$", line.strip())
+            if match_bold:
+                key = match_bold.group(1).lower()
+                val = match_bold.group(2).strip().strip('"').strip("'")
+                metadata[key] = val
+
+    # Check plan status
+    status_raw = metadata.get("status", "active").lower()
+    phase_status = "active"
+    if any(k in status_raw for k in ("complete", "shipped", "done", "retired")):
+        phase_status = "complete"
+    elif any(k in status_raw for k in ("planned", "draft", "backlog", "not started")):
+        phase_status = "planned"
+
+    # H1 title
+    phase_title = plan_path.stem
+    for line in content.splitlines():
+        h1_match = re.match(r"^#\s+(.+)$", line)
+        if h1_match:
+            phase_title = h1_match.group(1).strip()
+            break
+
+    # Extract goal
+    goal = ""
+    goal_match = re.search(r"## Goal\s+(.+?)(?=\n##|\Z)", content, re.DOTALL)
+    if goal_match:
+        goal = goal_match.group(1).strip().replace("\n", " ")
+        if len(goal) > 200:
+            goal = goal[:197] + "..."
+
+    # Parse lines
+    lines = content.splitlines()
+    tasks = []
+    current_section = ""
+    current_unit = ""
+    unit_tasks_buffer = []
+
+    # Heuristic list of headers that contain tasks
+    task_header_keywords = ("unit", "step", "milestone", "implementation", "task", "checklist", "order", "run")
+    exclude_header_keywords = ("reference", "boundary", "starting point", "measured", "purpose", "non-negotiable")
+
+    def is_task_section(sec_name):
+        sec_lower = sec_name.lower()
+        if any(kw in sec_lower for kw in exclude_header_keywords):
+            return False
+        if any(kw in sec_lower for kw in task_header_keywords):
+            return True
+        return False
+
+    for idx, line in enumerate(lines):
+        line_num = idx + 1
+        stripped = line.strip()
+
+        # Detect headers
+        if stripped.startswith("## "):
+            current_section = stripped[3:].strip()
+            current_unit = ""
+        elif stripped.startswith("### "):
+            current_unit = stripped[4:].strip()
+        elif stripped.startswith("- **M") or stripped.startswith("* **M"):
+            m_match = re.match(r"^[-*]\s+\*\*([^*]+)\*\*(.*)$", stripped)
+            if m_match:
+                current_unit = m_match.group(1).strip() + m_match.group(2).strip()
+
+        # Parse tasks in valid sections
+        sec_context = current_unit or current_section
+        if sec_context and is_task_section(sec_context):
+            # Check for checkbox
+            cb_match = re.match(r"^[-*]\s+\[([ x/])\]\s+(.+)$", stripped)
+            if cb_match:
+                state_char = cb_match.group(1)
+                task_title = normalize_task_title(cb_match.group(2))
+                if task_title is None:
+                    continue
+
+                prefix = f"[{current_unit}] " if current_unit else ""
+                full_title = f"{prefix}{task_title}"
+                # Unit prefixes can push a capped title past the serving
+                # gate (240); truncate rather than lose the task downstream.
+                if len(full_title) > 240:
+                    full_title = full_title[:239].rstrip() + "…"
+
+                task_state = "active"
+                if state_char == "x":
+                    task_state = "done"
+                elif state_char == "/":
+                    task_state = "active"
+                else:
+                    if phase_status == "complete":
+                        task_state = "done"
+                    elif phase_status == "planned":
+                        task_state = "backlog"
+                    else:
+                        task_state = "active"
+
+                unit_tasks_buffer.append({
+                    "line_num": line_num,
+                    "title": full_title,
+                    "status": task_state,
+                    "unit": current_unit or current_section,
+                    "is_checkbox": True
+                })
+            # Plain bullets are intentionally not captured: plan sections mix
+            # work items with decision-log and status notes, and only the
+            # operator's explicit checkboxes are commitments.
+
+    # Refine status of active items using the unit order heuristic
+    if phase_status == "active" and unit_tasks_buffer:
+        units_ordered = []
+        unit_to_tasks = {}
+        for t in unit_tasks_buffer:
+            u = t["unit"]
+            if u not in unit_to_tasks:
+                units_ordered.append(u)
+                unit_to_tasks[u] = []
+            unit_to_tasks[u].append(t)
+
+        active_unit_idx = -1
+        for i, u in enumerate(units_ordered):
+            has_active = any(t["status"] == "active" for t in unit_to_tasks[u])
+            if has_active:
+                active_unit_idx = i
+                break
+
+        if active_unit_idx != -1:
+            for i in range(active_unit_idx + 1, len(units_ordered)):
+                for t in unit_to_tasks[units_ordered[i]]:
+                    if t["status"] == "active":
+                        t["status"] = "backlog"
+
+    # Construct final task records
+    target_rel_prefix = f"30_projects/{project_slug}/plans"
+    if project_slug == "local-agent":
+        target_rel_prefix = "30_projects/local-agent/workbench/planning"
+
+    for t in unit_tasks_buffer:
+        plan_rel_path = f"{target_rel_prefix}/{plan_path.name}"
+        tasks.append({
+            "id": f"task-{project_slug}-{plan_path.stem}-l{t['line_num']}",
+            "title": t["title"],
+            "status": t["status"],
+            "priority": metadata.get("priority", "normal"),
+            "owner_agent_id": "agent-local-coder",
+            "phase": phase_title,
+            "goal": goal,
+            "next_action": t["title"],
+            "blocker": "",
+            "unresolved_decisions": [],
+            "mainframe_target": f"{plan_rel_path}#L{t['line_num']}",
+            "evidence": [],
+            "updated": metadata.get("last_updated") or metadata.get("updated") or "today"
+        })
+
+    return tasks
+
+
+def compile_tasks(
+    projects_dir: Path = PROJECTS_DIR,
+    packet_manifest_path: Path = PACKET_MANIFEST_PATH,
+) -> list[dict]:
+    compiled_tasks = []
+
+    # Scan projects
+    for p_dir in sorted(projects_dir.iterdir()):
+        if not p_dir.is_dir():
+            continue
+        if p_dir.name.startswith("."):
+            continue
+
+        readme_path = p_dir / "README.md"
+        project_tasks = []
+
+        # 1. Parse README metadata for defaults
+        metadata = {}
+        project_title = p_dir.name
+        if readme_path.exists():
+            try:
+                readme_text = readme_path.read_text(encoding="utf-8")
+                metadata = parse_frontmatter(readme_text)
+                project_title = metadata.get("title") or project_title
+            except Exception as e:
+                print(f"Error reading README for {p_dir.name}: {e}", file=sys.stderr)
+
+        # 2. Extract tasks from plans/ and plans/phases/ (recursively)
+        plan_files = []
+        plans_dir = p_dir / "plans"
+        if plans_dir.exists():
+            plan_files.extend(plans_dir.glob("*.md"))
+            plan_files.extend(plans_dir.glob("phases/*.md"))
+
+        # Special case: local-agent planning files
+        if p_dir.name == "local-agent":
+            la_planning = p_dir / "workbench" / "planning"
+            if la_planning.exists():
+                plan_files.extend(la_planning.glob("*.md"))
+                plan_files.extend(la_planning.glob("phases/*.md"))
+
+        for plan_file in plan_files:
+            if plan_file.name == "README.md":
+                continue
+            plan_tasks = extract_phase_tasks(plan_file, p_dir.name)
+            project_tasks.extend(plan_tasks)
+
+        # 3. Fallback to README metadata if no tasks extracted from plan files
+        if not project_tasks:
+            status = metadata.get("status") or metadata.get("project_state") or "active"
+            status = status.lower()
+            if status == "shipped":
+                status = "done"
+            if status not in ("active", "review", "blocked", "done", "backlog"):
+                status = "active"
+            project_tasks.append(
+                {
+                    "id": f"project-{p_dir.name}",
+                    "title": project_title,
+                    "status": status,
+                    "priority": metadata.get("priority", "normal"),
+                    "owner_agent_id": "agent-local-coder",
+                    "phase": metadata.get("project_state", "Active Project"),
+                    "next_action": metadata.get("next_action", "Explore next steps."),
+                    "blocker": metadata.get("blocker", ""),
+                    "unresolved_decisions": metadata.get("unresolved_decisions", []),
+                    "mainframe_target": f"30_projects/{p_dir.name}/README.md",
+                    "evidence": [],
+                    "updated": metadata.get("updated") or "unknown",
+                }
+            )
+
+        compiled_tasks.extend(project_tasks)
+
+    compiled_tasks.extend(packet_tasks(packet_manifest_path))
+    return compiled_tasks
+
+
+def main() -> int:
+    compiled_tasks = compile_tasks()
+
+    # Write compiled manifest
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+        json.dump({"tasks": compiled_tasks}, f, indent=2)
+
+    print(f"Compiled {len(compiled_tasks)} tasks to {MANIFEST_PATH.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

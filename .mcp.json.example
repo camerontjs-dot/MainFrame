@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mindgraph": {
+      "command": "/path/to/Mainframe/bin/mindgraph",
+      "args": ["serve-mcp"]
+    }
+  }
+}

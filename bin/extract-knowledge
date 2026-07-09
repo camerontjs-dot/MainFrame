@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Validate prerequisites and scaffold a knowledge note from a project."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS_DIR = ROOT / "30_projects"
+KNOWLEDGE_DIR = ROOT / "10_knowledge"
+
+
+@dataclass(frozen=True)
+class Prerequisite:
+    name: str
+    path: str
+    exists: bool
+    required: bool
+    message: str
+
+
+@dataclass
+class ExtractResult:
+    prerequisites: list[Prerequisite] = field(default_factory=list)
+    target_path: str | None = None
+    collision: bool = False
+    written: bool = False
+
+    @property
+    def ok(self) -> bool:
+        if self.collision:
+            return False
+        return all(p.exists for p in self.prerequisites if p.required)
+
+
+def slugify(title: str) -> str:
+    slug = title.lower().strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-")
+
+
+def scaffold_content(title: str, domain: str, project_slug: str,
+                     tags: list[str]) -> str:
+    tag_str = json_tags(tags)
+    return (
+        f"---\n"
+        f'title: "{title}"\n'
+        f'domain: "{domain}"\n'
+        f'type: "note"\n'
+        f'status: "queued"\n'
+        f'source: "30_projects/{project_slug}/README.md"\n'
+        f"tags: {tag_str}\n"
+        f"---\n"
+        f"\n"
+        f"# {title}\n"
+        f"\n"
+    )
+
+
+def json_tags(tags: list[str]) -> str:
+    inner = ", ".join(f'"{t}"' for t in tags)
+    return f"[{inner}]"
+
+
+def check_prerequisites(root: Path, project_slug: str,
+                        domain: str) -> list[Prerequisite]:
+    prereqs: list[Prerequisite] = []
+
+    proj_dir = root / "30_projects" / project_slug
+    prereqs.append(Prerequisite(
+        name="project directory",
+        path=f"30_projects/{project_slug}",
+        exists=proj_dir.is_dir(),
+        required=True,
+        message="project directory must exist",
+    ))
+
+    readme = proj_dir / "README.md"
+    prereqs.append(Prerequisite(
+        name="project README",
+        path=f"30_projects/{project_slug}/README.md",
+        exists=readme.exists(),
+        required=True,
+        message="project README is the extraction source",
+    ))
+
+    log = proj_dir / "log.md"
+    prereqs.append(Prerequisite(
+        name="project log",
+        path=f"30_projects/{project_slug}/log.md",
+        exists=log.exists(),
+        required=False,
+        message="log.md is optional but useful for extraction",
+    ))
+
+    decisions = proj_dir / "decisions.md"
+    prereqs.append(Prerequisite(
+        name="project decisions",
+        path=f"30_projects/{project_slug}/decisions.md",
+        exists=decisions.exists(),
+        required=False,
+        message="decisions.md is optional but useful for extraction",
+    ))
+
+    domain_dir = root / "10_knowledge" / domain
+    prereqs.append(Prerequisite(
+        name="knowledge domain",
+        path=f"10_knowledge/{domain}",
+        exists=domain_dir.is_dir(),
+        required=True,
+        message="target domain must exist in 10_knowledge/",
+    ))
+
+    return prereqs
+
+
+def run_extract(root: Path, project_slug: str, domain: str, title: str,
+                tags: list[str], write: bool = False) -> ExtractResult:
+    result = ExtractResult()
+    result.prerequisites = check_prerequisites(root, project_slug, domain)
+
+    filename = f"{date.today().isoformat()}__{domain}__note__{slugify(title)}.md"
+    target = root / "10_knowledge" / domain / filename
+    result.target_path = f"10_knowledge/{domain}/{filename}"
+
+    if target.exists():
+        result.collision = True
+
+    if not result.ok:
+        return result
+
+    if write:
+        content = scaffold_content(title, domain, project_slug, tags)
+        target.write_text(content, encoding="utf-8")
+        result.written = True
+
+    return result
+
+
+def print_result(result: ExtractResult) -> None:
+    for p in result.prerequisites:
+        status = "OK" if p.exists else ("MISSING" if p.required else "WARN")
+        print(f"  [{status:>7}] {p.path}  — {p.message}")
+
+    print()
+    if result.target_path:
+        print(f"  target: {result.target_path}")
+    if result.collision:
+        print("  ERROR: target file already exists; will not overwrite")
+    if result.written:
+        print("  WROTE scaffold — fill in knowledge content, then run bin/mindgraph-refresh")
+    elif result.ok and not result.written:
+        print("  CHECK passed — run with --write to create the scaffold")
+    elif not result.ok:
+        print("  CHECK failed — resolve required prerequisites first")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Scaffold a knowledge note extracted from a project."
+    )
+    parser.add_argument("--project", required=True,
+                        help="project slug under 30_projects/")
+    parser.add_argument("--domain", required=True,
+                        help="target domain under 10_knowledge/")
+    parser.add_argument("--title", required=True,
+                        help="title for the new knowledge note")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true",
+                      help="validate prerequisites only (default)")
+    mode.add_argument("--write", action="store_true",
+                      help="create the scaffolded note file")
+    parser.add_argument("--tags", default="extracted",
+                        help="comma-separated tags (default: extracted)")
+    args = parser.parse_args()
+
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    write = args.write
+
+    result = run_extract(ROOT, args.project, args.domain, args.title,
+                         tags, write=write)
+    print_result(result)
+
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

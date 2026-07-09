@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Tail Aider histories and emit conservative, redacted workflow telemetry."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Iterable
+from pathlib import Path
+
+
+POLL_INTERVAL = 1.0
+DISCOVERY_INTERVAL = 10.0
+# Default to the MainFrame root that contains this bin/ wrapper.
+_MAINFRAME_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_WORKSPACES = (_MAINFRAME_ROOT,)
+
+SESSION_START_RE = re.compile(r"^# aider chat started at (.*)")
+MODEL_RE = re.compile(r"^>\s*Model:\s*(\S+)")
+PROMPT_RE = re.compile(r"^####\s+(.+)")
+RUN_RE = re.compile(r"^/run\s+(.+)")
+BANG_RE = re.compile(r"^!\s*(.+)")
+SHELL_RE = re.compile(r"^\$\s+(.+)")
+PROPOSED_COMMAND_RE = re.compile(r"^>\s+(.+)")
+SHELL_APPROVAL_RE = re.compile(
+    r"^>\s*Run shell commands\?.*\[[^]]+\]:\s*(\S+)", re.IGNORECASE
+)
+DIFF_RE = re.compile(r"^diff --git")
+APPLIED_EDIT_RE = re.compile(
+    r"(?:Applied edit to\s+|SEARCH/REPLACE blocks? were applied successfully)",
+    re.IGNORECASE,
+)
+APPLIED_COUNT_RE = re.compile(r"(\d+)\s+SEARCH/REPLACE blocks?", re.IGNORECASE)
+CONTEXT_LIMIT_RE = re.compile(
+    r"(?:context.*exceeds.*limit|token limit.*exceeded)", re.IGNORECASE
+)
+EDIT_FAILURE_RE = re.compile(
+    r"(?:did not conform to the edit format|SEARCH/REPLACE block failed|"
+    r"SearchReplaceNoExactMatch)",
+    re.IGNORECASE,
+)
+FAILURE_RE = re.compile(
+    r"(?:traceback|command failed|exit code [1-9])", re.IGNORECASE
+)
+
+VERIFICATION_TOKENS = {
+    "check",
+    "clippy",
+    "ctest",
+    "eslint",
+    "jest",
+    "lint",
+    "mocha",
+    "mypy",
+    "phpunit",
+    "pytest",
+    "rspec",
+    "ruff",
+    "test",
+    "tox",
+    "tsc",
+    "typecheck",
+    "unittest",
+    "vitest",
+}
+KNOWN_COMMAND_HEADS = VERIFICATION_TOKENS | {
+    "bash",
+    "cargo",
+    "git",
+    "make",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "python",
+    "python3",
+    "sh",
+    "yarn",
+}
+
+Emitter = Callable[[dict[str, object]], None]
+
+
+def new_state(size: int = 0) -> dict[str, object]:
+    return {
+        "size": size,
+        "partial": b"",
+        "session_id": None,
+        "session_started": False,
+        "model": "unknown",
+        "diagnostics_seen": set(),
+        "pending_shell_command": None,
+    }
+
+
+def extract_direct_command(line: str) -> str | None:
+    for pattern in (RUN_RE, BANG_RE, SHELL_RE):
+        match = pattern.match(line.strip())
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def extract_proposed_command(line: str) -> str | None:
+    match = PROPOSED_COMMAND_RE.match(line.strip())
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    tokens = candidate.split()
+    if not tokens:
+        return None
+    head = Path(tokens[0]).name.lower()
+    if head not in KNOWN_COMMAND_HEADS:
+        return None
+    return candidate
+
+
+def is_test_command(command: str) -> bool:
+    tokens = command.split()
+    if not tokens:
+        return False
+    normalized = {
+        Path(token.strip(".,:;()[]{}")).name.lower()
+        for token in tokens
+    }
+    return bool(normalized & VERIFICATION_TOKENS)
+
+
+def emit_event(event_dict: dict[str, object]) -> None:
+    try:
+        bin_dir = Path(__file__).parent
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(bin_dir / "workflow-event"),
+                "--client",
+                "local",
+            ],
+            input=json.dumps(event_dict),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            print(
+                f"[aider-watcher] workflow-event failed: {proc.stderr.strip()}",
+                file=sys.stderr,
+            )
+    except Exception as exc:
+        print(
+            f"[aider-watcher] error calling workflow-event: {exc}",
+            file=sys.stderr,
+        )
+
+
+def session_id_for(filepath: Path, timestamp: str) -> str:
+    material = f"{filepath.resolve()}\0{timestamp}"
+    return f"aider-{hashlib.sha256(material.encode()).hexdigest()[:16]}"
+
+
+def event_base(filepath: Path, state: dict[str, object]) -> dict[str, object]:
+    return {
+        "session_id": state.get("session_id") or "aider-default",
+        "source": "aider",
+        "cwd": str(filepath.parent),
+        "transcript_path": str(filepath),
+    }
+
+
+def ensure_session_started(
+    filepath: Path, state: dict[str, object], emitter: Emitter
+) -> None:
+    if state.get("session_started"):
+        return
+    payload = event_base(filepath, state)
+    payload.update(
+        {
+            "hook_event_name": "SessionStart",
+            "model": state.get("model") or "unknown",
+        }
+    )
+    emitter(payload)
+    state["session_started"] = True
+
+
+def end_session(
+    filepath: Path,
+    state: dict[str, object],
+    emitter: Emitter,
+    reason: str,
+) -> None:
+    if not state.get("session_started"):
+        return
+    payload = event_base(filepath, state)
+    payload.update({"hook_event_name": "SessionEnd", "reason": reason})
+    emitter(payload)
+    state["session_started"] = False
+
+
+def emit_diagnostic(
+    filepath: Path,
+    state: dict[str, object],
+    emitter: Emitter,
+    diagnostic: str,
+) -> None:
+    seen = state["diagnostics_seen"]
+    assert isinstance(seen, set)
+    if diagnostic in seen:
+        return
+    ensure_session_started(filepath, state, emitter)
+    payload = event_base(filepath, state)
+    payload.update(
+        {"hook_event_name": "Diagnostic", "diagnostic": diagnostic}
+    )
+    emitter(payload)
+    seen.add(diagnostic)
+
+
+def emit_command(
+    filepath: Path,
+    state: dict[str, object],
+    emitter: Emitter,
+    command: str,
+) -> None:
+    ensure_session_started(filepath, state, emitter)
+    payload = event_base(filepath, state)
+    payload.update(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "tool_purpose": (
+                "verification" if is_test_command(command) else "operation"
+            ),
+        }
+    )
+    emitter(payload)
+
+
+def process_line(
+    line: str,
+    filepath: Path,
+    state: dict[str, object],
+    emitter: Emitter = emit_event,
+) -> None:
+    trimmed = line.strip()
+    if not trimmed:
+        return
+
+    start_match = SESSION_START_RE.match(trimmed)
+    if start_match:
+        end_session(filepath, state, emitter, "next_session_started")
+        timestamp = start_match.group(1).strip()
+        state.update(
+            {
+                "session_id": session_id_for(filepath, timestamp),
+                "session_started": False,
+                "model": "unknown",
+                "diagnostics_seen": set(),
+                "pending_shell_command": None,
+            }
+        )
+        return
+
+    model_match = MODEL_RE.match(trimmed)
+    if model_match:
+        state["model"] = model_match.group(1).strip()
+        ensure_session_started(filepath, state, emitter)
+        return
+
+    prompt_match = PROMPT_RE.match(trimmed)
+    if prompt_match:
+        ensure_session_started(filepath, state, emitter)
+        payload = event_base(filepath, state)
+        payload.update(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": prompt_match.group(1).strip(),
+            }
+        )
+        emitter(payload)
+        return
+
+    approval_match = SHELL_APPROVAL_RE.match(trimmed)
+    if approval_match:
+        response = approval_match.group(1).lower()
+        pending = state.get("pending_shell_command")
+        if response in {"y", "yes", "d"} and isinstance(pending, str):
+            emit_command(filepath, state, emitter, pending)
+        elif response in {"n", "no"}:
+            emit_diagnostic(
+                filepath,
+                state,
+                emitter,
+                "shell_command_denied",
+            )
+        state["pending_shell_command"] = None
+        return
+
+    direct_command = extract_direct_command(trimmed)
+    if direct_command:
+        emit_command(filepath, state, emitter, direct_command)
+        return
+
+    proposed_command = extract_proposed_command(trimmed)
+    if proposed_command:
+        state["pending_shell_command"] = proposed_command
+        return
+
+    if CONTEXT_LIMIT_RE.search(trimmed):
+        emit_diagnostic(
+            filepath, state, emitter, "context_limit_exceeded"
+        )
+        return
+
+    if EDIT_FAILURE_RE.search(trimmed):
+        emit_diagnostic(filepath, state, emitter, "edit_format_failure")
+        return
+
+    if DIFF_RE.match(trimmed) or APPLIED_EDIT_RE.search(trimmed):
+        ensure_session_started(filepath, state, emitter)
+        count_match = APPLIED_COUNT_RE.search(trimmed)
+        observed_count = int(count_match.group(1)) if count_match else 1
+        payload = event_base(filepath, state)
+        payload.update(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_input": {},
+                "observed_count": observed_count,
+            }
+        )
+        emitter(payload)
+        return
+
+    if FAILURE_RE.search(trimmed):
+        emit_diagnostic(filepath, state, emitter, "command_failure")
+
+
+def process_bytes(
+    data: bytes,
+    filepath: Path,
+    state: dict[str, object],
+    emitter: Emitter = emit_event,
+    *,
+    final: bool = False,
+) -> None:
+    partial = state.get("partial")
+    assert isinstance(partial, bytes)
+    parts = (partial + data).split(b"\n")
+    complete = parts if final else parts[:-1]
+    state["partial"] = b"" if final else parts[-1]
+    for raw_line in complete:
+        process_line(
+            raw_line.rstrip(b"\r").decode("utf-8", errors="ignore"),
+            filepath,
+            state,
+            emitter,
+        )
+
+
+def read_growth(
+    filepath: Path,
+    state: dict[str, object],
+    emitter: Emitter = emit_event,
+    *,
+    final: bool = False,
+) -> None:
+    current_size = filepath.stat().st_size
+    size = state.get("size")
+    assert isinstance(size, int)
+    if current_size < size:
+        state.update(new_state())
+        size = 0
+    if current_size > size:
+        with filepath.open("rb") as handle:
+            handle.seek(size)
+            data = handle.read()
+        state["size"] = current_size
+        process_bytes(data, filepath, state, emitter, final=final)
+    elif final and state.get("partial"):
+        process_bytes(b"", filepath, state, emitter, final=True)
+
+
+def scan_files(workspaces: Iterable[Path]) -> list[Path]:
+    found: set[Path] = set()
+    for workspace in workspaces:
+        root_history = workspace / ".aider.chat.history.md"
+        if root_history.exists():
+            found.add(root_history)
+        projects_dir = workspace / "30_projects"
+        if projects_dir.exists():
+            found.update(projects_dir.rglob(".aider.chat.history.md"))
+    return sorted(found)
+
+
+def replay(paths: Iterable[Path], emitter: Emitter = emit_event) -> None:
+    for path in paths:
+        state = new_state()
+        read_growth(path, state, emitter, final=True)
+        end_session(path, state, emitter, "replay_eof")
+
+
+def watch(
+    workspaces: Iterable[Path],
+    poll_interval: float,
+    discovery_interval: float,
+) -> None:
+    print("[aider-watcher] Starting Aider chat history watcher...", flush=True)
+    files_state: dict[Path, dict[str, object]] = {}
+    for path in scan_files(workspaces):
+        size = path.stat().st_size
+        files_state[path] = new_state(size=size)
+        print(
+            f"[aider-watcher] Watching existing file: {path} "
+            f"(size: {size} bytes)",
+            flush=True,
+        )
+
+    next_discovery = time.monotonic()
+    while True:
+        try:
+            now = time.monotonic()
+            if now >= next_discovery:
+                current_paths = set(scan_files(workspaces))
+                for path in current_paths - files_state.keys():
+                    files_state[path] = new_state()
+                    print(
+                        f"[aider-watcher] Discovered new file: {path}",
+                        flush=True,
+                    )
+                for path in set(files_state) - current_paths:
+                    del files_state[path]
+                next_discovery = now + discovery_interval
+
+            for path, state in list(files_state.items()):
+                try:
+                    read_growth(path, state)
+                except FileNotFoundError:
+                    del files_state[path]
+                except Exception as exc:
+                    print(
+                        f"[aider-watcher] Error reading file {path}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        except Exception as exc:
+            print(
+                f"[aider-watcher] Loop error: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        time.sleep(poll_interval)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--replay",
+        action="append",
+        type=Path,
+        help="parse an existing history from the beginning, then exit",
+    )
+    parser.add_argument(
+        "--workspace",
+        action="append",
+        type=Path,
+        help="workspace root to scan; may be repeated",
+    )
+    parser.add_argument("--poll-interval", type=float, default=POLL_INTERVAL)
+    parser.add_argument(
+        "--discovery-interval",
+        type=float,
+        default=DISCOVERY_INTERVAL,
+    )
+    args = parser.parse_args()
+
+    if args.replay:
+        replay(args.replay)
+        return 0
+
+    watch(
+        args.workspace or DEFAULT_WORKSPACES,
+        max(0.1, args.poll_interval),
+        max(args.poll_interval, args.discovery_interval),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

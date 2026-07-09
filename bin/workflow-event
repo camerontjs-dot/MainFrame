@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""Append redacted agent-client hook event telemetry to 20_live."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DIR = ROOT / "20_live" / "workflow-metrics" / "events"
+TZ = ZoneInfo("America/Toronto")
+
+# A leading shell token shaped like NAME=value is an inline env assignment
+# (e.g. ``FOO=/tmp/bar cmd``). Skip it when picking the command head so the
+# assignment value does not leak into telemetry.
+ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A safe command head is a plain program name: alphanumerics with the usual
+# punctuation, no slashes, no path separators. Anything outside this shape is
+# collapsed before it is written to disk.
+SAFE_HEAD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+SAFE_PROCESS_ID_RE = re.compile(
+    r"^(?:cli|script|ingest|workflow|skill|agent)-[a-z0-9][a-z0-9._-]{0,72}$"
+)
+SHELL_TOOL_NAMES = {
+    "Bash",
+    "exec_command",
+    "functions.exec_command",
+    "run_terminal_command",
+}
+ALLOWED_DIAGNOSTICS = {
+    "command_failure",
+    "context_limit_exceeded",
+    "edit_format_failure",
+    "shell_command_denied",
+}
+ALLOWED_TOOL_PURPOSES = {"operation", "verification"}
+EVENT_NAME_ALIASES = {
+    "session_start": "SessionStart",
+    "user_prompt_submit": "UserPromptSubmit",
+    "pre_tool_use": "PreToolUse",
+    "post_tool_use": "PostToolUse",
+    "post_tool_use_failure": "PostToolUseFailure",
+    "permission_request": "PermissionRequest",
+    "permission_denied": "PermissionDenied",
+    "stop": "Stop",
+    "stop_failure": "StopFailure",
+    "notification": "Notification",
+    "subagent_start": "SubagentStart",
+    "subagent_stop": "SubagentStop",
+    "subagent_end": "SubagentStop",
+    "pre_compact": "PreCompact",
+    "post_compact": "PostCompact",
+    "session_end": "SessionEnd",
+}
+
+
+def digest(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def path_class(path_value: object) -> dict[str, str | None]:
+    if not path_value:
+        return {"path_zone": None, "extension": None}
+    try:
+        path = Path(str(path_value)).expanduser()
+        if not path.is_absolute():
+            path = (ROOT / path).resolve()
+        relative = path.relative_to(ROOT)
+        zone = relative.parts[0] if relative.parts else "."
+    except Exception:
+        zone = "external"
+        path = Path(str(path_value))
+    return {"path_zone": zone, "extension": path.suffix or None}
+
+
+def command_head(command: str) -> str | None:
+    """Pick the bare program name from a shell command line.
+
+    Skips leading env-var assignments (``FOO=/tmp/bar cmd`` -> ``cmd``) so
+    inline assignment values do not leak. Collapses path-shaped heads to
+    ``"<path>"`` and anything else unexpected to ``"<other>"`` so only the
+    shape of the call is recorded, never a filesystem basename.
+    """
+    tokens = command.split()
+    while tokens and ENV_ASSIGNMENT_RE.match(tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    head = tokens[0]
+    if "/" in head:
+        return "<path>"
+    if not SAFE_HEAD_RE.match(head):
+        return "<other>"
+    return head
+
+
+def bash_summary(tool_input: dict) -> dict[str, object]:
+    command = str(tool_input.get("command") or tool_input.get("cmd") or "").strip()
+    return {
+        "command_head": command_head(command) if command else None,
+        "command_hash": digest(command),
+        "timeout": tool_input.get("timeout"),
+        "background": tool_input.get("run_in_background"),
+    }
+
+
+def _process_id_candidates(value: object) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",")]
+    if isinstance(value, list):
+        return [
+            str(item).strip()
+            for item in value
+            if item not in (None, "")
+        ]
+    return [str(value).strip()]
+
+
+def process_ids(raw: dict) -> list[str]:
+    """Return validated catalogue/process ids from allowlisted fields/env vars."""
+    candidates: list[str] = []
+    for key in ("process_id", "process_ids", "catalogue_id", "catalogue_ids"):
+        candidates.extend(_process_id_candidates(raw.get(key)))
+    for key in ("MAINFRAME_PROCESS_ID", "MAINFRAME_CATALOGUE_ID"):
+        candidates.extend(_process_id_candidates(os.environ.get(key)))
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not SAFE_PROCESS_ID_RE.match(candidate):
+            continue
+        if candidate in seen:
+            continue
+        ids.append(candidate)
+        seen.add(candidate)
+    return ids
+
+
+def input_summary(tool_name: str | None, tool_input: dict) -> dict[str, object]:
+    if tool_name in SHELL_TOOL_NAMES:
+        return bash_summary(tool_input)
+    if tool_name in {
+        "Read",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "read_file",
+        "search_replace",
+        "apply_patch",
+    }:
+        return path_class(
+            tool_input.get("file_path")
+            or tool_input.get("path")
+        )
+    if tool_name in {"Glob", "Grep", "grep", "list_dir"}:
+        summary = path_class(
+            tool_input.get("path")
+            or tool_input.get("directory")
+        )
+        summary["pattern_hash"] = digest(tool_input.get("pattern"))
+        summary["glob_hash"] = digest(tool_input.get("glob"))
+        return summary
+    if tool_name:
+        return {"input_hash": digest(json.dumps(tool_input, sort_keys=True, default=str))}
+    return {}
+
+
+PERMISSION_HINTS = ("permission", "approve", "approval", "allow", "needs your")
+IDLE_HINTS = ("waiting for", "is waiting", "idle")
+
+
+def notification_kind(message: object) -> str | None:
+    """Coarsely classify a notification without storing its text.
+
+    ``permission`` means the agent is blocked on a human decision (review
+    table); ``idle`` means it is waiting on input; ``other`` is anything else.
+    """
+    if not message:
+        return None
+    lowered = str(message).lower()
+    if any(hint in lowered for hint in PERMISSION_HINTS):
+        return "permission"
+    if any(hint in lowered for hint in IDLE_HINTS):
+        return "idle"
+    return "other"
+
+
+def response_success(tool_response: object) -> bool | None:
+    """Best-effort tool outcome from a post-tool payload.
+
+    Claude Code signals failures with a separate PostToolUseFailure event,
+    but Codex reports the outcome inside PostToolUse's tool_response. Look
+    for an exit code or an explicit success flag, at the top level or one
+    level down in ``metadata``; return None when the shape is unrecognized
+    so the caller keeps the event-name default.
+    """
+    if not isinstance(tool_response, dict):
+        return None
+    containers = [tool_response]
+    if isinstance(tool_response.get("metadata"), dict):
+        containers.append(tool_response["metadata"])
+    for container in containers:
+        for key in ("exit_code", "exitCode", "returncode"):
+            value = container.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value == 0
+        if isinstance(container.get("success"), bool):
+            return container["success"]
+    return None
+
+
+def normalize_hook_payload(raw: dict) -> dict:
+    """Normalize supported client hook envelopes to MainFrame's schema.
+
+    Grok Build uses camelCase keys and lower snake-case event names, while the
+    existing Claude/Codex hooks use snake_case keys and canonical event names.
+    Only fields consumed by ``safe_event`` are copied; raw content remains
+    subject to the same redaction boundary.
+    """
+    normalized = dict(raw)
+    aliases = {
+        "hookEventName": "hook_event_name",
+        "sessionId": "session_id",
+        "transcriptPath": "transcript_path",
+        "workspaceRoot": "workspace_root",
+        "permissionMode": "permission_mode",
+        "toolName": "tool_name",
+        "toolInput": "tool_input",
+        "toolUseId": "tool_use_id",
+        "toolResponse": "tool_response",
+        "durationMs": "duration_ms",
+        "stopHookActive": "stop_hook_active",
+        "modelId": "model",
+    }
+    for source, target in aliases.items():
+        if target not in normalized and source in raw:
+            normalized[target] = raw[source]
+    if not normalized.get("cwd"):
+        normalized["cwd"] = raw.get("workspaceRoot")
+    event_name = normalized.get("hook_event_name")
+    if isinstance(event_name, str):
+        normalized["hook_event_name"] = EVENT_NAME_ALIASES.get(
+            event_name,
+            event_name,
+        )
+    return normalized
+
+
+def safe_event(raw: dict, client: str | None = None, pixel: str | None = None) -> dict[str, object]:
+    now = datetime.now(TZ)
+    event_name = raw.get("hook_event_name")
+    tool_name = raw.get("tool_name")
+    tool_input = raw.get("tool_input") if isinstance(raw.get("tool_input"), dict) else {}
+    event = {
+        "logged_at": now.isoformat(timespec="seconds"),
+        "as_of": now.date().isoformat(),
+        "event": event_name,
+        "client": client,
+        "pixel": pixel,  # unique/trackable identifier for the local agents pixel agent tracker
+        "session_hash": digest(raw.get("session_id")),
+        "transcript_hash": digest(raw.get("transcript_path")),
+        "cwd_zone": path_class(raw.get("cwd")).get("path_zone"),
+        "permission_mode": raw.get("permission_mode"),
+        "effort": (raw.get("effort") or {}).get("level")
+        if isinstance(raw.get("effort"), dict)
+        else None,
+        "tool_name": tool_name,
+        "tool_use_hash": digest(raw.get("tool_use_id")),
+        "duration_ms": raw.get("duration_ms"),
+        "input_summary": input_summary(tool_name, tool_input),
+    }
+    safe_process_ids = process_ids(raw)
+    if safe_process_ids:
+        event["process_id"] = safe_process_ids[0]
+        event["process_ids"] = safe_process_ids
+    if raw.get("source") == "aider":
+        event["source"] = "aider"
+    # Event-specific signals. Prompt and notification text are never stored
+    # verbatim - only a hash, a length, or a coarse kind - so the live tracker
+    # can light up planning / approval / handoff states without leaking content.
+    if event_name == "SessionStart":
+        event["source"] = raw.get("source")
+        event["model"] = raw.get("model")  # best-effort; absent on some clients
+    elif event_name == "SessionEnd":
+        event["reason"] = raw.get("reason")
+    elif event_name == "UserPromptSubmit":
+        prompt = raw.get("prompt")
+        event["prompt_hash"] = digest(prompt)
+        event["prompt_chars"] = len(prompt) if isinstance(prompt, str) else None
+    elif event_name == "Notification":
+        event["notification_hash"] = digest(raw.get("message"))
+        event["notification_kind"] = notification_kind(raw.get("message"))
+    elif event_name == "PermissionRequest":
+        # A dedicated approval event (Claude Code and Codex). Reuse the
+        # notification_kind vocabulary so downstream consumers have one
+        # "awaiting a human decision" signal.
+        event["notification_kind"] = "permission"
+    elif event_name in {"Stop", "SubagentStop"}:
+        event["stop_hook_active"] = raw.get("stop_hook_active")
+    elif event_name in {"PreCompact", "PostCompact"}:
+        event["trigger"] = raw.get("trigger")
+    elif event_name == "Diagnostic":
+        diagnostic = raw.get("diagnostic")
+        if diagnostic in ALLOWED_DIAGNOSTICS:
+            event["diagnostic"] = diagnostic
+    tool_purpose = raw.get("tool_purpose")
+    if tool_purpose in ALLOWED_TOOL_PURPOSES:
+        event["tool_purpose"] = tool_purpose
+    observed_count = raw.get("observed_count")
+    if isinstance(observed_count, int) and not isinstance(observed_count, bool):
+        event["observed_count"] = max(1, observed_count)
+    if event_name in {"PostToolUseFailure", "PermissionDenied", "StopFailure"}:
+        event["success"] = False
+    elif event_name == "PostToolUse":
+        derived = response_success(raw.get("tool_response"))
+        event["success"] = True if derived is None else derived
+    return event
+
+
+def parse_client(argv: list[str]) -> str | None:
+    """Read ``--client NAME`` (or ``--client=NAME``) from the hook command.
+
+    The client cannot be inferred reliably from the payload, so each agent's
+    hook config passes it explicitly (``--client claude`` / ``--client codex``).
+    """
+    for index, arg in enumerate(argv):
+        if arg == "--client" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--client="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def parse_pixel(argv: list[str]) -> str | None:
+    """Read optional ``--pixel ID`` for unique per-agent/pixel tracking.
+
+    Allows the local agents pixel agent tracker to distinguish specific
+    "pixels" (named agent instances or setups) while still grouping by client.
+    Example hook: .../workflow-event --client claude --pixel desktop-main-claude
+    """
+    for index, arg in enumerate(argv):
+        if arg == "--pixel" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--pixel="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def get_client_override() -> str | None:
+    import subprocess
+    import os
+    curr = os.getpid()
+    for _ in range(10):
+        if curr <= 1:
+            break
+        try:
+            res = subprocess.run(
+                ["ps", "-p", str(curr), "-o", "ppid,command"],
+                capture_output=True, text=True, check=False
+            )
+            if res.returncode != 0:
+                break
+            lines = res.stdout.strip().splitlines()
+            if len(lines) < 2:
+                break
+            parts = lines[1].split(None, 1)
+            ppid = int(parts[0])
+            cmd = parts[1].lower()
+            if "antigravity" in cmd:
+                return "antigravity"
+            if "codex" in cmd:
+                return "codex"
+            curr = ppid
+        except Exception:
+            break
+    return None
+
+
+def detect_loop(log_path: Path, session_hash: str) -> dict[str, object]:
+    """Read the last few events in log_path for the same session to detect loops.
+
+    If we see multiple consecutive failures or retries in the same session, we flag it.
+    """
+    if not log_path.exists():
+        return {"is_loop": False, "loop_count": 0}
+    try:
+        lines = []
+        with log_path.open("r", encoding="utf-8") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            buffer_size = 4096
+            pos = file_size
+            while pos > 0 and len(lines) < 15:
+                pos = max(0, pos - buffer_size)
+                f.seek(pos)
+                chunk = f.read(buffer_size)
+                lines = chunk.splitlines() + lines
+                lines = [l for l in lines if l.strip()]
+
+        session_events = []
+        for line in reversed(lines):
+            try:
+                ev = json.loads(line)
+                if ev.get("session_hash") == session_hash:
+                    session_events.append(ev)
+            except Exception:
+                continue
+            if len(session_events) >= 6:
+                break
+
+        failures = 0
+        for ev in session_events:
+            if ev.get("success") is False or ev.get("event") == "PostToolUseFailure":
+                failures += 1
+            else:
+                break
+        if failures >= 2:
+            return {"is_loop": True, "loop_count": failures}
+    except Exception:
+        pass
+    return {"is_loop": False, "loop_count": 0}
+
+
+def calculate_duration_from_pre_tool(
+    log_path: Path,
+    session_hash: str | None,
+    tool_use_hash: str | None,
+    now: datetime,
+) -> int | None:
+    """Read back logs in log_path to calculate tool duration from PreToolUse.
+
+    Used as fallback when the agent-client hook does not supply duration_ms.
+    """
+    if not log_path.exists() or not session_hash or not tool_use_hash:
+        return None
+    try:
+        lines = []
+        with log_path.open("r", encoding="utf-8") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            buffer_size = 4096
+            pos = file_size
+            while pos > 0 and len(lines) < 50:
+                pos = max(0, pos - buffer_size)
+                f.seek(pos)
+                chunk = f.read(buffer_size)
+                lines = chunk.splitlines() + lines
+                lines = [l for l in lines if l.strip()]
+
+        for line in reversed(lines):
+            try:
+                ev = json.loads(line)
+                if (
+                    ev.get("session_hash") == session_hash
+                    and ev.get("tool_use_hash") == tool_use_hash
+                    and ev.get("event") == "PreToolUse"
+                    and ev.get("logged_at")
+                ):
+                    pre_time = datetime.fromisoformat(ev["logged_at"])
+                    diff = now - pre_time
+                    return int(diff.total_seconds() * 1000)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def compute_hash(event_data: dict, prev_hash: str) -> str:
+    event_str = json.dumps(event_data, sort_keys=True, separators=(",", ":"))
+    h = hashlib.sha256((event_str + prev_hash).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def post_or_append_event(event: dict, log_path: Path, allow_post: bool = True) -> bool:
+    import urllib.request
+    import urllib.error
+
+    url = "http://127.0.0.1:5177/api/log-event"
+    event_without_hash = {k: v for k, v in event.items() if k != "hash_chain"}
+
+    # Try POSTing to server. An explicit WORKFLOW_METRICS_DIR override means
+    # "this directory is the destination" (tests rely on this), so the caller
+    # disables the POST and the event appends locally regardless of whether a
+    # workstation server happens to be listening.
+    if allow_post:
+        try:
+            payload = json.dumps({"event": event_without_hash}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=1.0) as response:
+                if response.status == 200:
+                    res_data = json.loads(response.read().decode("utf-8"))
+                    if res_data.get("ok"):
+                        event["hash_chain"] = res_data.get("hash_chain")
+                        return True
+        except Exception as e:
+            print(f"Server log-event endpoint unavailable ({e}); falling back to local file append", file=sys.stderr)
+
+    # Fallback: compute hash chain locally and append
+    prev_hash = "genesis-seed"
+    if log_path.exists():
+        try:
+            with log_path.open("r", encoding="utf-8") as f:
+                lines = [l for l in f.read().splitlines() if l.strip()]
+                if lines:
+                    last_line = lines[-1]
+                    last_event = json.loads(last_line)
+                    if last_event and last_event.get("hash_chain"):
+                        prev_hash = last_event["hash_chain"]
+        except Exception:
+            pass
+
+    curr_hash = compute_hash(event_without_hash, prev_hash)
+    event["hash_chain"] = curr_hash
+
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        return True
+    except Exception as exc:
+        print(f"workflow-event local append failed: {exc}", file=sys.stderr)
+        return False
+
+
+def main() -> int:
+    if any(arg in {"--help", "-h"} for arg in sys.argv[1:]):
+        print("Read agent-client hook JSON from stdin and append redacted JSONL telemetry.")
+        return 0
+
+    client = parse_client(sys.argv[1:])
+    pixel = parse_pixel(sys.argv[1:])
+    if client is None:
+        override = get_client_override()
+        if os.environ.get("ANTIGRAVITY_AGENT") == "1":
+            client = "antigravity"
+        elif override:
+            client = override
+    try:
+        payload = sys.stdin.read()
+        if not payload.strip():
+            return 0
+        raw = normalize_hook_payload(json.loads(payload))
+        if client == "grok":
+            raw.setdefault("source", "grok")
+        out_dir = Path(os.environ.get("WORKFLOW_METRICS_DIR", DEFAULT_DIR))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        event = safe_event(raw, client, pixel=pixel)
+        log_path = out_dir / f"{event['as_of']}.jsonl"
+
+        if event.get("session_hash"):
+            loop_info = detect_loop(log_path, event["session_hash"])
+            event.update(loop_info)
+
+        if event.get("event") in {"PostToolUse", "PostToolUseFailure"} and event.get("duration_ms") is None:
+            logged_at_str = event.get("logged_at")
+            if isinstance(logged_at_str, str):
+                try:
+                    now_dt = datetime.fromisoformat(logged_at_str)
+                    calc_duration = calculate_duration_from_pre_tool(
+                        log_path,
+                        event.get("session_hash"),
+                        event.get("tool_use_hash"),
+                        now_dt,
+                    )
+                    if calc_duration is not None:
+                        event["duration_ms"] = calc_duration
+                except Exception:
+                    pass
+
+        allow_post = "WORKFLOW_METRICS_DIR" not in os.environ
+        success = post_or_append_event(event, log_path, allow_post)
+        if not success:
+            return 1
+
+
+        # Wait loop for PermissionRequest
+        if event.get("event") == "PermissionRequest" and event.get("session_hash") and "PYTEST_CURRENT_TEST" not in os.environ:
+            import time
+            session_hash = event["session_hash"]
+            approvals_dir = ROOT / "20_live" / "workflow-metrics" / "approvals"
+            approvals_dir.mkdir(parents=True, exist_ok=True)
+            approval_file = approvals_dir / f"{session_hash}.json"
+
+            if approval_file.exists():
+                try:
+                    approval_file.unlink()
+                except Exception:
+                    pass
+
+            print(f"Awaiting human approval via Workstation UI for session {session_hash}...", file=sys.stderr)
+            timeout = 60.0
+            start_time = time.time()
+
+            while time.time() - start_time < timeout:
+                if approval_file.exists():
+                    try:
+                        with approval_file.open("r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        approved = data.get("approved", False)
+                        approval_file.unlink()
+                        if approved:
+                            print("Approved via Workstation UI.", file=sys.stderr)
+                            return 0
+                        else:
+                            print("Denied via Workstation UI.", file=sys.stderr)
+                            return 1
+                    except Exception as e:
+                        print(f"Error reading approval: {e}", file=sys.stderr)
+                        time.sleep(0.5)
+                time.sleep(0.25)
+
+            print("Approval request timed out after 60s. Denying.", file=sys.stderr)
+            return 1
+    except Exception as exc:
+        print(f"workflow-event telemetry skipped: {exc}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

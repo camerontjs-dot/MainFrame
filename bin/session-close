@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""Run deterministic end-of-session checks and downstream script triggers."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+DRAFT_REL = Path("20_live") / "last-handoff-draft.md"
+FEED_REL = Path("20_live") / "workstation" / "session-close-feed.jsonl"
+CHECKPOINT_HEADING = "## Session Checkpoints (auto)"
+SNAPSHOT_CAP = 5
+ACTIVITY_WINDOW_DAYS = 14
+# Bounded per-project scan keeps --checkpoint inside the 5s hook budget even
+# if a workbench grows a large tree.
+SCAN_ENTRY_CAP = 600
+SKIP_DIR_NAMES = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__",
+    ".pytest_cache", "dist", "build", ".cache",
+}
+WEEKLY_EVAL_STALE_DAYS = 8  # matches bin/eval-schedule check (ADR-036)
+
+
+@dataclass(frozen=True)
+class CloseAction:
+    name: str
+    kind: str
+    needed: bool
+    reason: str
+    ran: bool = False
+    success: bool | None = None
+
+
+@dataclass
+class SessionCloseResult:
+    actions: list[CloseAction] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return all(
+            a.success is not False
+            for a in self.actions
+            if a.kind == "auto" and a.ran
+        )
+
+
+RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
+
+
+def default_run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd, capture_output=True, text=True, cwd=str(ROOT),
+    )
+
+
+def detect_project_from_state(state_path: Path) -> str | None:
+    if not state_path.exists():
+        return None
+    found_heading = False
+    for line in state_path.read_text(encoding="utf-8").splitlines():
+        if line.strip().lower() == "## active project":
+            found_heading = True
+            continue
+        if found_heading:
+            value = line.strip()
+            if value and not value.startswith("#"):
+                return value
+            if value.startswith("#"):
+                break
+    return None
+
+
+def git_changed_files(run_command: RunCommand) -> set[str]:
+    files: set[str] = set()
+    for cmd in (
+        ["git", "diff", "--name-only"],
+        ["git", "diff", "--name-only", "--cached"],
+    ):
+        proc = run_command(cmd)
+        if proc.returncode == 0:
+            files.update(f for f in proc.stdout.strip().splitlines() if f)
+    proc = run_command(["git", "status", "--porcelain"])
+    if proc.returncode == 0:
+        for line in proc.stdout.strip().splitlines():
+            if len(line) > 3:
+                files.add(line[3:].strip())
+    return files
+
+
+def parse_hook_stdin(payload: str) -> dict[str, object]:
+    """Extract correlation fields from a Claude Code hook JSON payload.
+
+    Only derived or coarse values are kept — the session id is hashed with
+    the same sha256[:16] scheme as bin/workflow-event so feed records join
+    against telemetry, and free-text fields are never copied.
+    """
+    try:
+        raw = json.loads(payload)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    hook: dict[str, object] = {}
+    session_id = raw.get("session_id")
+    if session_id:
+        hook["session_hash"] = hashlib.sha256(
+            str(session_id).encode("utf-8")
+        ).hexdigest()[:16]
+    for key in ("hook_event_name", "trigger", "reason"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            hook[key] = value
+    return hook
+
+
+def latest_mtime(project_dir: Path) -> float | None:
+    newest: float | None = None
+    scanned = 0
+    stack = [project_dir]
+    while stack and scanned < SCAN_ENTRY_CAP:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    scanned += 1
+                    if scanned >= SCAN_ENTRY_CAP:
+                        break
+                    if entry.name in SKIP_DIR_NAMES or entry.name.startswith("."):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                            if newest is None or mtime > newest:
+                                newest = mtime
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return newest
+
+
+def nested_repo_last_commit(project_dir: Path,
+                            run_command: RunCommand) -> float | None:
+    if not (project_dir / ".git").exists():
+        return None
+    proc = run_command(["git", "-C", str(project_dir), "log", "-1", "--format=%ct"])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return float(proc.stdout.strip().splitlines()[-1])
+    except ValueError:
+        return None
+
+
+def derive_active_projects(root: Path,
+                           run_command: RunCommand = default_run_command,
+                           now_ts: float | None = None,
+                           window_days: int = ACTIVITY_WINDOW_DAYS,
+                           limit: int = 3) -> list[dict[str, object]]:
+    """Evidence-based active projects: recent file mtimes + nested-repo commits.
+
+    This is the checkpoint's answer to self-reported project state — it only
+    reports what the filesystem and nested git histories show.
+    """
+    if now_ts is None:
+        now_ts = datetime.now().timestamp()
+    projects_dir = root / "30_projects"
+    if not projects_dir.is_dir():
+        return []
+    candidates: list[dict[str, object]] = []
+    for entry in sorted(projects_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        signals: list[tuple[str, float]] = []
+        mtime = latest_mtime(entry)
+        if mtime is not None:
+            signals.append(("files", mtime))
+        commit = nested_repo_last_commit(entry, run_command)
+        if commit is not None:
+            signals.append(("commit", commit))
+        if not signals:
+            continue
+        signal, ts = max(signals, key=lambda item: item[1])
+        age_hours = max(0.0, (now_ts - ts) / 3600)
+        if age_hours > window_days * 24:
+            continue
+        candidates.append({
+            "project": entry.name,
+            "signal": signal,
+            "age_hours": round(age_hours, 1),
+        })
+    candidates.sort(key=lambda item: item["age_hours"])
+    return candidates[:limit]
+
+
+def telemetry_today_summary(root: Path) -> dict[str, object] | None:
+    events_path = (root / "20_live" / "workflow-metrics" / "events"
+                   / f"{date.today().isoformat()}.jsonl")
+    if not events_path.exists():
+        return None
+    events = 0
+    zones: dict[str, int] = {}
+    try:
+        with events_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                events += 1
+                try:
+                    zone = json.loads(line).get("cwd_zone")
+                except (ValueError, AttributeError):
+                    continue
+                if zone:
+                    zones[zone] = zones.get(zone, 0) + 1
+    except OSError:
+        return None
+    top = sorted(zones.items(), key=lambda item: (-item[1], item[0]))[:3]
+    return {"events": events, "zones": dict(top)}
+
+
+def eval_weekly_status(root: Path,
+                       now: datetime | None = None) -> dict[str, object] | None:
+    """Weekly eval staleness straight from schedule-runs.jsonl (no subprocess)."""
+    runs_path = root / "20_live" / "eval-registry" / "schedule-runs.jsonl"
+    if not runs_path.exists():
+        return None
+    last_weekly: dict | None = None
+    try:
+        for line in runs_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                run = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(run, dict) and run.get("cadence") == "weekly":
+                last_weekly = run
+    except OSError:
+        return None
+    if not last_weekly:
+        return None
+    if now is None:
+        now = datetime.now(timezone.utc)
+    age_days: float | None = None
+    finished = last_weekly.get("finished_at") or last_weekly.get("started_at")
+    try:
+        finished_dt = datetime.fromisoformat(str(finished))
+        if finished_dt.tzinfo is None:
+            finished_dt = finished_dt.replace(tzinfo=timezone.utc)
+        age_days = round((now - finished_dt).total_seconds() / 86400, 1)
+    except (TypeError, ValueError):
+        pass
+    all_passed = bool(last_weekly.get("all_passed"))
+    stale = age_days is None or age_days > WEEKLY_EVAL_STALE_DAYS or not all_passed
+    return {
+        "run_id": last_weekly.get("run_id"),
+        "age_days": age_days,
+        "all_passed": all_passed,
+        "stale": stale,
+    }
+
+
+def build_checkpoint(root: Path,
+                     run_command: RunCommand = default_run_command,
+                     hook: dict | None = None) -> dict[str, object]:
+    hook = hook or {}
+    now = datetime.now().astimezone()
+    declared = detect_project_from_state(root / "STATE.md")
+    derived = derive_active_projects(root, run_command)
+    drift = bool(declared) and bool(derived) and not any(
+        str(item["project"]) in declared for item in derived
+    )
+    proc = run_command(["git", "log", "--oneline", "-1"])
+    last_commit = (proc.stdout.strip().splitlines()[0]
+                   if proc.returncode == 0 and proc.stdout.strip() else None)
+    return {
+        "logged_at": now.isoformat(timespec="seconds"),
+        "as_of": now.date().isoformat(),
+        "kind": "checkpoint",
+        "source": hook.get("hook_event_name") or "cli",
+        "trigger": hook.get("trigger"),
+        "session_hash": hook.get("session_hash"),
+        "declared_active": declared,
+        "derived_active": derived,
+        "drift": drift,
+        "last_commit": last_commit,
+        "dirty_files": len(git_changed_files(run_command)),
+        "telemetry_today": telemetry_today_summary(root),
+        "weekly_eval": eval_weekly_status(root),
+        "draft": str(DRAFT_REL),
+    }
+
+
+def derived_active_line(record: dict[str, object]) -> str:
+    derived = record.get("derived_active") or []
+    if not derived:
+        return ("Derived active: (no project activity in the last "
+                f"{ACTIVITY_WINDOW_DAYS} days)")
+    return "Derived active: " + ", ".join(
+        f"{d['project']} ({d['signal']} {d['age_hours']}h)" for d in derived
+    )
+
+
+def render_snapshot(record: dict[str, object]) -> str:
+    stamp = str(record["logged_at"])[:16].replace("T", " ")
+    source = record.get("source") or "cli"
+    trigger = record.get("trigger")
+    label = f"{source} ({trigger})" if trigger else str(source)
+    lines = [f"### {stamp} — {label}", ""]
+    lines.append(f"- {derived_active_line(record)}")
+    declared = record.get("declared_active") or "(none in STATE.md)"
+    fit = "drift" if record.get("drift") else "match"
+    lines.append(f"- Declared (STATE.md): {declared} [{fit}]")
+    commit = record.get("last_commit") or "(no commits)"
+    lines.append(f"- Git: {commit}; dirty files: {record.get('dirty_files', 0)}")
+    telemetry = record.get("telemetry_today")
+    if isinstance(telemetry, dict):
+        zones = ", ".join(
+            f"{zone} {count}" for zone, count in telemetry["zones"].items()
+        )
+        suffix = f"; zones: {zones}" if zones else ""
+        lines.append(f"- Telemetry today: {telemetry['events']} events{suffix}")
+    weekly = record.get("weekly_eval")
+    if isinstance(weekly, dict):
+        status = "STALE" if weekly["stale"] else "ok"
+        lines.append(
+            f"- Weekly eval: {weekly['age_days']}d ago, "
+            f"passed={weekly['all_passed']} [{status}]"
+        )
+    return "\n".join(lines)
+
+
+def write_checkpoint_draft(root: Path, record: dict[str, object],
+                           cap: int = SNAPSHOT_CAP) -> Path:
+    """Append a dated snapshot to the handoff draft without touching the
+    digest scaffold above the checkpoint section. The section is fully
+    machine-owned: the Derived active line is rebuilt every checkpoint and
+    only the newest `cap` snapshots are kept."""
+    draft_path = root / DRAFT_REL
+    draft_path.parent.mkdir(parents=True, exist_ok=True)
+    if draft_path.exists():
+        text = draft_path.read_text(encoding="utf-8")
+    else:
+        declared = record.get("declared_active") or "(unknown — STATE.md missing)"
+        text = "\n".join([
+            "# Session Handoff Draft (auto-generated)",
+            "",
+            f"Date: {record['as_of']}",
+            f"Active project: {declared}",
+            "",
+        ])
+    head, _, tail = text.partition(CHECKPOINT_HEADING)
+    blocks: list[str] = []
+    for chunk in tail.split("\n### "):
+        chunk = chunk.strip("\n")
+        if not chunk or chunk.startswith("Derived active:"):
+            continue
+        blocks.append(chunk if chunk.startswith("### ") else "### " + chunk)
+    blocks.append(render_snapshot(record))
+    blocks = blocks[-cap:]
+    body = (
+        head.rstrip("\n") + "\n\n" + CHECKPOINT_HEADING + "\n\n"
+        + derived_active_line(record) + "\n\n"
+        + "\n\n".join(blocks) + "\n"
+    )
+    draft_path.write_text(body, encoding="utf-8")
+    return draft_path
+
+
+def append_feed(root: Path, record: dict[str, object]) -> Path:
+    feed_path = root / FEED_REL
+    feed_path.parent.mkdir(parents=True, exist_ok=True)
+    with feed_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+    return feed_path
+
+
+def run_checkpoint(root: Path,
+                   run_command: RunCommand = default_run_command,
+                   hook: dict | None = None) -> tuple[dict[str, object], Path]:
+    record = build_checkpoint(root, run_command, hook)
+    draft_path = write_checkpoint_draft(root, record)
+    append_feed(root, record)
+    return record, draft_path
+
+
+def check_feed_record(result: SessionCloseResult, hook: dict | None,
+                      mode: str) -> dict[str, object]:
+    hook = hook or {}
+    now = datetime.now().astimezone()
+    pending_auto = [
+        a.name for a in result.actions
+        if a.kind == "auto" and a.needed and not a.ran
+    ]
+    return {
+        "logged_at": now.isoformat(timespec="seconds"),
+        "as_of": now.date().isoformat(),
+        "kind": mode,
+        "source": hook.get("hook_event_name") or "cli",
+        "reason": hook.get("reason"),
+        "session_hash": hook.get("session_hash"),
+        "ok": result.ok and not pending_auto,
+        "pending_auto": pending_auto,
+        "warnings": [
+            a.name for a in result.actions if a.kind == "warn" and a.needed
+        ],
+        "actions": [asdict(a) for a in result.actions],
+    }
+
+
+def check_session(root: Path, project: str | None = None,
+                  run_command: RunCommand = default_run_command,
+                  apply: bool = False) -> SessionCloseResult:
+    result = SessionCloseResult()
+
+    state_path = root / "STATE.md"
+    state_exists = state_path.exists()
+    if not state_exists:
+        result.actions.append(CloseAction(
+            name="state-md", kind="warn", needed=True,
+            reason="STATE.md is missing — create it with a handoff note",
+        ))
+    else:
+        result.actions.append(CloseAction(
+            name="state-md-narrative", kind="manual", needed=True,
+            reason="update STATE.md narrative (what changed, what remains, blockers, handoff)",
+        ))
+
+    if project is None:
+        project = detect_project_from_state(state_path) if state_exists else None
+
+    changed = git_changed_files(run_command)
+
+    dirty_count = len(changed)
+    if dirty_count > 0:
+        result.actions.append(CloseAction(
+            name="working-tree", kind="warn", needed=True,
+            reason=f"{dirty_count} changed file(s) in working tree",
+        ))
+
+    proc_check = run_command([str(root / "bin" / "sync-project-index"), "--check"])
+    index_stale = proc_check.returncode != 0
+    if index_stale:
+        action = CloseAction(
+            name="sync-project-index", kind="auto", needed=True,
+            reason="project index is stale",
+        )
+        if apply:
+            proc = run_command([str(root / "bin" / "sync-project-index"), "--write"])
+            action = CloseAction(
+                name="sync-project-index", kind="auto", needed=True,
+                reason="project index was updated",
+                ran=True, success=proc.returncode == 0,
+            )
+        result.actions.append(action)
+    else:
+        result.actions.append(CloseAction(
+            name="sync-project-index", kind="auto", needed=False,
+            reason="project index is current",
+        ))
+
+    knowledge_changed = any(f.startswith("10_knowledge/") for f in changed)
+    if knowledge_changed:
+        action = CloseAction(
+            name="mindgraph-refresh", kind="auto", needed=True,
+            reason="10_knowledge/ content changed",
+        )
+        if apply:
+            proc = run_command([str(root / "bin" / "mindgraph-refresh")])
+            action = CloseAction(
+                name="mindgraph-refresh", kind="auto", needed=True,
+                reason="10_knowledge/ content changed",
+                ran=True, success=proc.returncode == 0,
+            )
+        result.actions.append(action)
+    else:
+        result.actions.append(CloseAction(
+            name="mindgraph-refresh", kind="auto", needed=False,
+            reason="no knowledge changes detected",
+        ))
+
+    events_dir = root / "20_live" / "workflow-metrics" / "events"
+    today_log = events_dir / f"{date.today().isoformat()}.jsonl"
+    if today_log.exists():
+        action = CloseAction(
+            name="workflow-report", kind="auto", needed=True,
+            reason=f"telemetry available ({today_log.name})",
+        )
+        if apply:
+            proc = run_command([str(root / "bin" / "workflow-report"), "--days", "1"])
+            action = CloseAction(
+                name="workflow-report", kind="auto", needed=True,
+                reason=f"telemetry available ({today_log.name})",
+                ran=True, success=proc.returncode == 0,
+            )
+        result.actions.append(action)
+    else:
+        result.actions.append(CloseAction(
+            name="workflow-report", kind="auto", needed=False,
+            reason="no telemetry for today",
+        ))
+
+    proc_eval = run_command([str(root / "bin" / "eval-schedule"), "check"])
+    if proc_eval.returncode != 0:
+        eval_reason = proc_eval.stdout.strip().splitlines()[-1] if proc_eval.stdout.strip() else "eval schedule unhealthy"
+        if "problem" in eval_reason or eval_reason.startswith("  -"):
+            eval_reason = proc_eval.stdout.strip().replace("\n", "; ")[:240]
+        result.actions.append(CloseAction(
+            name="eval-schedule", kind="warn", needed=True,
+            reason=f"scheduled evals need attention — {eval_reason}",
+        ))
+    else:
+        result.actions.append(CloseAction(
+            name="eval-schedule", kind="warn", needed=False,
+            reason="scheduled evals current (bin/eval-schedule check)",
+        ))
+
+    result.actions.append(CloseAction(
+        name="decisions-review", kind="manual", needed=True,
+        reason="review DECISIONS.md if architecture or workflow choices were made",
+    ))
+
+    # Fix 4: operator load reduction - always provide handoff digest scaffolding
+    digest_action = CloseAction(
+        name="handoff-digest",
+        kind="auto",
+        needed=True,
+        reason="generate draft handoff content for STATE.md (includes recent audit, ingest, telemetry signals)",
+    )
+    if apply:
+        digest_path = root / DRAFT_REL
+        try:
+            # The digest owns the scaffold above the checkpoint section;
+            # compaction snapshots below it must survive a rewrite.
+            preserved = ""
+            if digest_path.exists():
+                existing = digest_path.read_text(encoding="utf-8")
+                marker = existing.find(CHECKPOINT_HEADING)
+                if marker != -1:
+                    preserved = existing[marker:].rstrip("\n")
+            digest_lines = ["# Session Handoff Draft (auto-generated)", ""]
+            digest_lines.append(f"Date: {date.today().isoformat()}")
+            digest_lines.append("Active project: " + (project or "(from STATE.md)"))
+            digest_lines.append("")
+            digest_lines.append("## Quick Signals (paste/edit into STATE.md)")
+            # Ingest status
+            try:
+                p = run_command([str(root / "bin" / "ingest-status"), "--json"])
+                if p.returncode == 0:
+                    digest_lines.append("Ingest status: " + p.stdout.strip()[:300])
+            except Exception:
+                pass
+            # Recent audit sweep (light)
+            try:
+                p = run_command([str(root / "bin" / "audit-sweep"), "--dry-run", "--json", "--max-days", "7"])
+                if p.returncode == 0:
+                    digest_lines.append("Recent audit candidates: " + p.stdout.strip()[:400])
+            except Exception:
+                pass
+            # Knowledge / synthesis report (Fix 3/5 navigation + raw accumulation signal)
+            try:
+                p = run_command([str(root / "bin" / "knowledge-report"), "--json", "--max-days", "7"])
+                if p.returncode == 0:
+                    digest_lines.append("Knowledge report (ratios + candidates): " + p.stdout.strip()[:400])
+            except Exception:
+                pass
+            # Workflow report note
+            digest_lines.append("Run: bin/workflow-report --days 7 for details")
+            try:
+                p = run_command([str(root / "bin" / "eval-schedule"), "status"])
+                if p.returncode == 0 and p.stdout.strip():
+                    digest_lines.append("Eval schedule: " + p.stdout.strip().replace("\n", " | ")[:400])
+            except Exception:
+                pass
+            digest_lines.append("")
+            digest_lines.append("## What changed / remains / blockers / next (fill manually)")
+            digest_lines.append("- What changed:")
+            digest_lines.append("- What remains:")
+            digest_lines.append("- Blocked:")
+            digest_lines.append("- Reentry point:")
+            if preserved:
+                digest_lines.append("")
+                digest_lines.append(preserved)
+            digest_path.write_text("\n".join(digest_lines), encoding="utf-8")
+            digest_action = CloseAction(
+                name="handoff-digest",
+                kind="auto",
+                needed=True,
+                reason=f"handoff draft written to {digest_path.relative_to(root)}",
+                ran=True,
+                success=True,
+            )
+        except Exception as e:
+            digest_action = CloseAction(
+                name="handoff-digest", kind="auto", needed=True,
+                reason=f"failed to write digest: {e}", ran=True, success=False,
+            )
+    result.actions.append(digest_action)
+
+    return result
+
+
+def print_result(result: SessionCloseResult) -> None:
+    for a in result.actions:
+        tag = a.kind.upper()
+        if a.kind == "auto" and a.ran:
+            status = "OK" if a.success else "FAIL"
+            print(f"  [{tag:>6}] {a.name}: {status} — {a.reason}")
+        elif a.needed:
+            print(f"  [{tag:>6}] {a.name}: needed — {a.reason}")
+        else:
+            print(f"  [{tag:>6}] {a.name}: not needed — {a.reason}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run end-of-session checks and downstream triggers."
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true",
+                      help="report what needs doing (exit 1 if auto actions needed)")
+    mode.add_argument("--apply", action="store_true",
+                      help="run auto actions")
+    mode.add_argument("--checkpoint", action="store_true",
+                      help="fast prompt-free snapshot: append a dated block to "
+                           "20_live/last-handoff-draft.md and a record to the "
+                           "tracker feed (wired to the PreCompact hook)")
+    parser.add_argument("--project", help="project slug under 30_projects/")
+    parser.add_argument("--feed", action="store_true",
+                        help="with --check/--apply: append the machine-readable "
+                             "result to 20_live/workstation/session-close-feed.jsonl "
+                             "and exit 0 (hook mode — the outcome lives in the record)")
+    parser.add_argument("--hook-stdin", action="store_true",
+                        help="read Claude Code hook JSON from stdin for "
+                             "session/trigger correlation (hashed, never verbatim)")
+    args = parser.parse_args()
+
+    hook = parse_hook_stdin(sys.stdin.read()) if args.hook_stdin else {}
+
+    if args.checkpoint:
+        try:
+            record, draft_path = run_checkpoint(ROOT, hook=hook)
+        except Exception as exc:
+            print(f"checkpoint failed: {exc}", file=sys.stderr)
+            return 1
+        derived = record.get("derived_active") or []
+        summary = ", ".join(str(d["project"]) for d in derived) or "none in window"
+        print(f"checkpoint: {draft_path.relative_to(ROOT)} + feed updated "
+              f"(derived active: {summary})")
+        return 0
+
+    result = check_session(ROOT, project=args.project, apply=args.apply)
+    print_result(result)
+
+    has_pending_auto = any(
+        a.kind == "auto" and a.needed and not a.ran
+        for a in result.actions
+    )
+
+    if args.feed:
+        try:
+            feed_path = append_feed(ROOT, check_feed_record(
+                result, hook, "close-check" if args.check else "close-apply"))
+        except Exception as exc:
+            print(f"feed append failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"feed: appended to {feed_path.relative_to(ROOT)}")
+        return 0
+
+    if args.check:
+        return 1 if has_pending_auto else 0
+
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
