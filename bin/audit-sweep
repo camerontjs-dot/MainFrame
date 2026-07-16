@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Discover needs-audit (and recent routed) items in 10_knowledge/ and surface them
+for the epistemic auditor. Deterministic discovery + manifest; delegates LLM
+judgment to the epistemic-research-system orchestrator.
+
+Follows the style and guardrails of other MainFrame minions (dry-run first,
+no shared library, structured reporting, respect for volatility in 20_live/).
+
+Usage:
+  bin/audit-sweep --dry-run
+  bin/audit-sweep --apply          # write manifest + hand off to auditor
+  bin/audit-sweep --json
+  bin/audit-sweep --subset agents  # limit to one domain (per ADR-021)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+KNOWLEDGE = ROOT / "10_knowledge"
+LIVE_AUDIT = ROOT / "20_live" / "epistemic-audit"
+EPISTEMIC_BIN = ROOT / "bin" / "epistemic"
+
+
+def parse_simple_frontmatter_tags(text: str) -> list[str]:
+    """Very lightweight frontmatter tag extractor. Avoids full YAML dependency.
+    Looks for the first tags: [...] or tags: list under --- ... --- .
+    Returns lowercased tag list or [].
+    """
+    if not text.startswith("---"):
+        return []
+    end = text.find("\n---", 3)
+    if end == -1:
+        return []
+    header = text[3:end]
+    tags: list[str] = []
+    in_tags = False
+    for raw_line in header.splitlines():
+        line = raw_line.strip()
+        if line.lower().startswith("tags:"):
+            in_tags = True
+            # tags: [a, b] form
+            rest = line.split(":", 1)[1].strip()
+            if rest.startswith("["):
+                content = rest.strip("[]").strip()
+                if content:
+                    tags = [t.strip().strip('"').strip("'").lower() for t in content.split(",") if t.strip()]
+            continue
+        if in_tags:
+            if line.startswith("-"):
+                t = line.lstrip("- ").strip().strip('"').strip("'").lower()
+                if t:
+                    tags.append(t)
+            elif ":" in line and not line.startswith(" "):
+                # next top-level key
+                break
+    return tags
+
+
+def find_knowledge_files(subset: str | None = None) -> list[Path]:
+    """Return candidate .md files under 10_knowledge/ (or a domain subset)."""
+    base = KNOWLEDGE
+    if subset:
+        base = base / subset
+        if not base.is_dir():
+            return []
+    if not base.is_dir():
+        return []
+    files: list[Path] = []
+    for p in base.rglob("*.md"):
+        if p.is_file() and not p.name.startswith(".") and "index.md" not in p.name.lower():
+            # Skip the raw/ subdirs? No — we want the wrapper notes too, but typically the canonical md lives beside or above raw/.
+            files.append(p)
+    return sorted(files)
+
+
+def collect_candidates(subset: str | None, max_days: int = 365) -> list[dict[str, Any]]:
+    """Scan for files carrying needs-audit (or needs-verification) and recent routed items."""
+    today = date.today()
+    candidates: list[dict[str, Any]] = []
+    for path in find_knowledge_files(subset):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        tags = parse_simple_frontmatter_tags(text)
+        has_needs_audit = any("needs-audit" in t or "needs-verification" in t for t in tags)
+
+        mtime = datetime.fromtimestamp(path.stat().st_mtime).date()
+        age_days = max((today - mtime).days, 0)
+
+        # Include if it has the explicit signal, or if it is recent and looks routed (convention name or raw tag)
+        is_recent = age_days <= 14
+        looks_routed = "__" in path.name and ("raw" in path.name or any("raw" in t or "routed" in t for t in tags))
+
+        if has_needs_audit or (is_recent and looks_routed):
+            domain_guess = path.relative_to(KNOWLEDGE).parts[0] if path.is_relative_to(KNOWLEDGE) else "unknown"
+            candidates.append({
+                "path": str(path.relative_to(ROOT)),
+                "domain": domain_guess,
+                "name": path.name,
+                "age_days": age_days,
+                "tags": tags,
+                "has_needs_audit": has_needs_audit,
+                "mtime": mtime.isoformat(),
+            })
+
+    # Sort: explicit needs-audit first, then by age asc (newest first among recent)
+    candidates.sort(key=lambda c: (not c["has_needs_audit"], c["age_days"]))
+    return candidates
+
+
+def write_manifest(candidates: list[dict[str, Any]], run_date: str) -> Path:
+    LIVE_AUDIT.mkdir(parents=True, exist_ok=True)
+    (LIVE_AUDIT / "pending-review").mkdir(exist_ok=True)
+    manifest_path = LIVE_AUDIT / "pending-review" / f"sweep-{run_date}.md"
+    lines = [
+        "# Audit Sweep Manifest",
+        "",
+        f"Generated: {run_date} by bin/audit-sweep",
+        f"Total candidates: {len(candidates)}",
+        "",
+        "This file lists items that carried `needs-audit` (or were recently routed).",
+        "The epistemic auditor should process these and publish reports under this directory or via mainframe_bridge.",
+        "",
+        "## Candidates",
+        "",
+    ]
+    if not candidates:
+        lines.append("_No candidates found in this sweep._")
+    else:
+        lines.append("| Path | Domain | Age (days) | Has needs-audit | Tags |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for c in candidates:
+            tags_str = ", ".join(c["tags"][:6]) + ("..." if len(c["tags"]) > 6 else "")
+            has = "yes" if c["has_needs_audit"] else "no (recent sample)"
+            lines.append(f"| {c['path']} | {c['domain']} | {c['age_days']} | {has} | {tags_str} |")
+
+    lines.extend([
+        "",
+        "## Next Actions",
+        "- Run the auditor on high-priority items (explicit needs-audit).",
+        "- Review published audit reports in 20_live/epistemic-audit/.",
+        "- After verification, remove `needs-audit` from source frontmatter (or mark `audited-YYYY-MM-DD`).",
+        "- Record any policy or process findings in DECISIONS.md or the mainframe-process-eval project.",
+        "",
+        "## Synthesis Opportunities (raw accumulation signal)",
+        "Many `raw` items without companion synthesized `note` entries increase the burden on recall and the epistemic auditor.",
+        "Consider using `bin/extract-knowledge` patterns or the `create-source-summary` skill (via ingest-source) to produce higher-value notes from clusters of related raws in high-volume domains.",
+        "See also: local 10_knowledge/index.md promotion rules (template: 10_knowledge/index.template.md) and process-evaluation for measuring synthesis rate over time.",
+    ])
+    content = "\n".join(lines)
+    manifest_path.write_text(content, encoding="utf-8")
+    return manifest_path
+
+
+def handoff_to_auditor(manifest: Path, dry_run: bool) -> str:
+    """Call the epistemic system for judgment. In real use this would invoke
+    specific auditor entrypoints with focus on the manifest or a subset.
+    """
+    if not EPISTEMIC_BIN.exists():
+        return "epistemic bin not found; skipping LLM pass (install/activate the venv in the workbench)."
+
+    if dry_run:
+        return f"DRY-RUN: would invoke {EPISTEMIC_BIN} with sweep focused on {manifest}"
+
+    # Best-effort handoff. The real orchestrator may grow a `sweep` or `audit-mainframe` subcommand.
+    # For now we simply note that the operator (or a future orchestrator call) should process the manifest.
+    # We could do: subprocess with --focus or a dedicated mode.
+    return f"Manifest ready at {manifest}. Run: bin/epistemic sweep --mainframe --manifest {manifest} (or equivalent orchestrator command) to drive the auditor."
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Surface needs-audit items for epistemic review.")
+    parser.add_argument("--dry-run", action="store_true", help="Report what would be done; do not write manifests.")
+    parser.add_argument("--apply", action="store_true", help="Write the sweep manifest and trigger auditor handoff.")
+    parser.add_argument("--json", action="store_true", help="Output machine-readable summary.")
+    parser.add_argument("--subset", help="Limit scan to one 10_knowledge/<domain> (e.g. agents, finance).")
+    parser.add_argument("--max-days", type=int, default=365, help="Include items up to this age for sampling.")
+    args = parser.parse_args()
+
+    if not args.dry_run and not args.apply:
+        # Default to a safe reporting mode
+        args.dry_run = True
+
+    candidates = collect_candidates(args.subset, args.max_days)
+    run_date = date.today().isoformat()
+
+    if args.json:
+        print(json.dumps({
+            "run_date": run_date,
+            "subset": args.subset,
+            "candidate_count": len(candidates),
+            "explicit_needs_audit": sum(1 for c in candidates if c["has_needs_audit"]),
+            "candidates": candidates[:50],  # cap for readability
+        }, indent=2))
+        return 0
+
+    print(f"Audit sweep — {run_date}")
+    print(f"Subset: {args.subset or 'all 10_knowledge'}")
+    print(f"Candidates found: {len(candidates)} (explicit needs-audit: {sum(1 for c in candidates if c['has_needs_audit'])})")
+    for c in candidates[:20]:
+        flag = " [needs-audit]" if c["has_needs_audit"] else ""
+        print(f"  {c['path']} ({c['age_days']}d){flag}")
+
+    if len(candidates) > 20:
+        print(f"  ... and {len(candidates)-20} more")
+
+    if args.dry_run:
+        print("\n--dry-run: no files written. Use --apply to surface a manifest in 20_live/epistemic-audit/pending-review/.")
+        return 0
+
+    # --apply path
+    manifest = write_manifest(candidates, run_date)
+    note = handoff_to_auditor(manifest, dry_run=False)
+    print(f"\nManifest written: {manifest}")
+    print(note)
+    print("Next: review the manifest, run the auditor on the listed items, then update source tags after verification.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

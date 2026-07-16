@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Lightweight navigation and synthesis report for 10_knowledge/.
+
+Helps with recall surface (Fix 5) and raw-vs-synthesis visibility (Fix 3).
+Uses the audit-sweep machinery for candidate discovery + simple domain stats.
+
+Usage:
+  bin/knowledge-report --json
+  bin/knowledge-report --domain agents --max-days 30
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+KNOWLEDGE = ROOT / "10_knowledge"
+
+
+def domain_stats(subset: str | None = None) -> dict[str, Any]:
+    base = KNOWLEDGE
+    if subset:
+        base = base / subset
+    if not base.is_dir():
+        return {"error": "no such domain"}
+
+    files = list(base.rglob("*.md"))
+    raws = [f for f in files if "__raw__" in f.name or "/raw/" in str(f)]
+    notes = [f for f in files if "__note__" in f.name]
+    total = len(files)
+    return {
+        "domain": subset or "all",
+        "total_md": total,
+        "raw_like": len(raws),
+        "note_like": len(notes),
+        "raw_note_ratio": round(len(raws) / max(len(notes), 1), 2) if total else 0,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--domain", help="limit to one domain")
+    parser.add_argument("--max-days", type=int, default=30)
+    args = parser.parse_args()
+
+    stats = domain_stats(args.domain)
+    # Leverage audit-sweep for synthesis candidates (needs-audit raws are prime targets)
+    try:
+        cmd = [str(ROOT / "bin" / "audit-sweep"), "--dry-run", "--json", "--max-days", str(args.max_days)]
+        if args.domain:
+            cmd.extend(["--subset", args.domain])
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        audit_data = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except Exception:
+        audit_data = {"candidate_count": 0, "explicit_needs_audit": 0}
+
+    report = {
+        "date": date.today().isoformat(),
+        "domain_stats": stats,
+        "audit_candidates": {
+            "total": audit_data.get("candidate_count", 0),
+            "explicit_needs_audit": audit_data.get("explicit_needs_audit", 0),
+        },
+        "synthesis_note": "High raw:note ratio or many needs-audit raws = good targets for ingest-source + create-source-summary to produce durable notes.",
+        "recommended": "bin/audit-sweep --apply --subset <domain> ; bin/extract-knowledge for projects ; review local 10_knowledge/index.md promotion rules (template: 10_knowledge/index.template.md)",
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    print(f"Knowledge Report — {report['date']}")
+    print(f"Domain: {stats.get('domain')}")
+    print(f"  Total md: {stats.get('total_md')}  raw-like: {stats.get('raw_like')}  note-like: {stats.get('note_like')}  ratio: {stats.get('raw_note_ratio')}")
+    print(f"Audit candidates (last {args.max_days}d): {audit_data.get('candidate_count', 0)} (explicit needs-audit: {audit_data.get('explicit_needs_audit', 0)})")
+    print(report["synthesis_note"])
+    print("Next:", report["recommended"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

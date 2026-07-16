@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+import sys
+import re
+import json
+from pathlib import Path
+from datetime import datetime
+
+# Whitelist of known domains to check (subdirectories of 10_knowledge)
+_MAINFRAME_ROOT = Path(__file__).resolve().parent.parent
+KNOWLEDGE_ROOT = _MAINFRAME_ROOT / "10_knowledge"
+
+def parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
+    """Parse YAML frontmatter from markdown content."""
+    meta = {}
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            yaml_content = parts[1]
+            body = parts[2]
+            for line in yaml_content.splitlines():
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    meta[key] = val
+    return meta, body
+
+def find_atlas_file(domain_dir: Path) -> Path | None:
+    """Find the existing atlas/index file for a domain."""
+    for path in domain_dir.glob("*.md"):
+        if path.name.startswith("."):
+            continue
+        # Check filename rules
+        name = path.name.lower()
+        if name == "index.md" or name.endswith("-index.md") or name.endswith("_index.md") or "atlas" in name or "source-map" in name:
+            if "llamaindex" not in name and "index-id" not in name:
+                return path
+        # Check frontmatter tags
+        try:
+            content = path.read_text(encoding="utf-8")
+            meta, _ = parse_frontmatter(content)
+            tags = meta.get("tags", "")
+            if "source-index" in tags or "atlas" in tags or "topic-index" in tags:
+                return path
+        except Exception:
+            pass
+    return None
+
+def repair_domain(domain_dir: Path, *, dry_run: bool = False) -> tuple[int, int, bool]:
+    """
+    Check for missing links in a domain's files and repair its atlas note.
+    Returns (total_files, missing_files_count, was_repaired).
+    """
+    domain = domain_dir.name
+    md_files = [p for p in domain_dir.glob("*.md") if not p.name.startswith(".") and p.name != ".gitkeep"]
+
+    if not md_files:
+        return 0, 0, False
+
+    atlas_path = find_atlas_file(domain_dir)
+
+    # If no atlas exists, we will create a new one
+    is_new = atlas_path is None
+    if is_new:
+        today = datetime.now().strftime("%Y-%m-%d")
+        atlas_name = f"{today}__{domain}__note__{domain}-atlas.md"
+        atlas_path = domain_dir / atlas_name
+
+    # Get all file stems (slugs) in the domain
+    stems = {p.stem: p for p in md_files if p != atlas_path}
+
+    # Check which stems are already linked in the atlas file
+    linked_stems = set()
+    atlas_content = ""
+
+    if not is_new and atlas_path.exists():
+        atlas_content = atlas_path.read_text(encoding="utf-8")
+        # Search for file stems in the content
+        for stem in stems:
+            # Match wikilinks [[stem]] or simple filename strings
+            if stem in atlas_content:
+                linked_stems.add(stem)
+
+    missing_stems = sorted(list(set(stems.keys()) - linked_stems))
+
+    if not missing_stems:
+        return len(md_files), 0, False
+
+    print(f"Domain '{domain}': Found {len(missing_stems)} unlinked file(s).")
+
+    # Build links block for the missing ones
+    links_lines = []
+    for stem in missing_stems:
+        file_path = stems[stem]
+        try:
+            content = file_path.read_text(encoding="utf-8")
+            meta, _ = parse_frontmatter(content)
+            title = meta.get("title", stem)
+            links_lines.append(f"- [[{stem}]] — {title}")
+            print(f"  * Adding: {stem} -> '{title}'")
+        except Exception:
+            links_lines.append(f"- [[{stem}]]")
+            print(f"  * Adding: {stem}")
+
+    links_block = "\n".join(links_lines)
+
+    if is_new:
+        # Generate complete new atlas file
+        today = datetime.now().strftime("%Y-%m-%d")
+        new_content = f"""---
+title: "{domain.replace('-', ' ').title()} Topic and Source Index"
+domain: "{domain}"
+type: "note"
+status: "synthesized"
+source: "connectivity-repair-minion"
+tags: ["{domain}", "source-index", "atlas", "needs-audit"]
+links: []
+updated: "{today}"
+---
+
+# {domain.replace('-', ' ').title()} Topic and Source Index
+
+Central index of resources and notes for the `{domain}` domain.
+
+## Unsorted / Ingested Sources
+
+{links_block}
+"""
+        if dry_run:
+            print(f"  -> [dry-run] would create {atlas_path.name} with {len(missing_stems)} links")
+        else:
+            atlas_path.write_text(new_content, encoding="utf-8")
+            print(f"  -> Created new atlas file at {atlas_path.name}")
+    else:
+        # Append to existing atlas file
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Check if the file ends with a newline
+        if not atlas_content.endswith("\n"):
+            atlas_content += "\n"
+
+        append_content = f"\n\n## Unsorted / Ingested Sources (Appended {today})\n\n{links_block}\n"
+        if dry_run:
+            print(f"  -> [dry-run] would append {len(missing_stems)} links to {atlas_path.name}")
+        else:
+            atlas_path.write_text(atlas_content + append_content, encoding="utf-8")
+            print(f"  -> Appended {len(missing_stems)} links to {atlas_path.name}")
+
+    return len(md_files), len(missing_stems), True
+
+def main():
+    dry_run = "--dry-run" in sys.argv or "-n" in sys.argv
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(
+            "Usage: mindgraph-repair-connectivity [--dry-run|-n]\n"
+            "Append missing domain file stems into each 10_knowledge/*/index.md atlas.\n"
+            "Default applies writes. Prefer --dry-run first."
+        )
+        return
+
+    if not KNOWLEDGE_ROOT.is_dir():
+        print(f"Error: {KNOWLEDGE_ROOT} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    print("=== MindGraph Connectivity Repair Minion ===")
+    if dry_run:
+        print("(dry-run: no files will be written)\n")
+    else:
+        print()
+
+    repaired_count = 0
+    total_checked = 0
+
+    for subdir in sorted(KNOWLEDGE_ROOT.iterdir()):
+        if subdir.is_dir() and not subdir.name.startswith("."):
+            total_checked += 1
+            try:
+                files_count, missing_count, repaired = repair_domain(
+                    subdir, dry_run=dry_run
+                )
+                if repaired:
+                    repaired_count += 1
+            except Exception as e:
+                print(f"Error checking domain {subdir.name}: {e}", file=sys.stderr)
+
+    action = "Would repair" if dry_run else "Repaired/Created"
+    print(f"\nDone. Checked {total_checked} domains. {action} {repaired_count} atlas indexes.")
+
+if __name__ == "__main__":
+    main()

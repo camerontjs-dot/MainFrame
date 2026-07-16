@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Report ingest lane ages and migration-batch dispositions without moving files."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+from collections import Counter
+from datetime import date, datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BATCHES_REL = Path("30_projects/second-brain-migration/raw-materials/batches")
+LANES = (
+    "00_inbox",
+    "01_ingest/ready",
+    "01_ingest/queue",
+    "01_ingest/rejected",
+)
+UNRESOLVED = "unresolved"
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def visible_files(directory: Path) -> list[Path]:
+    """Flat scan of one lane, matching the ingest minion's visibility rule."""
+    if not directory.is_dir():
+        return []
+    return [
+        path
+        for path in sorted(directory.iterdir(), key=lambda item: item.name)
+        if path.is_file() and not path.name.startswith(".")
+    ]
+
+
+def visible_dirs(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return [
+        path
+        for path in sorted(directory.iterdir(), key=lambda item: item.name)
+        if path.is_dir() and not path.name.startswith(".")
+    ]
+
+
+def file_age_days(path: Path, today: date) -> int:
+    modified = datetime.fromtimestamp(path.stat().st_mtime).date()
+    return max((today - modified).days, 0)
+
+
+def scan_lane(root: Path, lane: str, today: date) -> dict[str, object]:
+    directory = root / lane
+    files = visible_files(directory)
+    ages = [file_age_days(path, today) for path in files]
+    oldest_age = max(ages) if ages else None
+    return {
+        "name": lane,
+        "exists": directory.is_dir(),
+        "files": len(files),
+        "directories": len(visible_dirs(directory)),
+        "age_days_0_7": sum(age <= 7 for age in ages),
+        "age_days_8_30": sum(7 < age <= 30 for age in ages),
+        "age_days_31_plus": sum(age > 30 for age in ages),
+        "oldest_file_age_days": oldest_age,
+    }
+
+
+def load_batches(root: Path) -> dict[str, object]:
+    """Read every registered batch's manifest and append-only disposition ledger.
+
+    The manifest is immutable registration evidence; the ledger appends later
+    per-file decisions, so the last ledger row for a path wins.
+    """
+    batches_dir = root / BATCHES_REL
+    batches: list[dict[str, object]] = []
+    hash_index: dict[str, str] = {}
+    name_index: dict[tuple[str, str], str] = {}
+    disposition_by_name: dict[tuple[str, str], str] = {}
+    disposition_by_hash: dict[str, str] = {}
+    invalid_dirs: list[str] = []
+
+    if not batches_dir.is_dir():
+        return {
+            "batches": batches,
+            "hash_index": hash_index,
+            "name_index": name_index,
+            "disposition_by_name": disposition_by_name,
+            "disposition_by_hash": disposition_by_hash,
+            "invalid_dirs": invalid_dirs,
+        }
+
+    for batch_dir in sorted(path for path in batches_dir.iterdir() if path.is_dir()):
+        manifest_path = batch_dir / "manifest.csv"
+        if not manifest_path.is_file():
+            invalid_dirs.append(batch_dir.name)
+            continue
+
+        batch_id = batch_dir.name
+        registered = 0
+        with manifest_path.open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                relative_path = (row.get("relative_path") or "").strip()
+                file_hash = (row.get("sha256") or "").strip()
+                if not relative_path or not file_hash:
+                    continue
+                registered += 1
+                hash_index[file_hash] = batch_id
+                name_index[(batch_id, relative_path)] = file_hash
+
+        ledger_rows = 0
+        latest_in_batch: dict[str, str] = {}
+        ledger_path = batch_dir / "disposition-ledger.csv"
+        if ledger_path.is_file():
+            with ledger_path.open(encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    relative_path = (row.get("relative_path") or "").strip()
+                    disposition = (row.get("disposition") or "").strip()
+                    file_hash = (row.get("sha256") or "").strip()
+                    if not relative_path or not disposition:
+                        continue
+                    ledger_rows += 1
+                    latest_in_batch[relative_path] = disposition
+                    disposition_by_name[(batch_id, relative_path)] = disposition
+                    if file_hash:
+                        disposition_by_hash[file_hash] = disposition
+
+        dispositions = Counter(latest_in_batch.values())
+        batches.append({
+            "id": batch_id,
+            "registered_files": registered,
+            "ledger_rows": ledger_rows,
+            "has_ledger": ledger_path.is_file(),
+            "dispositions": [
+                {"name": name, "count": count}
+                for name, count in dispositions.most_common()
+            ],
+        })
+
+    return {
+        "batches": batches,
+        "hash_index": hash_index,
+        "name_index": name_index,
+        "disposition_by_name": disposition_by_name,
+        "disposition_by_hash": disposition_by_hash,
+        "invalid_dirs": invalid_dirs,
+    }
+
+
+def classify_inbox(root: Path, batch_data: dict[str, object]) -> dict[str, object]:
+    """Split 00_inbox into batch-registered migration files and organic captures.
+
+    Matching is scoped to the inbox because registration is non-destructive
+    there; once the minion normalizes a file into 01_ingest the bytes (and so
+    the hash) legitimately drift from the registered snapshot.
+    """
+    hash_index = batch_data["hash_index"]
+    name_index = batch_data["name_index"]
+    disposition_by_name = batch_data["disposition_by_name"]
+    disposition_by_hash = batch_data["disposition_by_hash"]
+
+    registered = 0
+    organic = 0
+    matched_batches: set[str] = set()
+    dispositions: Counter[str] = Counter()
+
+    for path in visible_files(root / "00_inbox"):
+        file_hash = sha256_of(path)
+        batch_id = hash_index.get(file_hash)
+        if batch_id is None:
+            organic += 1
+            continue
+        registered += 1
+        matched_batches.add(batch_id)
+        if (batch_id, path.name) in name_index:
+            disposition = disposition_by_name.get(
+                (batch_id, path.name),
+                disposition_by_hash.get(file_hash, UNRESOLVED),
+            )
+        else:
+            disposition = disposition_by_hash.get(file_hash, UNRESOLVED)
+        dispositions[disposition] += 1
+
+    return {
+        "batch_registered": registered,
+        "organic": organic,
+        "batches_matched": sorted(matched_batches),
+        "registered_by_disposition": [
+            {"name": name, "count": count}
+            for name, count in dispositions.most_common()
+        ],
+    }
+
+
+def build_status(root: Path, today: date | None = None) -> dict[str, object]:
+    today = today or date.today()
+    batch_data = load_batches(root)
+    return {
+        "as_of": today.isoformat(),
+        "lanes": [scan_lane(root, lane, today) for lane in LANES],
+        "inbox_composition": classify_inbox(root, batch_data),
+        "batches": batch_data["batches"],
+        "invalid_batch_dirs": batch_data["invalid_dirs"],
+    }
+
+
+def print_status(status: dict[str, object]) -> None:
+    print(f"Ingest status, as of {status['as_of']}")
+    print("")
+    print("Lanes (visible files, flat scan):")
+    for lane in status["lanes"]:
+        if not lane["exists"]:
+            print(f"- {lane['name']}: missing")
+            continue
+        line = (
+            f"- {lane['name']}: {lane['files']} file(s); "
+            f"age <=7d: {lane['age_days_0_7']}, "
+            f"8-30d: {lane['age_days_8_30']}, "
+            f">30d: {lane['age_days_31_plus']}"
+        )
+        if lane["oldest_file_age_days"] is not None:
+            line += f"; oldest {lane['oldest_file_age_days']}d"
+        if lane["directories"]:
+            line += f" (+{lane['directories']} unscanned subdirectories)"
+        print(line)
+
+    composition = status["inbox_composition"]
+    print("")
+    print("Inbox composition:")
+    print(
+        f"- batch-registered migration files: {composition['batch_registered']}"
+        + (
+            f" (batches: {', '.join(composition['batches_matched'])})"
+            if composition["batches_matched"]
+            else ""
+        )
+    )
+    print(f"- organic captures (no batch match): {composition['organic']}")
+    for item in composition["registered_by_disposition"]:
+        print(f"  - {item['name']}: {item['count']}")
+
+    if status["batches"]:
+        print("")
+        print("Migration batches (latest ledger row per file wins):")
+        for batch in status["batches"]:
+            dispositions = ", ".join(
+                f"{item['name']} {item['count']}"
+                for item in batch["dispositions"]
+            ) or "no ledger rows"
+            ledger_note = "" if batch["has_ledger"] else " [no ledger file]"
+            print(
+                f"- {batch['id']}: {batch['registered_files']} registered; "
+                f"{dispositions}{ledger_note}"
+            )
+
+    if status["invalid_batch_dirs"]:
+        print("")
+        print(
+            "Batch directories without a manifest (skipped): "
+            + ", ".join(status["invalid_batch_dirs"])
+        )
+
+    print("")
+    print(
+        "Interpretation: batch-registered files are intentional migration "
+        "backlog, not stuck intake. Organic captures aging past 30 days and "
+        "ready-lane age measure the agent-enrichment middle. This report "
+        "moves nothing."
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument(
+        "--json", action="store_true", help="emit a structured summary"
+    )
+    args = parser.parse_args()
+
+    status = build_status(args.root)
+    if args.json:
+        print(json.dumps(status, indent=2))
+    else:
+        print_status(status)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

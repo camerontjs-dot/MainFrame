@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# PATH-safe wrapper for scripts/mainframe_doctor
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONPATH="${ROOT}/scripts${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -x /opt/homebrew/bin/python3 ]]; then
+  exec /opt/homebrew/bin/python3 -m mainframe_doctor "$@"
+elif [[ -x /usr/bin/python3 ]]; then
+  exec /usr/bin/python3 -m mainframe_doctor "$@"
+else
+  exec python3 -m mainframe_doctor "$@"
+fi

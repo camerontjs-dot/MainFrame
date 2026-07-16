@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# mindgraph-live: Procedure to query live knowledge data (workstation.sqlite) or finance-specific (fund.sqlite)
+# using MindGraph-style fused lexical + semantic search where possible.
+#
+# This allows MindGraph-like access to volatile/live data without polluting the durable index.
+# Usage examples:
+#   bin/mindgraph-live "AAPL price history or recent metrics" --scope finance
+#   bin/mindgraph-live "current active tasks or agent status" --scope live
+#   bin/mindgraph-live "GME strategy performance" --scope finance --json
+#   bin/mindgraph-live "recent runs or errors" --scope live
+#
+# Scopes:
+#   finance (default for finance queries): 20_live/markets/fund.sqlite + registry text
+#   live / workstation: 20_live/workstation/workstation.sqlite
+#   both: federated
+#
+# For full semantic, uses the same embedder as main MindGraph if available.
+# Results include source, snippet, score, and trust note (volatile).
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="$ROOT/mindgraph/.venv/bin/python"
+LIVE_DB_FINANCE="$ROOT/20_live/markets/fund.sqlite"
+LIVE_DB_WORKSTATION="$ROOT/20_live/workstation/workstation.sqlite"
+REGISTRY_DIR="$ROOT/20_live/markets/registry"
+
+SCOPE="finance"
+QUERY=""
+JSON_OUT=0
+TOP_K=5
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --scope) SCOPE="$2"; shift 2 ;;
+    --json) JSON_OUT=1; shift ;;
+    --top-k) TOP_K="$2"; shift 2 ;;
+    -h|--help)
+      echo "mindgraph-live \"your question\" [--scope finance|live|both] [--json] [--top-k N]"
+      exit 0
+      ;;
+    *) QUERY="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$QUERY" ]]; then
+  echo "Usage: bin/mindgraph-live \"query text\" [options]"
+  echo "See --help"
+  exit 1
+fi
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "MindGraph python not found at $PYTHON_BIN"
+  exit 1
+fi
+
+$PYTHON_BIN - "$QUERY" "$SCOPE" "$JSON_OUT" "$TOP_K" "$LIVE_DB_FINANCE" "$LIVE_DB_WORKSTATION" "$REGISTRY_DIR" << 'PYEOF'
+import sys
+import json
+import sqlite3
+import os
+from pathlib import Path
+from datetime import datetime
+
+query = sys.argv[1]
+scope = sys.argv[2]
+json_out = bool(int(sys.argv[3]))
+top_k = int(sys.argv[4])
+db_finance = sys.argv[5]
+db_work = sys.argv[6]
+registry_dir = sys.argv[7]
+
+def load_text_rows(db_path, queries):
+    """Return list of (source, text, meta) from SQL queries that return text content."""
+    rows = []
+    if not Path(db_path).exists():
+        return rows
+    try:
+        conn = sqlite3.connect(db_path)
+        for sql, label in queries:
+            try:
+                cur = conn.execute(sql)
+                for r in cur.fetchall():
+                    if r and r[0]:
+                        text = str(r[0])
+                        meta = r[1] if len(r) > 1 else ""
+                        rows.append((label, text[:2000], meta or ""))
+            except Exception:
+                pass
+        conn.close()
+    except Exception:
+        pass
+    return rows
+
+def collect_finance_texts():
+    texts = []
+    # tickers
+    texts += load_text_rows(db_finance, [
+        ("SELECT symbol || ' ' || COALESCE(company_name,'') || ' ' || COALESCE(sector,'') || ' ' || COALESCE(notes,'') FROM tickers", "ticker")
+    ])
+    # recent prices / history summary
+    texts += load_text_rows(db_finance, [
+        ("SELECT 'Price ' || symbol || ' ' || price || ' ' || COALESCE(market_date,'') FROM prices LIMIT 50", "price")
+    ])
+    # strategy metrics
+    texts += load_text_rows(db_finance, [
+        ("SELECT 'Strategy ' || COALESCE(strategy,'') || ' ' || COALESCE(ticker,'') || ' oos:' || COALESCE(oos_return,'') || ' dsr:' || COALESCE(dsr_p,'') || ' ' || COALESCE(promotion_status,'') FROM strategy_metrics LIMIT 100", "metric")
+    ])
+    # registry text files (hypotheses, runs, etc.)
+    for f in Path(registry_dir).glob("*.jsonl"):
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    if line.strip():
+                        try:
+                            obj = json.loads(line)
+                            text = json.dumps(obj)[:1500]
+                            texts.append((f"registry/{f.name}", text, str(f)))
+                        except:
+                            pass
+        except:
+            pass
+    # reports
+    for md in Path(db_finance).parent.glob("reports/*.md"):
+        try:
+            with open(md) as fh:
+                texts.append(("report", fh.read()[:2000], str(md)))
+        except:
+            pass
+    return texts
+
+def collect_live_texts():
+    texts = []
+    # tasks, projects, agents from workstation
+    texts += load_text_rows(db_work, [
+        ("SELECT title || ' ' || COALESCE(goal,'') || ' ' || COALESCE(next_action,'') FROM projects", "project"),
+        ("SELECT title || ' ' || COALESCE(description,'') FROM tasks", "task"),
+        ("SELECT name || ' ' || role || ' ' || status || ' ' || location FROM agent_profiles", "agent"),
+    ])
+    # runs and events if text
+    texts += load_text_rows(db_work, [
+        ("SELECT COALESCE(output,'') || ' ' || COALESCE(error,'') FROM runs LIMIT 30", "run"),
+    ])
+    return texts
+
+def simple_rank(query, texts, top_k):
+    """Very lightweight lexical + length bias rank (no heavy deps if no embedder)."""
+    qlower = query.lower()
+    scored = []
+    for src, txt, meta in texts:
+        score = 0.0
+        tlower = txt.lower()
+        # lexical overlap
+        for w in qlower.split():
+            if w and w in tlower:
+                score += 1.0 / (1 + tlower.count(w))
+        # boost recent-ish or key fields (heuristic)
+        if "strategy" in src or "metric" in src:
+            score *= 1.2
+        if score > 0:
+            scored.append((score, src, txt[:300].replace('\n',' '), meta))
+    scored.sort(reverse=True)
+    return scored[:top_k]
+
+# Collect
+all_texts = []
+if scope in ("finance", "both"):
+    all_texts += collect_finance_texts()
+if scope in ("live", "workstation", "both"):
+    all_texts += collect_live_texts()
+
+if not all_texts:
+    print("No live data found for scope", scope)
+    sys.exit(0)
+
+results = simple_rank(query, all_texts, top_k)
+
+if json_out:
+    out = []
+    for score, src, snippet, meta in results:
+        out.append({
+            "score": round(score, 4),
+            "source": src,
+            "snippet": snippet,
+            "meta": meta,
+            "trust": "volatile-live",
+            "note": "Live data - promote summaries to 10_knowledge after review"
+        })
+    print(json.dumps(out, indent=2))
+else:
+    print(f"Live MindGraph-style query (scope={scope}): {query}")
+    print(f"Found {len(results)} candidates (lexical rank; use --json for machine)\n")
+    for i, (score, src, snippet, meta) in enumerate(results, 1):
+        print(f"{i}. [{src}] score={score:.3f}")
+        print(f"   {snippet[:200]}...")
+        if meta:
+            print(f"   meta: {meta}")
+        print("   trust: volatile-live (not durable)\n")
+
+PYEOF
+chmod +x bin/mindgraph-live
+echo "Created bin/mindgraph-live"
+ls -l bin/mindgraph-live

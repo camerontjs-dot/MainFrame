@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""Load session context files in a fixed order for progressive disclosure.
+
+Unit 2.2: fail closed when a selected project does not resolve.
+MPE-024: prefer structured focus (20_live/focus/current.yaml); STATE.md is
+narrative fallback and must not invent compound slugs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from focus_authority import load_focus  # noqa: E402
+
+_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+@dataclass(frozen=True)
+class ContextEntry:
+    order: int
+    path: str
+    exists: bool
+    size: int | None
+    note: str
+
+
+@dataclass
+class SessionOpenResult:
+    entries: list[ContextEntry] = field(default_factory=list)
+    project: str | None = None
+    project_source: str | None = None
+    project_path: str | None = None
+    project_exists: bool | None = None
+    project_error: str | None = None
+    degraded: bool = False
+    focus_revision: str | None = None
+    focus_path: str | None = None
+    focus_errors: list[str] = field(default_factory=list)
+    focus_warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        required = {"AGENTS.md", "STATE.md"}
+        found = {e.path for e in self.entries if e.exists}
+        if not required.issubset(found):
+            return False
+        if self.project_error:
+            return False
+        if self.project is not None and self.project_exists is False:
+            return False
+        return True
+
+
+def is_valid_project_slug(label: str) -> bool:
+    label = label.strip()
+    if not label:
+        return False
+    if " + " in label or "(" in label or ")" in label:
+        return False
+    if any(c.isspace() for c in label):
+        return False
+    return bool(_SLUG_RE.match(label))
+
+
+def detect_project_from_state(state_path: Path) -> str | None:
+    if not state_path.exists():
+        return None
+    found_heading = False
+    for line in state_path.read_text(encoding="utf-8").splitlines():
+        if line.strip().lower() == "## active project":
+            found_heading = True
+            continue
+        if found_heading:
+            value = line.strip()
+            if value and not value.startswith("#"):
+                return value
+            if value.startswith("#"):
+                break
+    return None
+
+
+def find_active_phase_plan(plans_dir: Path) -> Path | None:
+    if not plans_dir.is_dir():
+        return None
+    for plan in sorted(plans_dir.glob("*.md")):
+        text = plan.read_text(encoding="utf-8")
+        if not text.startswith("---\n"):
+            continue
+        end = text.find("\n---", 4)
+        if end == -1:
+            continue
+        for fm_line in text[4:end].splitlines():
+            if ":" not in fm_line:
+                continue
+            key, value = fm_line.split(":", 1)
+            if key.strip() == "status" and value.strip().strip('"').strip("'") == "active":
+                return plan
+    return None
+
+
+def entry(order: int, rel: str, root: Path, note: str) -> ContextEntry:
+    full = root / rel
+    exists = full.exists()
+    size = full.stat().st_size if exists else None
+    return ContextEntry(order=order, path=rel, exists=exists, size=size, note=note)
+
+
+def _apply_project(result: SessionOpenResult, root: Path, order: int) -> int:
+    if not result.project:
+        return order
+    raw = result.project.strip()
+    if not is_valid_project_slug(raw):
+        result.project_error = (
+            "compound or invalid project label cannot resolve to a project slug; "
+            "set structured focus primary.project or STATE Active Project to a "
+            "single 30_projects/<slug> name"
+        )
+        result.degraded = True
+        result.project_exists = False
+        order += 1
+        result.entries.append(
+            ContextEntry(
+                order=order,
+                path="(invalid-project-label)",
+                exists=False,
+                size=None,
+                note=result.project_error,
+            )
+        )
+        return order
+
+    slug = raw
+    project_dir = root / "30_projects" / slug
+    readme_rel = f"30_projects/{slug}/README.md"
+    result.project_path = readme_rel
+    readme_entry = entry(order + 1, readme_rel, root, "active project")
+    order += 1
+    result.entries.append(readme_entry)
+    result.project_exists = readme_entry.exists
+    if not readme_entry.exists:
+        result.project_error = f"selected project path missing: {readme_rel}"
+        result.degraded = True
+    else:
+        plans_dir = project_dir / "plans"
+        phase_plan = find_active_phase_plan(plans_dir)
+        if phase_plan:
+            order += 1
+            plan_rel = str(phase_plan.relative_to(root))
+            result.entries.append(entry(order, plan_rel, root, "active phase plan"))
+    return order
+
+
+def build_context(root: Path, project: str | None = None) -> SessionOpenResult:
+    result = SessionOpenResult()
+    order = 0
+
+    order += 1
+    result.entries.append(entry(order, "AGENTS.md", root, "root control file"))
+
+    order += 1
+    result.entries.append(entry(order, "STATE.md", root, "workspace state"))
+
+    # 1) Explicit flag wins
+    if project:
+        result.project = project
+        result.project_source = "flag"
+    else:
+        # 2) Structured focus authority (MPE-024)
+        focus = load_focus(root)
+        if focus.path is not None:
+            result.focus_path = str(focus.path.relative_to(root)) if focus.path.is_relative_to(root) else str(focus.path)
+            result.focus_revision = focus.revision
+            result.focus_errors = list(focus.errors)
+            result.focus_warnings = list(focus.warnings)
+            order += 1
+            result.entries.append(
+                entry(order, result.focus_path, root, "structured focus authority")
+            )
+            if focus.ok and focus.primary_project:
+                result.project = focus.primary_project
+                result.project_source = "focus"
+            elif focus.errors:
+                result.degraded = True
+        # 3) STATE narrative fallback (migration window)
+        if result.project is None:
+            detected = detect_project_from_state(root / "STATE.md")
+            if detected:
+                result.project = detected
+                result.project_source = "state"
+                if focus.path is not None:
+                    result.degraded = True
+                    result.focus_warnings = list(result.focus_warnings) + [
+                        "using STATE.md fallback; structured focus did not supply primary"
+                    ]
+
+    order = _apply_project(result, root, order)
+
+    order += 1
+    result.entries.append(
+        ContextEntry(order=order, path="(task-local)", exists=False, size=None,
+                     note="load task-local docs manually when ready")
+    )
+
+    order += 1
+    result.entries.append(
+        ContextEntry(order=order, path="(evidence)", exists=False, size=None,
+                     note="evidence loading deferred")
+    )
+
+    return result
+
+
+def print_result(result: SessionOpenResult, root: Path,
+                 print_contents: bool = False) -> None:
+    if result.project:
+        print(f"project: {result.project} (from {result.project_source})")
+    else:
+        print("project: none")
+    if result.focus_revision:
+        print(f"focus_revision: {result.focus_revision}")
+    if result.project_error:
+        print(f"project_error: {result.project_error}")
+    if result.focus_errors:
+        print(f"focus_errors: {'; '.join(result.focus_errors)}")
+    if result.focus_warnings:
+        print(f"focus_warnings: {'; '.join(result.focus_warnings)}")
+    if result.degraded:
+        print("status: DEGRADED — session context is not fully valid")
+    print()
+
+    for e in result.entries:
+        if e.exists:
+            size_str = f"{e.size} bytes" if e.size is not None else ""
+            print(f"  {e.order}. [{size_str:>10}] {e.path}  — {e.note}")
+        elif e.path.startswith("("):
+            print(f"  {e.order}. {'':>12} {e.path}  — {e.note}")
+        else:
+            print(f"  {e.order}. {'[MISSING]':>12} {e.path}  — {e.note}")
+
+    if print_contents:
+        print()
+        for e in result.entries:
+            if not e.exists or e.path.startswith("("):
+                continue
+            full = root / e.path
+            print(f"--- BEGIN {e.path} ---")
+            print(full.read_text(encoding="utf-8"), end="")
+            print(f"--- END {e.path} ---")
+            print()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Load session context files in fixed order."
+    )
+    parser.add_argument("--project", help="project slug under 30_projects/")
+    parser.add_argument("--print-contents", action="store_true",
+                        help="print file contents after the checklist")
+    parser.add_argument("--json", action="store_true",
+                        help="emit structured JSON instead of human text")
+    args = parser.parse_args()
+
+    result = build_context(ROOT, project=args.project)
+
+    eval_proc = subprocess.run(
+        [str(ROOT / "bin" / "eval-schedule"), "check"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+    )
+    eval_ok = eval_proc.returncode == 0
+    eval_summary = eval_proc.stdout.strip().splitlines()[0] if eval_proc.stdout.strip() else "unknown"
+
+    if args.json:
+        out = {
+            "ok": result.ok,
+            "project": result.project,
+            "project_source": result.project_source,
+            "project_path": result.project_path,
+            "project_exists": result.project_exists,
+            "project_error": result.project_error,
+            "degraded": result.degraded,
+            "focus_revision": result.focus_revision,
+            "focus_path": result.focus_path,
+            "focus_errors": result.focus_errors,
+            "focus_warnings": result.focus_warnings,
+            "entries": [asdict(e) for e in result.entries],
+            "eval_schedule_ok": eval_ok,
+            "eval_schedule_summary": eval_summary,
+        }
+        json.dump(out, sys.stdout, indent=2)
+        print()
+    else:
+        print_result(result, ROOT, print_contents=args.print_contents)
+        print()
+        if eval_ok:
+            print(f"eval-schedule: {eval_summary}")
+            action_card = ROOT / "20_live" / "eval-registry" / "last-eval-action.md"
+            if not action_card.exists():
+                action_card = ROOT / "20_live" / "eval-registry" / "last-canary-action.md"
+            if action_card.exists():
+                text = action_card.read_text(encoding="utf-8", errors="replace")
+                sev = "info"
+                for line in text.splitlines():
+                    if line.startswith("## Severity:"):
+                        sev = line.split("**")[-2] if "**" in line else line
+                        break
+                primary = ""
+                grab = False
+                for line in text.splitlines():
+                    if line.startswith("## Primary next action"):
+                        grab = True
+                        continue
+                    if grab and line.startswith("##"):
+                        break
+                    if grab and line.strip() and not line.startswith("#"):
+                        primary = line.strip()
+                        break
+                print(f"eval-action: severity={sev}")
+                if primary:
+                    print(f"eval-action: {primary[:160]}")
+        else:
+            print("eval-schedule: ATTENTION — run `bin/eval-schedule check` and read 20_live/eval-registry/OPERATOR.md")
+
+        if not result.ok:
+            print("session-open: FAIL — context is not valid (see project_error / missing entries)")
+
+    return 0 if result.ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

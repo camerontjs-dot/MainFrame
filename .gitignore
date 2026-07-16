@@ -1,0 +1,67 @@
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+
+# Personal working state
+STATE.md
+
+# Local tool config and telemetry
+.mcp.json
+.claude/settings.local.json
+20_live/workflow-metrics/
+.obsidian/
+
+# Local databases
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Inbox (keep control files only)
+00_inbox/*
+!00_inbox/.gitkeep
+!00_inbox/AGENTS.md
+
+# Ingest pipelines
+01_ingest/ready/*
+01_ingest/queue/*
+01_ingest/processing/*
+01_ingest/renamed/*
+01_ingest/rejected/*
+01_ingest/ingest-log.md
+01_ingest/prep-ingest-log.md
+
+# Knowledge domains (keep templates only)
+10_knowledge/*
+!10_knowledge/index.template.md
+!10_knowledge/AGENTS.md
+
+# Live state (keep control files only)
+20_live/*
+!20_live/index.md
+!20_live/AGENTS.md
+
+# Projects (keep templates only)
+30_projects/*
+!30_projects/index.template.md
+!30_projects/AGENTS.md
+
+# Archive
+90_archive/*
+!90_archive/index.md
+!90_archive/AGENTS.md
+
+# Env and secrets
+.env
+.env.*
+
+# Node (if workstation added later)
+node_modules/

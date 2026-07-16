@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Register an immutable snapshot of a rolling second-brain inbox drop."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import re
+import shutil
+import sys
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECT_DIR = ROOT / "30_projects" / "second-brain-migration"
+BATCHES_DIR = PROJECT_DIR / "raw-materials" / "batches"
+REGISTER_PATH = PROJECT_DIR / "raw-materials" / "batch-register.md"
+SOURCE_SNAPSHOT_DIRNAME = "source-files"
+LEDGER_FILENAME = "disposition-ledger.csv"
+TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".tsv", ".json", ".jsx", ".html"}
+ISO_DATE_RE = re.compile(r"\b20\d{2}-[01]\d-[0-3]\d\b")
+MONTH_DATE_RE = re.compile(
+    r"\b(?:January|February|March|April|May|June|July|August|September|"
+    r"October|November|December) [0-3]?\d, 20\d{2}\b"
+)
+BATCH_ID_RE = re.compile(r"^20\d{2}-[01]\d-[0-3]\d-\d{3}$")
+MANIFEST_FIELDS = [
+    "batch_id",
+    "source",
+    "relative_path",
+    "size_bytes",
+    "sha256",
+    "created_at",
+    "modified_at",
+    "extension",
+    "embedded_dates",
+    "category",
+    "proposed_destination",
+    "review_status",
+    "duplicate_group",
+]
+LEDGER_FIELDS = [
+    "recorded_at",
+    "batch_id",
+    "relative_path",
+    "sha256",
+    "disposition",
+    "destination",
+    "evidence",
+    "notes",
+]
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def embedded_dates(path: Path) -> str:
+    values = ISO_DATE_RE.findall(path.name)
+    if path.suffix.lower() in TEXT_EXTENSIONS:
+        try:
+            sample = path.read_text(encoding="utf-8", errors="replace")[:32768]
+        except OSError:
+            sample = ""
+        values.extend(ISO_DATE_RE.findall(sample))
+        values.extend(MONTH_DATE_RE.findall(sample))
+    return "; ".join(dict.fromkeys(values[:8]))
+
+
+def classify(path: Path) -> tuple[str, str]:
+    name = path.name.lower()
+    rel = path.as_posix().lower()
+
+    if name == ".ds_store" or "vault-lint-workspace/" in rel:
+        return "generated-artifact", "park pending artifact review"
+    if (
+        name.startswith("cb-")
+        or "ce-state" in name
+        or "content-pipeline" in name
+        or "newsletter" in name
+        or "_draft_" in name
+        or "_deepdive_" in name
+        or "_quicktake_" in name
+    ):
+        return "project-specific", "reconcile with 30_projects/content-engine"
+    if any(
+        token in name
+        for token in (
+            "state",
+            "status",
+            "positions",
+            "allocations",
+            "rebalance",
+            "watchlist",
+            "options-log",
+            "crypto-log",
+            "identity",
+            "deployment",
+            "housing-indicators",
+            "earnings-tracker",
+        )
+    ):
+        return "live-state-candidate", "reconcile before 20_live promotion"
+    if any(
+        token in name
+        for token in ("template", "prompt", "migration_plan", "raw_catalogue", "taxonomy")
+    ) or path.suffix.lower() in {".jsx", ".docx"}:
+        return "template-or-tool", "park pending operational review"
+    if any(
+        token in name
+        for token in ("daily brief", "daily-brief", "weekly-market", "research leads")
+    ):
+        return "dated-snapshot", "archive after reconciliation"
+    if any(
+        token in name
+        for token in (
+            "framework",
+            "strategies",
+            "strategy",
+            "technical indicators",
+            "greeks reference",
+            "asset allocation",
+        )
+    ):
+        return "durable-knowledge-candidate", "review through 01_ingest"
+    return "raw-research-or-evidence", "review through 01_ingest"
+
+
+def fmt_timestamp(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds).astimezone().isoformat(timespec="seconds")
+
+
+def ensure_batch_not_registered(batch_id: str) -> None:
+    text = REGISTER_PATH.read_text(encoding="utf-8")
+    if f"| `{batch_id}` |" in text:
+        raise ValueError(f"batch already registered: {batch_id}")
+
+
+def append_register(batch_id: str, source: str, file_count: int, manifest: Path) -> None:
+    text = REGISTER_PATH.read_text(encoding="utf-8")
+    row = (
+        f"| `{batch_id}` | {datetime.now().astimezone().date().isoformat()} | "
+        f"`{source}` | {file_count} | registered | "
+        f"`{manifest.relative_to(PROJECT_DIR)}` |\n"
+    )
+    REGISTER_PATH.write_text(text.rstrip() + "\n" + row, encoding="utf-8")
+
+
+def snapshot_path(batch_dir: Path, relative_path: str) -> Path:
+    return batch_dir / SOURCE_SNAPSHOT_DIRNAME / Path(relative_path)
+
+
+def copy_source_snapshot(source_path: Path, destination_path: Path) -> None:
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, destination_path)
+
+
+def append_disposition_entries(
+    ledger_path: Path, entries: list[dict[str, str]]
+) -> None:
+    file_exists = ledger_path.exists()
+    with ledger_path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=LEDGER_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        if entries:
+            writer.writerows(entries)
+
+
+def initialize_disposition_ledger(
+    batch_id: str, batch_dir: Path, records: list[dict[str, str | int]]
+) -> Path:
+    ledger_path = batch_dir / LEDGER_FILENAME
+    recorded_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    entries = [
+        {
+            "recorded_at": recorded_at,
+            "batch_id": batch_id,
+            "relative_path": str(record["relative_path"]),
+            "sha256": str(record["sha256"]),
+            "disposition": "unresolved",
+            "destination": "",
+            "evidence": manifest_relpath(batch_id),
+            "notes": "Initialized at registration; no lifecycle decision recorded.",
+        }
+        for record in records
+    ]
+    append_disposition_entries(ledger_path, entries)
+    return ledger_path
+
+
+def manifest_relpath(batch_id: str) -> str:
+    return f"raw-materials/batches/{batch_id}/manifest.csv"
+
+
+def register_batch(batch_id: str, source_path: Path, source_label: str) -> Path:
+    if not BATCH_ID_RE.fullmatch(batch_id):
+        raise ValueError("batch ID must use YYYY-MM-DD-NNN form")
+    if not REGISTER_PATH.exists():
+        raise FileNotFoundError(
+            "second-brain migration project is missing its batch register"
+        )
+    ensure_batch_not_registered(batch_id)
+    if not source_path.is_dir():
+        raise ValueError(f"source is not a directory: {source_path}")
+
+    batch_dir = BATCHES_DIR / batch_id
+    if batch_dir.exists():
+        raise ValueError(f"batch output already exists: {batch_dir}")
+
+    files = sorted(path for path in source_path.rglob("*") if path.is_file())
+    records: list[dict[str, str | int]] = []
+    batch_dir.mkdir(parents=True)
+    for path in files:
+        stat = path.stat()
+        relative_path = path.relative_to(source_path).as_posix()
+        category, destination = classify(Path(relative_path))
+        snapshot_file = snapshot_path(batch_dir, relative_path)
+        copy_source_snapshot(path, snapshot_file)
+        records.append(
+            {
+                "batch_id": batch_id,
+                "source": source_label,
+                "relative_path": relative_path,
+                "size_bytes": stat.st_size,
+                "sha256": sha256(snapshot_file),
+                "created_at": fmt_timestamp(
+                    getattr(stat, "st_birthtime", stat.st_ctime)
+                ),
+                "modified_at": fmt_timestamp(stat.st_mtime),
+                "extension": path.suffix.lower() or "[none]",
+                "embedded_dates": embedded_dates(path),
+                "category": category,
+                "proposed_destination": destination,
+                "review_status": "unreviewed",
+                "duplicate_group": "",
+            }
+        )
+
+    hash_counts = Counter(str(record["sha256"]) for record in records)
+    duplicate_hashes = sorted(value for value, count in hash_counts.items() if count > 1)
+    duplicate_ids = {
+        value: f"dup-{index:03d}" for index, value in enumerate(duplicate_hashes, 1)
+    }
+    for record in records:
+        record["duplicate_group"] = duplicate_ids.get(str(record["sha256"]), "")
+
+    manifest = batch_dir / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
+        writer.writeheader()
+        if records:
+            writer.writerows(records)
+    ledger = initialize_disposition_ledger(batch_id, batch_dir, records)
+
+    categories = Counter(str(record["category"]) for record in records)
+    duplicates = [record for record in records if str(record["duplicate_group"])]
+    report_lines = [
+        f"# Batch Report - {batch_id}",
+        "",
+        f"- Registered: {datetime.now().astimezone().date().isoformat()}",
+        f"- Source: `{source_label}`",
+        f"- Files: {len(records)}",
+        f"- Source snapshot: `raw-materials/batches/{batch_id}/{SOURCE_SNAPSHOT_DIRNAME}/`",
+        f"- Exact duplicate files: {len(duplicates)}",
+        f"- Exact duplicate groups: {len(duplicate_ids)}",
+        f"- Disposition ledger: `{ledger.relative_to(PROJECT_DIR)}`",
+        "- Status: registered; classification and reconciliation pending",
+        "",
+        "## Initial Classification",
+        "",
+        "| Candidate category | Files |",
+        "|---|---:|",
+    ]
+    report_lines.extend(
+        f"| {category} | {count} |" for category, count in sorted(categories.items())
+    )
+    report_lines.extend(
+        [
+            "",
+            "## Guardrails",
+            "",
+            "- Categories are triage suggestions, not routing decisions.",
+            "- Registration copies recoverable source bytes into the batch-local snapshot.",
+            "- No source files were moved, renamed, edited, or deleted.",
+            "- The disposition ledger is append-only; add later lifecycle decisions as new rows.",
+            "- Live-state candidates require claim-level reconciliation and source verification.",
+            "- Content Engine candidates must be compared with its external production workspace.",
+            "",
+        ]
+    )
+    (batch_dir / "batch-report.md").write_text(
+        "\n".join(report_lines), encoding="utf-8"
+    )
+
+    duplicate_lines = [
+        f"# Exact Duplicates - {batch_id}",
+        "",
+        "Hash-backed duplicate groups. No files have been deleted.",
+        "",
+    ]
+    if not duplicate_ids:
+        duplicate_lines.append("_No exact duplicates found._")
+    else:
+        for digest in duplicate_hashes:
+            duplicate_lines.extend(
+                [
+                    f"## {duplicate_ids[digest]}",
+                    "",
+                    f"`sha256:{digest}`",
+                    "",
+                ]
+            )
+            duplicate_lines.extend(
+                f"- `{record['relative_path']}`"
+                for record in records
+                if record["sha256"] == digest
+            )
+            duplicate_lines.append("")
+    (batch_dir / "duplicates.md").write_text(
+        "\n".join(duplicate_lines), encoding="utf-8"
+    )
+
+    append_register(batch_id, source_label, len(records), manifest)
+    return batch_dir
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Register a read-only snapshot of a second-brain inbox batch."
+    )
+    parser.add_argument("--batch-id", required=True)
+    parser.add_argument("--source", default=str(ROOT / "00_inbox"))
+    parser.add_argument("--source-label")
+    args = parser.parse_args()
+
+    source = Path(args.source).expanduser().resolve()
+    source_label = args.source_label or str(source)
+    try:
+        output = register_batch(args.batch_id, source, source_label)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        print(f"second-brain-batch: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"registered {args.batch_id}: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Staged apply for projects MindGraph index (ADR-045 / live-retention).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONPATH="${ROOT}/scripts${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -x /opt/homebrew/bin/python3 ]]; then
+  exec /opt/homebrew/bin/python3 "$ROOT/scripts/mindgraph_projects_apply.py" "$@"
+elif [[ -x /usr/bin/python3 ]]; then
+  exec /usr/bin/python3 "$ROOT/scripts/mindgraph_projects_apply.py" "$@"
+else
+  exec python3 "$ROOT/scripts/mindgraph_projects_apply.py" "$@"
+fi

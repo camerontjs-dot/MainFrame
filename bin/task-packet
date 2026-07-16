@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""Validate and compile MainFrame project delegation packets."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import shlex
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS_DIR = ROOT / "30_projects"
+DEFAULT_OUTPUT = PROJECTS_DIR / "task_packets_manifest.json"
+
+REQUIRED_KEYS = (
+    "packet_version",
+    "task_id",
+    "project_slug",
+    "title",
+    "status",
+    "task_kind",
+    "agent_profile",
+    "workdir",
+    "timeout_seconds",
+    "editable_files",
+    "create_files",
+    "read_only_files",
+    "verification_commands",
+    "mindgraph_mode",
+    "knowledge_queries",
+)
+OPTIONAL_ROUTING_KEYS = (
+    "task_category",
+    "executor",
+    "harness_recommendation",
+    "allow_fusion_plan",
+    "needs_deliberation",
+)
+ALLOWED_KEYS = REQUIRED_KEYS + OPTIONAL_ROUTING_KEYS
+LIST_KEYS = {
+    "editable_files",
+    "create_files",
+    "read_only_files",
+    "verification_commands",
+    "knowledge_queries",
+}
+REQUIRED_SECTIONS = (
+    "Goal",
+    "Context and plan references",
+    "Required implementation",
+    "Non-negotiable boundaries",
+    "Acceptance criteria",
+    "Stop conditions",
+    "Expected handoff",
+)
+# Allowed but not required — planning observability (MH01 / ADR-030).
+OPTIONAL_SECTIONS = (
+    "MindGraph Query Pass",
+)
+STATUSES = {"draft", "ready", "retired"}
+TASK_KINDS = {"code", "research", "analysis", "operations"}
+MINDGRAPH_MODES = {"off", "curated"}
+TASK_CATEGORIES = {
+    "mechanical-edit",
+    "multi-file-coordination",
+    "failure-recovery",
+    "scope-enforcement",
+    "research-synthesis",
+    "environment-setup",
+    "long-horizon-build",
+}
+EXECUTORS = {"local", "cloud", "auto"}
+HARNESS_RECOMMENDATIONS = {
+    "H0-current",
+    "H1-packet",
+    "H2-repair",
+    "H3-mindgraph",
+}
+BOOL_KEYS = {"allow_fusion_plan", "needs_deliberation"}
+ROUTING_POLICY_PATH = ROOT / ".context" / "harness-routing.json"
+SHELL_OPERATORS = ("&&", "||", ";", "|", "`", "$(", ">", "<", "\n", "\r")
+SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+class PacketError(ValueError):
+    """Raised when a packet violates the project convention."""
+
+
+def _parse_scalar(value: str, key: str) -> Any:
+    value = value.strip()
+    if key in LIST_KEYS:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise PacketError(f"{key} must be a JSON array: {exc.msg}") from exc
+        if not isinstance(parsed, list) or not all(
+            isinstance(item, str) for item in parsed
+        ):
+            raise PacketError(f"{key} must be a JSON array of strings")
+        return parsed
+    if key == "timeout_seconds":
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise PacketError("timeout_seconds must be an integer") from exc
+    if key in BOOL_KEYS:
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes"}:
+            return True
+        if normalized in {"false", "no"}:
+            return False
+        raise PacketError(f"{key} must be true or false")
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in {'"', "'"}
+    ):
+        return value[1:-1]
+    return value
+
+
+def parse_packet_text(text: str, source: str = "<packet>") -> dict[str, Any]:
+    if not text.startswith("---\n"):
+        raise PacketError(f"{source}: packet must start with YAML frontmatter")
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        raise PacketError(f"{source}: frontmatter closing delimiter is missing")
+
+    metadata: dict[str, Any] = {}
+    for number, raw_line in enumerate(text[4:end].splitlines(), start=2):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise PacketError(f"{source}:{number}: expected key: value")
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key in metadata:
+            raise PacketError(f"{source}:{number}: duplicate key {key}")
+        metadata[key] = _parse_scalar(value, key)
+
+    body = text[end + 5 :]
+    sections: dict[str, str] = {}
+    current: str | None = None
+    lines: list[str] = []
+    for raw_line in body.splitlines():
+        if raw_line.startswith("## "):
+            if current is not None:
+                if current in sections:
+                    raise PacketError(f"{source}: duplicate section: {current}")
+                sections[current] = "\n".join(lines).strip()
+            current = raw_line[3:].strip()
+            lines = []
+        elif current is not None:
+            lines.append(raw_line)
+    if current is not None:
+        if current in sections:
+            raise PacketError(f"{source}: duplicate section: {current}")
+        sections[current] = "\n".join(lines).strip()
+
+    return {
+        "metadata": metadata,
+        "sections": sections,
+        "source": source,
+    }
+
+
+def load_packet(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PacketError(f"{path}: cannot read packet: {exc}") from exc
+    packet = parse_packet_text(text, str(path))
+    packet["path"] = path
+    return packet
+
+
+def _validate_relative_path(value: str, field: str) -> None:
+    path = Path(value)
+    if not value or path.is_absolute():
+        raise PacketError(f"{field} entries must be non-empty relative paths")
+    if any(part in {"", ".", ".."} for part in path.parts):
+        raise PacketError(f"{field} contains unsafe path: {value}")
+
+
+def command_argv(command: str) -> list[str]:
+    if not command.strip():
+        raise PacketError("verification_commands may not contain empty commands")
+    if any(operator in command for operator in SHELL_OPERATORS):
+        raise PacketError(
+            f"verification command contains a forbidden shell operator: {command}"
+        )
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise PacketError(f"invalid verification command: {exc}") from exc
+    if not argv:
+        raise PacketError("verification command produced no arguments")
+    return argv
+
+
+def validate_packet(
+    packet: dict[str, Any],
+    *,
+    projects_dir: Path = PROJECTS_DIR,
+    workspace_root: Path | None = None,
+    require_ready: bool = False,
+) -> list[str]:
+    errors: list[str] = []
+    metadata = packet["metadata"]
+    sections = packet["sections"]
+
+    missing_keys = []
+    for key in REQUIRED_KEYS:
+        if key not in metadata:
+            errors.append(f"missing frontmatter key: {key}")
+            missing_keys.append(key)
+    unknown_keys = sorted(set(metadata) - set(ALLOWED_KEYS))
+    for key in unknown_keys:
+        errors.append(f"unknown frontmatter key: {key}")
+    for section in REQUIRED_SECTIONS:
+        if not sections.get(section, "").strip():
+            errors.append(f"missing or empty section: {section}")
+    allowed_sections = set(REQUIRED_SECTIONS) | set(OPTIONAL_SECTIONS)
+    for section in sorted(set(sections) - allowed_sections):
+        errors.append(f"unknown packet section: {section}")
+    # Empty optional sections are ignored; if present with mindgraph curated
+    # mode, encourage a filled pass (warning as error only when empty placeholder).
+    qp = sections.get("MindGraph Query Pass", "").strip()
+    if (
+        metadata.get("mindgraph_mode") == "curated"
+        and qp
+        and "knowledge_query:" in qp
+        and "REPLACE" in qp.upper()
+    ):
+        errors.append(
+            "MindGraph Query Pass still contains REPLACE placeholders "
+            "while mindgraph_mode is curated"
+        )
+    if missing_keys:
+        return errors
+
+    if str(metadata["packet_version"]) != "1":
+        errors.append("packet_version must be 1")
+    if metadata["status"] not in STATUSES:
+        errors.append(f"status must be one of: {', '.join(sorted(STATUSES))}")
+    if require_ready and metadata["status"] != "ready":
+        errors.append("only packets with status ready may execute")
+    if metadata["task_kind"] not in TASK_KINDS:
+        errors.append(
+            f"task_kind must be one of: {', '.join(sorted(TASK_KINDS))}"
+        )
+    if metadata["mindgraph_mode"] not in MINDGRAPH_MODES:
+        errors.append(
+            "mindgraph_mode must be one of: "
+            + ", ".join(sorted(MINDGRAPH_MODES))
+        )
+    if not SAFE_ID.fullmatch(str(metadata["task_id"])):
+        errors.append("task_id must use lowercase letters, digits, dots, dashes, or underscores")
+    if not SAFE_ID.fullmatch(str(metadata["project_slug"])):
+        errors.append("project_slug must use lowercase letters, digits, dots, dashes, or underscores")
+    for key in ("title", "agent_profile", "workdir"):
+        if not isinstance(metadata[key], str) or not metadata[key].strip():
+            errors.append(f"{key} must be a non-empty string")
+    if not isinstance(metadata["timeout_seconds"], int) or not (
+        1 <= metadata["timeout_seconds"] <= 7200
+    ):
+        errors.append("timeout_seconds must be between 1 and 7200")
+
+    path_fields = ("editable_files", "create_files", "read_only_files")
+    for field in path_fields:
+        if len(metadata[field]) != len(set(metadata[field])):
+            errors.append(f"{field} may not contain duplicate paths")
+        for value in metadata[field]:
+            try:
+                _validate_relative_path(value, field)
+            except PacketError as exc:
+                errors.append(str(exc))
+
+    editable = set(metadata["editable_files"])
+    create = set(metadata["create_files"])
+    read_only = set(metadata["read_only_files"])
+    if editable & create:
+        errors.append("editable_files and create_files may not overlap")
+    if (editable | create) & read_only:
+        errors.append("editable/create files may not overlap read_only_files")
+    if not editable and not create:
+        errors.append("at least one editable_files or create_files entry is required")
+    if not metadata["verification_commands"]:
+        errors.append("at least one verification command is required")
+    for command in metadata["verification_commands"]:
+        try:
+            command_argv(command)
+        except PacketError as exc:
+            errors.append(str(exc))
+    if len(metadata["verification_commands"]) != len(
+        set(metadata["verification_commands"])
+    ):
+        errors.append("verification_commands may not contain duplicates")
+
+    if metadata["mindgraph_mode"] == "curated" and not metadata["knowledge_queries"]:
+        errors.append("curated MindGraph mode requires at least one knowledge query")
+    if metadata["mindgraph_mode"] == "off" and metadata["knowledge_queries"]:
+        errors.append("knowledge_queries must be empty when mindgraph_mode is off")
+
+    task_category = metadata.get("task_category")
+    if task_category is not None:
+        if not isinstance(task_category, str) or task_category not in TASK_CATEGORIES:
+            errors.append(
+                "task_category must be one of: "
+                + ", ".join(sorted(TASK_CATEGORIES))
+            )
+    executor = metadata.get("executor")
+    if executor is not None:
+        if not isinstance(executor, str) or executor not in EXECUTORS:
+            errors.append(
+                f"executor must be one of: {', '.join(sorted(EXECUTORS))}"
+            )
+    harness_recommendation = metadata.get("harness_recommendation")
+    if harness_recommendation is not None:
+        if (
+            not isinstance(harness_recommendation, str)
+            or harness_recommendation not in HARNESS_RECOMMENDATIONS
+        ):
+            errors.append(
+                "harness_recommendation must be one of: "
+                + ", ".join(sorted(HARNESS_RECOMMENDATIONS))
+            )
+    for key in BOOL_KEYS:
+        value = metadata.get(key)
+        if value is not None and not isinstance(value, bool):
+            errors.append(f"{key} must be true or false")
+
+    if workspace_root is None:
+        project_root = projects_dir / metadata["project_slug"]
+        workdir = project_root / metadata["workdir"]
+    else:
+        project_root = workspace_root
+        workdir = workspace_root / metadata["workdir"]
+    workdir_value = str(metadata["workdir"])
+    try:
+        if workdir_value != ".":
+            _validate_relative_path(workdir_value, "workdir")
+    except PacketError as exc:
+        errors.append(str(exc))
+    else:
+        if not project_root.is_dir():
+            errors.append(f"project root does not exist: {project_root}")
+        elif not workdir.is_dir():
+            errors.append(f"workdir does not exist: {workdir}")
+
+    if metadata["project_slug"] and packet.get("path") and workspace_root is None:
+        expected = projects_dir / metadata["project_slug"] / "plans" / "task-packets"
+        try:
+            packet["path"].resolve().relative_to(expected.resolve())
+        except ValueError:
+            errors.append(f"packet must live under {expected}")
+
+    return errors
+
+
+def packet_summary(packet: dict[str, Any], root: Path = ROOT) -> dict[str, Any]:
+    metadata = packet["metadata"]
+    path = packet["path"]
+    try:
+        relative_path = str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        relative_path = str(path)
+    contract_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key != "status"
+    }
+    contract_payload = {
+        "metadata": contract_metadata,
+        "sections": packet["sections"],
+    }
+    contract_sha256 = hashlib.sha256(
+        json.dumps(
+            contract_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    summary = {
+        "id": f"packet-{metadata['project_slug']}-{metadata['task_id']}",
+        "task_id": metadata["task_id"],
+        "project_slug": metadata["project_slug"],
+        "title": metadata["title"],
+        "status": metadata["status"],
+        "task_kind": metadata["task_kind"],
+        "agent_profile": metadata["agent_profile"],
+        "timeout_seconds": metadata["timeout_seconds"],
+        "mindgraph_mode": metadata["mindgraph_mode"],
+        "goal": packet["sections"]["Goal"],
+        "next_action": (
+            "Delegate the reviewed task packet."
+            if metadata["status"] == "ready"
+            else "Review and mark the task packet ready."
+        ),
+        "packet_path": relative_path,
+        "editable_files": metadata["editable_files"],
+        "create_files": metadata["create_files"],
+        "read_only_files": metadata["read_only_files"],
+        "verification_commands": metadata["verification_commands"],
+        "contract_sha256": contract_sha256,
+    }
+    for key in OPTIONAL_ROUTING_KEYS:
+        if key in metadata:
+            summary[key] = metadata[key]
+    return summary
+
+
+def _coerce_policy_int(value: Any, field: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise PacketError(f"routing policy field {field} must be an integer") from exc
+
+
+def load_routing_policy(path: Path = ROUTING_POLICY_PATH) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise PacketError(f"cannot read routing policy: {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise PacketError(f"invalid routing policy JSON: {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise PacketError("routing policy root must be an object")
+    return payload
+
+
+def infer_routing_hints(
+    metadata: dict[str, Any],
+    *,
+    policy_path: Path = ROUTING_POLICY_PATH,
+) -> dict[str, Any]:
+    """Suggest routing metadata from packet shape and harness-routing policy."""
+    if not policy_path.is_file():
+        return {}
+    policy = load_routing_policy(policy_path)
+    hints: dict[str, Any] = {}
+    if metadata.get("task_category"):
+        hints["task_category"] = metadata["task_category"]
+    else:
+        editable_count = len(metadata.get("editable_files", []))
+        create_count = len(metadata.get("create_files", []))
+        file_count = editable_count + create_count
+        task_kind = metadata.get("task_kind")
+        for rule in policy.get("inference_rules", []):
+            when = rule.get("when", {})
+            if task_kind and when.get("task_kind") and when["task_kind"] != task_kind:
+                continue
+            min_files = when.get("min_editable_files")
+            if min_files is not None and editable_count < _coerce_policy_int(
+                min_files, "when.min_editable_files"
+            ):
+                continue
+            max_files = when.get("max_editable_files")
+            if max_files is not None and editable_count > _coerce_policy_int(
+                max_files, "when.max_editable_files"
+            ):
+                continue
+            min_total = when.get("min_total_files")
+            if min_total is not None and file_count < _coerce_policy_int(
+                min_total, "when.min_total_files"
+            ):
+                continue
+            if "task_category" in rule:
+                hints["task_category"] = rule["task_category"]
+                break
+
+    category = hints.get("task_category") or metadata.get("task_category")
+    defaults = policy.get("category_defaults", {}).get(category or "", {})
+    if isinstance(defaults, dict):
+        for key in OPTIONAL_ROUTING_KEYS:
+            if key not in metadata and key in defaults:
+                hints[key] = defaults[key]
+        if "agent_profile" in defaults and "agent_profile" not in metadata:
+            hints["agent_profile"] = defaults["agent_profile"]
+    return hints
+
+
+def discover_packets(projects_dir: Path = PROJECTS_DIR) -> list[Path]:
+    return sorted(projects_dir.glob("*/plans/task-packets/*.md"))
+
+
+def compile_packets(
+    *,
+    projects_dir: Path = PROJECTS_DIR,
+    output: Path = DEFAULT_OUTPUT,
+    include_drafts: bool = True,
+) -> dict[str, Any]:
+    summaries: list[dict[str, Any]] = []
+    problems: list[dict[str, Any]] = []
+    seen_packet_ids: set[str] = set()
+    prior_packets: dict[str, dict[str, Any]] = {}
+    if output.is_file():
+        try:
+            prior_payload = json.loads(output.read_text(encoding="utf-8"))
+            prior_packets = {
+                item["id"]: item
+                for item in prior_payload.get("packets", [])
+                if isinstance(item, dict) and "id" in item
+            }
+        except (OSError, json.JSONDecodeError):
+            prior_packets = {}
+    for path in discover_packets(projects_dir):
+        try:
+            packet = load_packet(path)
+            errors = validate_packet(packet, projects_dir=projects_dir)
+        except PacketError as exc:
+            errors = [str(exc)]
+            packet = None
+        if errors:
+            problems.append({"path": str(path), "errors": errors})
+            continue
+        assert packet is not None
+        summary = packet_summary(packet, root=projects_dir.parent)
+        seen_packet_ids.add(summary["id"])
+        prior = prior_packets.get(summary["id"])
+        if prior and prior.get("status") in {"ready", "retired"}:
+            if (
+                prior.get("contract_sha256")
+                and prior["contract_sha256"] != summary["contract_sha256"]
+            ):
+                problems.append(
+                    {
+                        "path": str(path),
+                        "errors": [
+                            "compiled ready packet contract is immutable; "
+                            "create a new task_id for revised work"
+                        ],
+                    }
+                )
+                continue
+            if summary["status"] == "draft":
+                problems.append(
+                    {
+                        "path": str(path),
+                        "errors": ["compiled ready packet may not return to draft"],
+                    }
+                )
+                continue
+            if prior.get("status") == "retired" and summary["status"] != "retired":
+                problems.append(
+                    {
+                        "path": str(path),
+                        "errors": ["retired packet may not be reactivated"],
+                    }
+                )
+                continue
+        if include_drafts or packet["metadata"]["status"] == "ready":
+            summaries.append(summary)
+
+    for packet_id, prior in sorted(prior_packets.items()):
+        if (
+            prior.get("status") in {"ready", "retired"}
+            and packet_id not in seen_packet_ids
+        ):
+            problems.append(
+                {
+                    "path": prior.get("packet_path", packet_id),
+                    "errors": [
+                        "compiled ready packet may not be deleted; "
+                        "retire it and preserve the contract"
+                    ],
+                }
+            )
+
+    payload = {
+        "packet_version": 1,
+        "packets": summaries,
+        "invalid": problems,
+    }
+    if problems:
+        return payload
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+    return payload
+
+
+def _print_errors(errors: list[str]) -> None:
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate_parser = subparsers.add_parser("validate")
+    validate_parser.add_argument("path", type=Path)
+    validate_parser.add_argument("--require-ready", action="store_true")
+
+    compile_parser = subparsers.add_parser("compile")
+    compile_parser.add_argument("--projects-dir", type=Path, default=PROJECTS_DIR)
+    compile_parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    compile_parser.add_argument("--ready-only", action="store_true")
+
+    hints_parser = subparsers.add_parser("routing-hints")
+    hints_parser.add_argument(
+        "--policy",
+        type=Path,
+        default=ROUTING_POLICY_PATH,
+    )
+    hints_parser.add_argument("--metadata-json", required=True)
+
+    args = parser.parse_args(argv)
+    if args.command == "routing-hints":
+        try:
+            metadata = json.loads(args.metadata_json)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: invalid metadata JSON: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(metadata, dict):
+            print("ERROR: metadata JSON must be an object", file=sys.stderr)
+            return 1
+        try:
+            hints = infer_routing_hints(metadata, policy_path=args.policy)
+        except PacketError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(hints, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "validate":
+        try:
+            packet = load_packet(args.path)
+            errors = validate_packet(packet, require_ready=args.require_ready)
+        except PacketError as exc:
+            errors = [str(exc)]
+        if errors:
+            _print_errors(errors)
+            return 1
+        print(f"Valid task packet: {args.path}")
+        return 0
+
+    payload = compile_packets(
+        projects_dir=args.projects_dir,
+        output=args.output,
+        include_drafts=not args.ready_only,
+    )
+    print(
+        f"Compiled {len(payload['packets'])} packets "
+        f"with {len(payload['invalid'])} invalid packet(s) to {args.output}"
+    )
+    if payload["invalid"]:
+        for problem in payload["invalid"]:
+            _print_errors(
+                [f"{problem['path']}: {message}" for message in problem["errors"]]
+            )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Summarize local workflow telemetry without exposing raw prompts or outputs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from collections import Counter, defaultdict
+from datetime import date, timedelta
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DIR = ROOT / "20_live" / "workflow-metrics" / "events"
+SAFE_PROCESS_ID_RE = re.compile(
+    r"^(?:cli|script|ingest|workflow|skill|agent)-[a-z0-9][a-z0-9._-]{0,72}$"
+)
+
+
+def load_events(log_dir: Path, days: int) -> list[dict]:
+    start = date.today() - timedelta(days=days - 1)
+    events: list[dict] = []
+    for path in sorted(log_dir.glob("*.jsonl")):
+        try:
+            if date.fromisoformat(path.stem) < start:
+                continue
+        except ValueError:
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return events
+
+
+def percentage(numerator: int, denominator: int) -> float | None:
+    if denominator == 0:
+        return None
+    return round((numerator / denominator) * 100, 1)
+
+
+def named_counts(counter: Counter[str]) -> list[dict[str, object]]:
+    return [
+        {"name": name, "count": count}
+        for name, count in counter.most_common()
+    ]
+
+
+def event_process_ids(event: dict) -> list[str]:
+    values = event.get("process_ids")
+    if isinstance(values, list):
+        ids = [str(value) for value in values if value]
+    else:
+        ids = []
+    single = event.get("process_id")
+    if single:
+        ids.insert(0, str(single))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for process_id in ids:
+        if not SAFE_PROCESS_ID_RE.match(process_id):
+            continue
+        if process_id in seen:
+            continue
+        unique.append(process_id)
+        seen.add(process_id)
+    return unique
+
+
+def client_quality(events: list[dict]) -> list[dict[str, object]]:
+    """Per-client quality rollup; a session counts under every client tag it carries."""
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for event in events:
+        grouped[event.get("client") or "unknown"].append(event)
+
+    rollup: list[dict[str, object]] = []
+    for client, client_events in grouped.items():
+        sessions = {
+            event.get("session_hash")
+            for event in client_events
+            if event.get("session_hash")
+        }
+        starts = {
+            event.get("session_hash")
+            for event in client_events
+            if event.get("event") == "SessionStart" and event.get("session_hash")
+        }
+        ends = {
+            event.get("session_hash")
+            for event in client_events
+            if event.get("event") == "SessionEnd" and event.get("session_hash")
+        }
+        post_events = [
+            event for event in client_events
+            if event.get("event") in {"PostToolUse", "PostToolUseFailure"}
+        ]
+        timed_post_events = sum(
+            1
+            for event in post_events
+            if isinstance(event.get("duration_ms"), (int, float))
+        )
+        closed = len(starts & ends)
+        rollup.append({
+            "name": client,
+            "events": len(client_events),
+            "event_types": sorted(
+                {event.get("event") or "unknown" for event in client_events}
+            ),
+            "sessions": len(sessions),
+            "sessions_with_start": len(starts),
+            "sessions_with_end": len(ends),
+            "closed_started_sessions": closed,
+            "session_close_coverage_pct": percentage(closed, len(starts)),
+            "post_tool_events": len(post_events),
+            "timed_post_tool_events": timed_post_events,
+            "duration_coverage_pct": percentage(
+                timed_post_events, len(post_events)
+            ),
+            "tool_failures": sum(
+                1 for event in client_events if event.get("success") is False
+            ),
+        })
+    rollup.sort(key=lambda item: item["events"], reverse=True)
+    return rollup
+
+
+def process_rollup(events: list[dict]) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for event in events:
+        for process_id in event_process_ids(event):
+            grouped[process_id].append(event)
+
+    rollup: list[dict[str, object]] = []
+    for process_id, process_events in grouped.items():
+        sessions = {
+            event.get("session_hash")
+            for event in process_events
+            if event.get("session_hash")
+        }
+        clients = Counter(
+            event.get("client") or "unknown"
+            for event in process_events
+        )
+        rollup.append({
+            "process_id": process_id,
+            "events": len(process_events),
+            "sessions": len(sessions),
+            "tool_failures": sum(
+                1 for event in process_events if event.get("success") is False
+            ),
+            "event_types": sorted(
+                {event.get("event") or "unknown" for event in process_events}
+            ),
+            "clients": named_counts(clients),
+        })
+    rollup.sort(key=lambda item: item["events"], reverse=True)
+    return rollup
+
+
+def input_signal_rollup(events: list[dict]) -> dict[str, object]:
+    command_heads: Counter[str] = Counter()
+    path_zones: Counter[str] = Counter()
+    extensions: Counter[str] = Counter()
+    redacted_input_events = 0
+
+    for event in events:
+        summary = event.get("input_summary")
+        if not isinstance(summary, dict) or not summary:
+            continue
+        redacted_input_events += 1
+        command_head = summary.get("command_head")
+        if isinstance(command_head, str) and command_head:
+            command_heads[command_head] += 1
+        path_zone = summary.get("path_zone")
+        if isinstance(path_zone, str) and path_zone:
+            path_zones[path_zone] += 1
+        extension = summary.get("extension")
+        if isinstance(extension, str) and extension:
+            extensions[extension] += 1
+
+    return {
+        "redacted_input_events": redacted_input_events,
+        "command_heads": named_counts(command_heads),
+        "path_zones": named_counts(path_zones),
+        "file_extensions": named_counts(extensions),
+    }
+
+
+def build_summary(
+    events: list[dict],
+    days: int,
+    *,
+    by_process: bool = False,
+    input_signals: bool = False,
+) -> dict[str, object]:
+    by_event = Counter(event.get("event") or "unknown" for event in events)
+    by_tool = Counter(event.get("tool_name") or "none" for event in events)
+    by_client = Counter(event.get("client") or "unknown" for event in events)
+    failures = [event for event in events if event.get("success") is False]
+    failures_by_tool = Counter(
+        event.get("tool_name") or "unknown" for event in failures
+    )
+    diagnostics = Counter(
+        event.get("diagnostic")
+        for event in events
+        if event.get("diagnostic")
+    )
+    verification_events = sum(
+        1 for event in events if event.get("tool_purpose") == "verification"
+    )
+    post_events = [
+        event for event in events
+        if event.get("event") in {"PostToolUse", "PostToolUseFailure"}
+    ]
+    durations = [
+        {
+            "duration_ms": event.get("duration_ms"),
+            "tool_name": event.get("tool_name") or "unknown",
+        }
+        for event in events
+        if isinstance(event.get("duration_ms"), (int, float))
+    ]
+    durations.sort(key=lambda item: item["duration_ms"], reverse=True)
+
+    sessions = {
+        event.get("session_hash")
+        for event in events
+        if event.get("session_hash")
+    }
+    start_sessions = {
+        event.get("session_hash")
+        for event in events
+        if event.get("event") == "SessionStart" and event.get("session_hash")
+    }
+    end_sessions = {
+        event.get("session_hash")
+        for event in events
+        if event.get("event") == "SessionEnd" and event.get("session_hash")
+    }
+
+    pairing: dict[str, Counter[str]] = defaultdict(Counter)
+    outcome_only_source_events = 0
+    for event in events:
+        session = event.get("session_hash")
+        if not session:
+            continue
+        if event.get("event") == "PreToolUse":
+            pairing[session]["pre"] += 1
+        elif event.get("event") in {"PostToolUse", "PostToolUseFailure"}:
+            if event.get("source") == "aider":
+                outcome_only_source_events += 1
+                continue
+            pairing[session]["outcome"] += 1
+
+    deltas = [
+        counts["pre"] - counts["outcome"]
+        for counts in pairing.values()
+        if counts["pre"] or counts["outcome"]
+    ]
+    client_tagged = sum(
+        count for name, count in by_client.items() if name != "unknown"
+    )
+    process_tagged = sum(1 for event in events if event_process_ids(event))
+    timed_post_events = sum(
+        1
+        for event in post_events
+        if isinstance(event.get("duration_ms"), (int, float))
+    )
+    closed_started_sessions = len(start_sessions & end_sessions)
+
+    summary: dict[str, object] = {
+        "days": days,
+        "events": len(events),
+        "sessions": len(sessions),
+        "tool_failures": len(failures),
+        "events_by_type": named_counts(by_event),
+        "tool_calls": named_counts(by_tool),
+        "clients": named_counts(by_client),
+        "failures_by_tool": named_counts(failures_by_tool),
+        "diagnostics": named_counts(diagnostics),
+        "verification_events": verification_events,
+        "slowest_tool_calls": durations[:10],
+        "telemetry_quality": {
+            "client_tagged_events": client_tagged,
+            "client_tag_coverage_pct": percentage(client_tagged, len(events)),
+            "process_tagged_events": process_tagged,
+            "process_tag_coverage_pct": percentage(process_tagged, len(events)),
+            "post_tool_events": len(post_events),
+            "timed_post_tool_events": timed_post_events,
+            "duration_coverage_pct": percentage(
+                timed_post_events, len(post_events)
+            ),
+            "sessions_with_start": len(start_sessions),
+            "sessions_with_end": len(end_sessions),
+            "closed_started_sessions": closed_started_sessions,
+            "session_close_coverage_pct": percentage(
+                closed_started_sessions, len(start_sessions)
+            ),
+            "tool_sessions": len(deltas),
+            "unbalanced_tool_sessions": sum(delta != 0 for delta in deltas),
+            "unmatched_pre_tool_events": sum(max(delta, 0) for delta in deltas),
+            "unmatched_outcome_events": sum(max(-delta, 0) for delta in deltas),
+            "outcome_only_source_events": outcome_only_source_events,
+            "by_client": client_quality(events),
+        },
+    }
+    if by_process:
+        summary["processes"] = process_rollup(events)
+    if input_signals:
+        summary["input_signals"] = input_signal_rollup(events)
+    return summary
+
+
+def format_coverage(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}%"
+
+
+def print_summary(summary: dict[str, object]) -> None:
+    quality = summary["telemetry_quality"]
+    assert isinstance(quality, dict)
+
+    print(f"Workflow telemetry summary, last {summary['days']} days")
+    print(f"Events: {summary['events']}")
+    print(f"Sessions: {summary['sessions']}")
+    print(f"Tool failures: {summary['tool_failures']}")
+    print("")
+    print("Events by type:")
+    for item in summary["events_by_type"]:
+        print(f"- {item['name']}: {item['count']}")
+    print("")
+    print("Tool calls:")
+    for item in summary["tool_calls"][:10]:
+        print(f"- {item['name']}: {item['count']}")
+
+    failures_by_tool = summary["failures_by_tool"]
+    if failures_by_tool:
+        print("")
+        print("Tool failures by type:")
+        for item in failures_by_tool:
+            print(f"- {item['name']}: {item['count']}")
+
+    diagnostics = summary["diagnostics"]
+    if diagnostics:
+        print("")
+        print("Run diagnostics:")
+        for item in diagnostics:
+            print(f"- {item['name']}: {item['count']}")
+
+    if summary["verification_events"]:
+        print("")
+        print(f"Observed verification events: {summary['verification_events']}")
+
+    slowest = summary["slowest_tool_calls"]
+    if slowest:
+        print("")
+        print("Slowest timed tool calls:")
+        for item in slowest:
+            print(f"- {item['tool_name']}: {item['duration_ms']} ms")
+
+    print("")
+    print("Telemetry quality:")
+    print(
+        "- Client tags: "
+        f"{quality['client_tagged_events']}/{summary['events']} "
+        f"({format_coverage(quality['client_tag_coverage_pct'])})"
+    )
+    print(
+        "- Duration coverage: "
+        f"{quality['timed_post_tool_events']}/{quality['post_tool_events']} "
+        f"post-tool events "
+        f"({format_coverage(quality['duration_coverage_pct'])})"
+    )
+    print(
+        "- Session close coverage: "
+        f"{quality['closed_started_sessions']}/{quality['sessions_with_start']} "
+        f"started sessions "
+        f"({format_coverage(quality['session_close_coverage_pct'])})"
+    )
+    print(
+        "- Tool event pairing: "
+        f"{quality['unbalanced_tool_sessions']} unbalanced session(s), "
+        f"{quality['unmatched_pre_tool_events']} unmatched pre-tool event(s), "
+        f"{quality['unmatched_outcome_events']} unmatched outcome event(s)"
+    )
+    if quality["outcome_only_source_events"]:
+        print(
+            "- Outcome-only source events: "
+            f"{quality['outcome_only_source_events']} "
+            "(excluded from pre/post pairing)"
+        )
+
+    by_client = quality.get("by_client") or []
+    if by_client:
+        print("")
+        print("Telemetry quality by client:")
+        for item in by_client:
+            print(
+                f"- {item['name']}: {item['events']} events, "
+                f"{item['sessions']} session(s); "
+                f"close {item['closed_started_sessions']}/{item['sessions_with_start']} "
+                f"({format_coverage(item['session_close_coverage_pct'])}); "
+                f"durations {item['timed_post_tool_events']}/{item['post_tool_events']} "
+                f"({format_coverage(item['duration_coverage_pct'])}); "
+                f"failures {item['tool_failures']}"
+            )
+
+    processes = summary.get("processes") or []
+    if processes:
+        print("")
+        print("Processes:")
+        for item in processes[:20]:
+            clients = ", ".join(
+                f"{client['name']}:{client['count']}"
+                for client in item["clients"]
+            )
+            print(
+                f"- {item['process_id']}: {item['events']} events, "
+                f"{item['sessions']} session(s), failures {item['tool_failures']}; "
+                f"clients {clients}"
+            )
+
+    input_signals = summary.get("input_signals")
+    if isinstance(input_signals, dict):
+        print("")
+        print("Redacted input signals:")
+        print(
+            "- Events with redacted input summaries: "
+            f"{input_signals['redacted_input_events']}"
+        )
+        for label, key in (
+            ("Command heads", "command_heads"),
+            ("Path zones", "path_zones"),
+            ("File extensions", "file_extensions"),
+        ):
+            items = input_signals.get(key) or []
+            if items:
+                values = ", ".join(
+                    f"{item['name']}:{item['count']}" for item in items[:10]
+                )
+                print(f"- {label}: {values}")
+
+    print("")
+    print(
+        "Interpretation: tool failures measure execution events, not task quality. "
+        "A client with started sessions but no SessionEnd events may never emit "
+        "that event; read per-client coverage before trusting the aggregate. "
+        "Use telemetry coverage and outcome sampling before drawing process conclusions."
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--dir", type=Path, default=DEFAULT_DIR)
+    parser.add_argument(
+        "--json", action="store_true", help="emit a structured summary"
+    )
+    parser.add_argument(
+        "--by-process",
+        action="store_true",
+        help="include privacy-safe process_id rollups when events provide them",
+    )
+    parser.add_argument(
+        "--input-signals",
+        action="store_true",
+        help="include aggregate redacted command-head/path-zone input signals",
+    )
+    args = parser.parse_args()
+
+    events = load_events(args.dir, args.days)
+    if not events:
+        if args.json:
+            print(json.dumps(
+                build_summary(
+                    [],
+                    args.days,
+                    by_process=args.by_process,
+                    input_signals=args.input_signals,
+                ),
+                indent=2,
+            ))
+        else:
+            print(
+                f"No workflow telemetry found in {args.dir} "
+                f"for the last {args.days} days."
+            )
+        return 0
+
+    summary = build_summary(
+        events,
+        args.days,
+        by_process=args.by_process,
+        input_signals=args.input_signals,
+    )
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print_summary(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

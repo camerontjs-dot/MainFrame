@@ -1,0 +1,4 @@
+interface:
+  display_name: "Print-Ready PDF Generation"
+  short_description: "Generate and repair polished PDFs"
+  default_prompt: "Use $print-ready-pdf-generation to regenerate this Markdown or HTML file as a polished, verified PDF."

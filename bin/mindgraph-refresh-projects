@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# Refresh the projects MindGraph index from coordination surfaces.
+# Fail-closed CLI (Unit 2.1): --help is non-mutating; unknown flags rejected;
+# flags are order-independent; live ingest requires explicit --apply.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+DB_PATH="${MINDGRAPH_DB_PATH:-$HOME/.mindgraph/mainframe-projects.sqlite}"
+# Default lean manifest; --deep switches to archaeology profile unless env overrides.
+PROJECT_MANIFEST="${MAINFRAME_MINDGRAPH_PROJECTS_MANIFEST:-$ROOT/30_projects/mindgraph-projects.json}"
+DEEP_MANIFEST="$ROOT/30_projects/mindgraph-projects-deep.json"
+DRY_RUN=0
+FULL=0
+DEEP=0
+APPLY=0
+
+usage() {
+  cat <<'EOF'
+Usage: bin/mindgraph-refresh-projects [options]
+
+Refresh (or preview) the projects MindGraph index from 30_projects/
+coordination surfaces. Trust profile: project_status (see HARNESS.md).
+
+Options (order-independent):
+  -h, --help     Show this help and exit 0 (never mutates)
+  --dry-run      Preview scopes and intended commands; no DB writes
+  --full         Include every project directory (not just the curated list)
+  --deep         Use mindgraph-projects-deep.json (includes outputs/**)
+  --apply        Perform the live ingest (required for mutation)
+
+Default manifest (lean): README, AGENTS, log, decisions, methodology, plans —
+no bulk outputs. Deep profile adds outputs/** for archaeology.
+
+Environment:
+  MINDGRAPH_DB_PATH                      Target SQLite DB
+                                         (default: ~/.mindgraph/mainframe-projects.sqlite)
+  MAINFRAME_MINDGRAPH_PROJECTS_MANIFEST  Path to curated manifest JSON
+  MAINFRAME_MINDGRAPH_PROJECTS           Space-separated project slug override
+
+Safety:
+  - Unknown flags fail closed (exit 2).
+  - Without --apply, this command will not mutate any database.
+  - Prefer --dry-run first. Point MINDGRAPH_DB_PATH at a temporary DB for experiments.
+  - Recommended: bin/mindgraph-projects-apply (plan → stage → promote).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --full)
+      FULL=1
+      shift
+      ;;
+    --deep)
+      DEEP=1
+      shift
+      ;;
+    --apply)
+      APPLY=1
+      shift
+      ;;
+    -*)
+      echo "error: unknown option: $1" >&2
+      echo "hint: use --help for usage; mutation requires --apply" >&2
+      exit 2
+      ;;
+    *)
+      echo "error: unexpected argument: $1" >&2
+      echo "hint: this command takes flags only; use --help" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$DRY_RUN" -eq 1 && "$APPLY" -eq 1 ]]; then
+  echo "error: refuse --dry-run together with --apply; choose one" >&2
+  exit 2
+fi
+
+if [[ "$DRY_RUN" -eq 0 && "$APPLY" -eq 0 ]]; then
+  echo "error: refusing to mutate without --apply" >&2
+  echo "hint: preview with --dry-run, or pass --apply for live ingest" >&2
+  echo "hint: set MINDGRAPH_DB_PATH to a temporary DB when testing" >&2
+  exit 2
+fi
+
+# --deep selects the deep manifest only when the env did not already pin one
+if [[ "$DEEP" -eq 1 ]]; then
+  if [[ -z "${MAINFRAME_MINDGRAPH_PROJECTS_MANIFEST:-}" ]]; then
+    PROJECT_MANIFEST="$DEEP_MANIFEST"
+  fi
+  if [[ ! -f "$PROJECT_MANIFEST" ]]; then
+    echo "error: deep manifest not found: $PROJECT_MANIFEST" >&2
+    exit 2
+  fi
+fi
+
+TMP_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/mindgraph-projects.XXXXXX.json")"
+trap 'rm -f "$TMP_MANIFEST"' EXIT
+
+python3 - "$ROOT" "$TMP_MANIFEST" "$PROJECT_MANIFEST" "$FULL" "${MAINFRAME_MINDGRAPH_PROJECTS:-}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+out_path = Path(sys.argv[2])
+manifest_path = Path(sys.argv[3]).expanduser()
+full = sys.argv[4] == "1"
+override = sys.argv[5].strip()
+projects_dir = root / "30_projects"
+
+default_projects = [
+    "agent-harness-eval",
+    "agent-tracker-eval",
+    "local-agent",
+    "mindgraph",
+    "mindgraph-eval",
+    "mainframe-process-eval",
+]
+include = [
+    "README.md",
+    "AGENTS.md",
+    "log.md",
+    "decisions.md",
+    "methodology-approach.md",
+    "plans/*.md",
+    "plans/**/*.md",
+]
+exclude = [
+    ".git/*",
+    ".git/**/*",
+    ".venv/*",
+    ".venv/**/*",
+    "__pycache__/*",
+    "__pycache__/**/*",
+    ".pytest_cache/*",
+    ".pytest_cache/**/*",
+    "workbench/*",
+    "workbench/**/*",
+    "raw-materials/*",
+    "raw-materials/**/*",
+    "outputs/*",
+    "outputs/**/*",
+]
+
+if full:
+    projects = sorted(p.name for p in projects_dir.iterdir() if p.is_dir())
+elif override:
+    projects = override.split()
+elif manifest_path.exists():
+    payload = json.loads(manifest_path.read_text())
+    if not isinstance(payload, dict):
+        raise SystemExit(f"project manifest must be a JSON object: {manifest_path}")
+    projects = payload.get("projects", default_projects)
+    include = payload.get("include", include)
+    exclude = payload.get("exclude", exclude)
+else:
+    projects = default_projects
+
+if not isinstance(projects, list) or not all(isinstance(p, str) for p in projects):
+    raise SystemExit("project manifest field 'projects' must be a string list")
+if not isinstance(include, list) or not all(isinstance(p, str) for p in include):
+    raise SystemExit("project manifest field 'include' must be a string list")
+if not isinstance(exclude, list) or not all(isinstance(p, str) for p in exclude):
+    raise SystemExit("project manifest field 'exclude' must be a string list")
+
+scopes = []
+for slug in projects:
+    project_path = projects_dir / slug
+    if not project_path.is_dir():
+        print(f"warn: project scope missing, skipping: {project_path}", file=sys.stderr)
+        continue
+    scopes.append(
+        {
+            "namespace": slug,
+            "root": str(project_path),
+            "source_root": str(project_path),
+            "display_prefix": f"30_projects/{slug}",
+        }
+    )
+
+if not scopes:
+    raise SystemExit("MindGraph projects ingest scope is empty.")
+
+out = {
+    "index_id": "mainframe-projects",
+    "trust_profile": "project_status",
+    "include": include,
+    "exclude": exclude,
+    "scopes": scopes,
+}
+out_path.write_text(json.dumps(out, indent=2) + "\n")
+PY
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "DB: $DB_PATH"
+  echo "Trust profile: project_status (see HARNESS.md)"
+  echo "Mode: dry-run (no DB mutation)"
+  if [[ "$FULL" -eq 1 ]]; then
+    echo "Scope mode: full project directory list (include patterns from manifest/defaults)"
+  elif [[ -n "${MAINFRAME_MINDGRAPH_PROJECTS:-}" ]]; then
+    echo "Scope mode: MAINFRAME_MINDGRAPH_PROJECTS override"
+  else
+    echo "Scope mode: curated manifest$([ "$DEEP" -eq 1 ] && echo ' (deep)' || echo ' (lean/default)')"
+    echo "Manifest: $PROJECT_MANIFEST"
+  fi
+  echo "Scopes:"
+  python3 - "$TMP_MANIFEST" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1]))
+for scope in payload["scopes"]:
+    print(f"  {scope['namespace']}: {scope['root']}")
+PY
+  echo "Includes:"
+  python3 - "$TMP_MANIFEST" <<'PY'
+import json
+import sys
+payload = json.load(open(sys.argv[1]))
+for pattern in payload["include"]:
+    print(f"  {pattern}")
+PY
+  echo "Commands (not run):"
+  echo "  MINDGRAPH_DB_PATH=\"$DB_PATH\" $ROOT/bin/mindgraph init"
+  echo "  MINDGRAPH_DB_PATH=\"$DB_PATH\" $ROOT/bin/mindgraph ingest-many <generated-project-manifest> --allow-failures"
+  echo "To apply against this DB: MINDGRAPH_DB_PATH=\"$DB_PATH\" $0 --apply${FULL:+ --full}"
+  exit 0
+fi
+
+# --apply path only below
+mkdir -p "$(dirname "$DB_PATH")"
+
+if [[ ! -f "$DB_PATH" ]]; then
+  MINDGRAPH_DB_PATH="$DB_PATH" "$ROOT/bin/mindgraph" init
+fi
+
+MINDGRAPH_DB_PATH="$DB_PATH" "$ROOT/bin/mindgraph" ingest-many "$TMP_MANIFEST" --allow-failures

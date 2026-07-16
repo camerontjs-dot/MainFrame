@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# G10: PATH-safe skill-eval wrapper.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_PY="$ROOT/30_projects/skill-eval-workshop/workbench/.venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  exec "$VENV_PY" -m skill_eval "$@"
+elif [[ -x /opt/homebrew/bin/python3 ]]; then
+  exec /opt/homebrew/bin/python3 -m skill_eval "$@"
+elif [[ -x /usr/bin/python3 ]]; then
+  exec /usr/bin/python3 -m skill_eval "$@"
+else
+  exec python3 -m skill_eval "$@"
+fi
