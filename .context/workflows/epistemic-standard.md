@@ -73,3 +73,27 @@ Source discovery (source-literature)
 - Vibes, aesthetics, and narrative coherence are not evidence.
 - "I don't know yet" is a valid output.
 - Contradictions go to `20_live/epistemic-audit/contradictions/` or stay tagged `needs-audit`.
+## Stop state
+
+The one this workflow most needs, because the failure it guards is a claim that
+cannot be supported and an author under pressure to ship something.
+
+**If a claim cannot be verified against a real source, stop promoting it.** Leave
+it `synthesized`, label it as inference or hypothesis per the claim-type table,
+and record in the note *why* verification failed: source unreachable, source
+found but does not support the claim, or no source located. All three are
+complete outcomes.
+
+**Escape.** A documented gap is a finished result and carries no penalty. There
+is no target number of sources and never should be. Finding one real source and
+recording the gap is a better result than three that resolve to nothing.
+
+**Never** resolve the tension by weakening the claim's language until the weak
+evidence fits. Calibrated confidence describes evidence you have; it does not
+launder evidence you do not.
+
+This is the station where the 2026-08-09 incident happened. A source count in
+`bin/research-lane-loop` met a capture schema that required `url` / `authors` /
+`year`, and between them there was no way to record "I looked and found nothing."
+107 captures cited papers that do not exist. See
+`10_knowledge/agents/2026-08-10__agents__note__every-rule-needs-an-honest-failure-path.md`.

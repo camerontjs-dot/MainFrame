@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -78,6 +79,41 @@ class TaskPacketTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_inspect_emits_validated_canonical_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "30_projects"
+            project = self.make_project(projects)
+            path = project / "plans" / "task-packets" / "fix-one.md"
+            path.write_text(packet_text(), encoding="utf-8")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "inspect",
+                    str(path),
+                    "--projects-dir",
+                    str(projects),
+                    "--require-ready",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            summary = json.loads(completed.stdout)
+
+        self.assertEqual(summary["task_id"], "fix-one")
+        self.assertEqual(summary["project_slug"], "demo")
+        self.assertEqual(summary["status"], "ready")
+        self.assertEqual(
+            summary["packet_path"],
+            "30_projects/demo/plans/task-packets/fix-one.md",
+        )
+        self.assertRegex(summary["contract_sha256"], r"^[a-f0-9]{64}$")
+        self.assertRegex(summary["source_sha256"], r"^[a-f0-9]{64}$")
+        self.assertEqual(summary["workdir"], "workbench")
+
     def test_optional_query_pass_section_allowed(self) -> None:
         text = packet_text() + (
             "## MindGraph Query Pass\n\n"
@@ -144,6 +180,53 @@ class TaskPacketTests(unittest.TestCase):
         self.assertTrue(any("unsafe path" in error for error in errors))
         self.assertTrue(any("overlap" in error for error in errors))
         self.assertTrue(any("shell operator" in error for error in errors))
+
+    def test_rejects_ancestor_descendant_scope_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = Path(tmp)
+            project = self.make_project(projects)
+            path = project / "plans" / "task-packets" / "fix-one.md"
+            path.write_text(
+                packet_text(
+                    editable_files=["src", "src/app.py"],
+                    create_files=["generated/report.json"],
+                    read_only_files=["src/secrets.txt", "generated"],
+                ),
+                encoding="utf-8",
+            )
+
+            errors = task_packet.validate_packet(
+                task_packet.load_packet(path), projects_dir=projects
+            )
+
+        self.assertTrue(
+            any("editable_files contains overlapping paths" in error for error in errors)
+        )
+        self.assertTrue(
+            any("editable_files and read_only_files" in error for error in errors)
+        )
+        self.assertTrue(
+            any("create_files and read_only_files" in error for error in errors)
+        )
+
+    def test_rejects_noncanonical_relative_path_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            projects = Path(tmp)
+            project = self.make_project(projects)
+            path = project / "plans" / "task-packets" / "fix-one.md"
+            path.write_text(
+                packet_text(
+                    editable_files=["src//app.py", "src/./other.py"],
+                    read_only_files=["src\\secrets.txt"],
+                ),
+                encoding="utf-8",
+            )
+
+            errors = task_packet.validate_packet(
+                task_packet.load_packet(path), projects_dir=projects
+            )
+
+        self.assertEqual(sum("unsafe path" in error for error in errors), 3)
 
     def test_rejects_missing_section_and_nonexistent_workdir(self) -> None:
         text = packet_text().replace(
@@ -306,6 +389,26 @@ class TaskPacketTests(unittest.TestCase):
             "30_projects/demo/plans/task-packets/fix-one.md",
         )
 
+    def test_compile_does_not_reuse_predictable_temporary_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "30_projects"
+            project = self.make_project(projects)
+            path = project / "plans" / "task-packets" / "fix-one.md"
+            output = projects / "task_packets_manifest.json"
+            predictable_temp = output.with_suffix(output.suffix + ".tmp")
+            path.write_text(packet_text(), encoding="utf-8")
+            predictable_temp.write_text("sentinel", encoding="utf-8")
+
+            payload = task_packet.compile_packets(
+                projects_dir=projects, output=output
+            )
+
+            self.assertEqual(
+                predictable_temp.read_text(encoding="utf-8"), "sentinel"
+            )
+            self.assertEqual(payload["invalid"], [])
+
     def test_invalid_compile_preserves_last_good_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -313,20 +416,73 @@ class TaskPacketTests(unittest.TestCase):
             project = self.make_project(projects)
             path = project / "plans" / "task-packets" / "fix-one.md"
             output = projects / "task_packets_manifest.json"
-            output.write_text('{"last_good": true}\n', encoding="utf-8")
-            path.write_text(
-                packet_text(verification_commands=[]),
-                encoding="utf-8",
-            )
+            path.write_text(packet_text(), encoding="utf-8")
+            task_packet.compile_packets(projects_dir=projects, output=output)
+            last_good = output.read_bytes()
+            path.write_text(packet_text(verification_commands=[]), encoding="utf-8")
 
             payload = task_packet.compile_packets(
                 projects_dir=projects,
                 output=output,
             )
-            output_text = output.read_text(encoding="utf-8")
+            output_bytes = output.read_bytes()
 
         self.assertTrue(payload["invalid"])
-        self.assertEqual(output_text, '{"last_good": true}\n')
+        self.assertEqual(output_bytes, last_good)
+
+    def test_corrupt_manifest_fails_closed_and_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "30_projects"
+            project = self.make_project(projects)
+            path = project / "plans" / "task-packets" / "fix-one.md"
+            output = projects / "task_packets_manifest.json"
+            path.write_text(packet_text(), encoding="utf-8")
+            corrupt = b'{"packet_version": 1, "packets": ['
+            output.write_bytes(corrupt)
+
+            payload = task_packet.compile_packets(
+                projects_dir=projects, output=output
+            )
+
+            self.assertTrue(payload["invalid"])
+            self.assertIn(
+                "invalid existing manifest JSON",
+                payload["invalid"][0]["errors"][0],
+            )
+            self.assertEqual(output.read_bytes(), corrupt)
+
+    def test_ready_manifest_entry_without_contract_hash_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            projects = root / "30_projects"
+            project = self.make_project(projects)
+            path = project / "plans" / "task-packets" / "fix-one.md"
+            output = projects / "task_packets_manifest.json"
+            path.write_text(packet_text(), encoding="utf-8")
+            corrupt = json.dumps(
+                {
+                    "packet_version": 1,
+                    "packets": [
+                        {
+                            "id": "packet-demo-fix-one",
+                            "status": "ready",
+                        }
+                    ],
+                    "invalid": [],
+                }
+            ).encode("utf-8")
+            output.write_bytes(corrupt)
+
+            payload = task_packet.compile_packets(
+                projects_dir=projects, output=output
+            )
+
+            self.assertTrue(payload["invalid"])
+            self.assertIn(
+                "no valid contract hash", payload["invalid"][0]["errors"][0]
+            )
+            self.assertEqual(output.read_bytes(), corrupt)
 
     def test_compiled_ready_contract_is_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

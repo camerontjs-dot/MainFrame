@@ -64,6 +64,56 @@ mindgraph serve-mcp --db mindgraph.sqlite
 mindgraph serve-mcp --db mindgraph.sqlite --verbose
 ```
 
+The commands above are the compatibility path: one database, stdio transport,
+and legacy list-shaped query/neighbor JSON by default.
+
+### Optional shared daemon
+
+The opt-in shared server loads one embedder and opens the durable and project
+indexes read-only. It binds only to loopback and requires every tool call to
+select `knowledge` (`durable_knowledge`) or `projects` (`project_status`). Its
+responses expose the selected scope and trust profile and never blend stores.
+
+```bash
+mindgraph daemon-start
+mindgraph daemon-status
+mindgraph daemon-health
+mindgraph mcp-proxy --url http://127.0.0.1:8000/mcp
+mindgraph daemon-stop
+```
+
+The default remains persistent and does not auto-start or idle-exit. Explicit
+idle mode (`serve-daemon --idle-seconds N`) exits only after the grace elapses
+with no in-flight tool call and no unexpired client lease. A proxy started with
+`mcp-proxy --auto-start` serializes startup under a state-directory lock, waits
+for health, and holds a renewable lease for the stdio client's lifetime.
+
+The installed MainFrame LaunchAgent currently uses `KeepAlive=true` and
+`RunAtLoad=true`; that supervision would immediately undo an idle exit. Do not
+enable idle mode without disabling that job in a verified idle window. From
+MainFrame root, the single explicit activation step is:
+
+```bash
+bin/mindgraph-idle-lifecycle activate --confirm-no-active-clients 900
+```
+
+The command backs up and unloads the job, renames its plist to `.disabled`, and
+writes the marker that makes existing `mcp-proxy` clients use locked auto-start
+plus leases. It is never run automatically. Roll back with the exact backup
+path printed by activation:
+
+```bash
+bin/mindgraph-idle-lifecycle rollback /exact/plist.backup-path
+```
+
+Direct Streamable HTTP clients cannot start a process at a dead URL. They must
+run `bin/mindgraph daemon-start --idle-seconds 900` before connecting and may
+lose an idle session after the grace unless they explicitly maintain a lease at
+`/lifecycle/lease`. Transparent direct-HTTP wakeup needs a separate always-on
+proxy or launchd socket-activation design and is not claimed here. Refresh does
+not hot-reload a running daemon. Authentication, remote exposure, socket
+activation, concurrency guarantees, and RAM/latency claims remain unestablished.
+
 First ingest on a fresh machine downloads and caches the embedding model. First query also loads the model to embed the query text, and logs the same line. Subsequent runs reuse the cached model.
 
 ## Try it
@@ -203,11 +253,30 @@ $ mindgraph neighbors c8a1be119b7ad0c3 --db /tmp/mindgraph-example/db.sqlite
 
 ## MCP
 
-MindGraph ships a stdio MCP server for local clients that already speak MCP. It is a transport wrap around the same retrieval code used by the CLI. It does not add ranking behavior, change the database schema, or turn retrieved chunks into verified claims.
+MindGraph ships MCP transports around the same retrieval code used by the CLI.
+It does not add ranking behavior, change the database schema, or turn retrieved
+chunks into verified claims.
 
-### Start the server
+### Operational default: shared daemon + proxy (MainFrame)
 
-Build or reuse a database first, then start the server from the asset root:
+One loopback daemon owns both indexes so agent sessions do not each load MiniLM:
+
+```bash
+bin/mindgraph daemon-start          # or LaunchAgent com.user.mindgraph-daemon
+bin/mindgraph daemon-health         # expect knowledge + projects scopes
+# stdio clients:
+bin/mindgraph mcp-proxy --url http://127.0.0.1:8000/mcp
+# streamable-HTTP clients (e.g. Codex):
+#   url = "http://127.0.0.1:8000/mcp"
+```
+
+Shared tools require explicit `scope` of `knowledge` or `projects` (no blend).
+Root `.mcp.json` points at `mcp-proxy`. Do not configure daily clients on
+`serve-mcp` — that path loads a full embedder per process.
+
+### Legacy single-DB stdio server
+
+For isolated debugging of one database:
 
 ```bash
 .venv/bin/mindgraph init --db /tmp/mindgraph-mcp/db.sqlite
@@ -215,32 +284,36 @@ Build or reuse a database first, then start the server from the asset root:
 .venv/bin/mindgraph serve-mcp --db /tmp/mindgraph-mcp/db.sqlite --verbose
 ```
 
-The server runs in the foreground and writes logs to stderr only. Stdout is reserved for MCP protocol frames. A smoke run against `examples/example-vault/` showed the eager model load at startup:
+Stdout is reserved for MCP protocol frames; logs go to stderr.
 
-```text
-21:30:39 INFO    mindgraph | Loading embedding model (all-MiniLM-L6-v2)...
-```
-
-### Claude Code config
-
-Add a `.mcp.json` at the repo root, adjusting the absolute paths for your checkout and database:
+### Client config (stdio proxy)
 
 ```json
 {
   "mcpServers": {
     "mindgraph": {
-      "command": "/absolute/path/to/mindgraph/.venv/bin/mindgraph",
-      "args": [
-        "serve-mcp",
-        "--db",
-        "/absolute/path/to/mindgraph.sqlite"
-      ]
+      "command": "/absolute/path/to/MainFrame/bin/mindgraph",
+      "args": ["mcp-proxy", "--url", "http://127.0.0.1:8000/mcp"]
     }
   }
 }
 ```
 
-Claude Code, Claude Desktop, Cursor, Cline, and other stdio-MCP-aware local clients can use the same server shape.
+Claude Code, Claude Desktop, Cursor, Grok, Antigravity, Cline, and other
+stdio-MCP clients can share this shape. Codex may use the HTTP URL directly.
+
+#### Idle lifecycle safety contract
+
+- Idle time starts after the last completed tool request or lease activity.
+- In-flight `query` and `graph_neighbors` calls block shutdown.
+- Renewable leases protect opt-in stdio proxy sessions; expired leases stop
+  protecting crashed clients.
+- A standard direct HTTP session is not a lease. Direct clients either tolerate
+  reconnect/manual start or explicitly use the lease endpoint. Health probes do
+  not reset idle time.
+- `daemon-status` combines PID-file and health evidence. `daemon-stop` refuses
+  a mismatched or identity-less healthy listener rather than signaling an
+  ambiguous process.
 
 ### Tools
 

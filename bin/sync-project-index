@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Generate or check the local/private 30_projects/index.md.
 
-`--check` also validates project-state truth (ADR-041): `active` requires
-activity evidence (file mtimes or nested-repo commits) within the window,
-the active count must respect the WIP cap, and every project needs valid
-frontmatter. Evidence rules match bin/session-close's checkpoint derivation.
+`--check` also validates project-state truth (ADR-041 / ADR-046): `active`
+requires activity evidence (file mtimes or nested-repo commits) within the
+window, active counts respect dual-pool WIP caps, and every project needs
+valid frontmatter. Evidence rules match bin/session-close's checkpoint
+derivation.
 """
 
 from __future__ import annotations
@@ -26,7 +27,32 @@ INDEX_PATH = PROJECTS_DIR / "index.md"
 VALID_STATES = {
     "active", "paused", "planned", "blocked", "suspended", "shipped", "trashed",
 }
-WIP_CAP = 5
+VALID_WIP_CLASSES = {"product", "eval", "anchor"}
+
+# ADR-046 dual-pool WIP (+ anchor):
+# - product seats stay tight (operator focus)
+# - eval/instrument projects may stay active without consuming product seats
+# - anchor (income-engine) is always-on strategic hub — not product, not total
+# - total active hard ceiling still bounds sprawl for product+eval
+PRODUCT_WIP_CAP = 5
+TOTAL_ACTIVE_CAP = 10
+# Backward-compatible alias used by older callers/tests.
+WIP_CAP = TOTAL_ACTIVE_CAP
+
+# Slugs that are measurement/eval infrastructure even without a *-eval suffix.
+DEFAULT_EVAL_SLUGS = frozenset({
+    "claim-audit-lab",
+    "reliability-eval-framework",
+    "scaffold-claims-study",
+    "skill-eval-workshop",
+    "verified-done",
+})
+
+# Strategic hubs that should stay active; they do not consume product or total seats.
+DEFAULT_ANCHOR_SLUGS = frozenset({
+    "income-engine",
+})
+
 ACTIVITY_WINDOW_DAYS = 14
 # Bounded scan, parity with bin/session-close latest_mtime.
 SCAN_ENTRY_CAP = 600
@@ -170,16 +196,61 @@ def render(projects_dir: Path = PROJECTS_DIR) -> str:
     return "\n".join(lines)
 
 
-def validate_projects(projects_dir: Path = PROJECTS_DIR,
-                      now_ts: float | None = None,
-                      window_days: int = ACTIVITY_WINDOW_DAYS,
-                      wip_cap: int = WIP_CAP) -> list[str]:
-    """Project-state truth rules (ADR-041). Returns human-readable problems."""
+def resolve_wip_class(slug: str, metadata: dict[str, str]) -> tuple[str, list[str]]:
+    """Return (wip_class, problems). Explicit frontmatter wins; else heuristics."""
+    problems: list[str] = []
+    raw = (metadata.get("wip_class") or "").strip().lower()
+    if raw:
+        if raw not in VALID_WIP_CLASSES:
+            problems.append(
+                f"{slug}: unknown wip_class '{raw}' "
+                f"(valid: {', '.join(sorted(VALID_WIP_CLASSES))})")
+            return "product", problems
+        return raw, problems
+    if slug in DEFAULT_ANCHOR_SLUGS:
+        return "anchor", problems
+    if slug.endswith("-eval") or slug in DEFAULT_EVAL_SLUGS:
+        return "eval", problems
+    return "product", problems
+
+
+def validate_projects(
+    projects_dir: Path = PROJECTS_DIR,
+    now_ts: float | None = None,
+    window_days: int = ACTIVITY_WINDOW_DAYS,
+    wip_cap: int | None = None,
+    product_wip_cap: int = PRODUCT_WIP_CAP,
+    total_active_cap: int | None = None,
+    only: str | None = None,
+) -> list[str]:
+    """Project-state truth rules (ADR-041 / ADR-046). Returns human-readable problems.
+
+    With `only`, validate that single project directory and skip the
+    cross-project WIP-cap rules; a missing directory is itself a problem.
+
+    Dual-pool WIP (ADR-046):
+    - product actives ≤ product_wip_cap (default 5)
+    - total actives (product+eval) ≤ total_active_cap (default 10; legacy alias: wip_cap)
+    - eval actives do not consume product seats
+    - anchor actives (income-engine) consume neither product nor total seats
+    """
     if now_ts is None:
         now_ts = datetime.now().timestamp()
+    if total_active_cap is None:
+        total_active_cap = TOTAL_ACTIVE_CAP if wip_cap is None else wip_cap
+
     problems: list[str] = []
-    active_names: list[str] = []
-    for entry in sorted(projects_dir.iterdir()):
+    active_product: list[str] = []
+    active_eval: list[str] = []
+    active_anchor: list[str] = []
+    if only is not None:
+        target = projects_dir / only
+        if not target.is_dir():
+            return [f"{only}: project directory does not exist"]
+        entries = [target]
+    else:
+        entries = sorted(projects_dir.iterdir())
+    for entry in entries:
         if not entry.is_dir() or entry.name.startswith("."):
             continue
         readme = entry / "README.md"
@@ -198,9 +269,16 @@ def validate_projects(projects_dir: Path = PROJECTS_DIR,
                 f"{entry.name}: unknown project_state '{state}' "
                 f"(valid: {', '.join(sorted(VALID_STATES))})")
             continue
+        wip_class, class_problems = resolve_wip_class(entry.name, metadata)
+        problems.extend(class_problems)
         next_action = (metadata.get("next_action") or "").strip()
         if state == "active":
-            active_names.append(entry.name)
+            if wip_class == "eval":
+                active_eval.append(entry.name)
+            elif wip_class == "anchor":
+                active_anchor.append(entry.name)
+            else:
+                active_product.append(entry.name)
             evidence = activity_evidence(entry)
             if evidence is None:
                 problems.append(f"{entry.name}: active but no activity evidence found")
@@ -216,10 +294,24 @@ def validate_projects(projects_dir: Path = PROJECTS_DIR,
         elif state == "paused" and not next_action:
             problems.append(
                 f"{entry.name}: paused without next_action reentry pointer")
-    if len(active_names) > wip_cap:
+
+    if only is not None:
+        return problems
+
+    # Anchors are permanent strategic hubs; product+eval share the capped pools.
+    active_capped = active_product + active_eval
+    if len(active_product) > product_wip_cap:
         problems.append(
-            f"WIP cap breach: {len(active_names)} active projects "
-            f"(cap {wip_cap}): {', '.join(active_names)}")
+            f"product WIP cap breach: {len(active_product)} active product "
+            f"projects (cap {product_wip_cap}): {', '.join(active_product)} "
+            f"[eval active={len(active_eval)}; anchor active={len(active_anchor)} "
+            f"not counted toward product seats]")
+    if len(active_capped) > total_active_cap:
+        problems.append(
+            f"total active cap breach: {len(active_capped)} product+eval actives "
+            f"(cap {total_active_cap}): product=[{', '.join(active_product)}] "
+            f"eval=[{', '.join(active_eval)}] "
+            f"[anchor active={len(active_anchor)} not counted toward total]")
     return problems
 
 
@@ -228,7 +320,25 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--check", action="store_true", help="fail if index is stale")
     group.add_argument("--write", action="store_true", help="write generated index")
+    parser.add_argument(
+        "--project",
+        metavar="SLUG",
+        help="with --check: validate one project's state only "
+        "(skips index staleness and the WIP cap)",
+    )
     args = parser.parse_args()
+
+    if args.project:
+        if args.write:
+            parser.error("--project only applies to --check")
+        problems = validate_projects(only=args.project)
+        if problems:
+            print("project-state problems (ADR-041):", file=sys.stderr)
+            for problem in problems:
+                print(f"  - {problem}", file=sys.stderr)
+            return 1
+        print(f"{args.project}: project state verified")
+        return 0
 
     generated = render()
     problems = validate_projects()

@@ -85,3 +85,22 @@ Use this workflow to ensure that material routed under the tiered ingest policy 
 - workflow-report coverage metric ("X needs-audit, Y swept, Z audited")
 
 **Canonical workflow:** `30_projects/epistemic-research-system/plans/epistemic-workflow.md`
+
+## The standard this sweep enforces
+
+This workflow is the post-placement half of the promotion gate in
+`EPISTEMIC_STANCE.md`, so the classification rules there are its input, not
+background reading. Full procedure: [epistemic-standard.md](epistemic-standard.md).
+
+- `status: stable` and `status: audited` mean **operator-verified or sweep-cleared**,
+  never LLM output alone. `bin/capture-validate` R6 enforces this and additionally
+  rejects any file that claims a verified status while still carrying `needs-audit`.
+- The sweep clears `needs-audit`. It does not confer `stable` by itself.
+- **Escape:** if a claim cannot be verified, leave it `synthesized` and record why.
+  An unresolved item with a stated reason is a complete sweep result.
+
+**Stop state.** A sweep that cannot reach its sources stops and reports the gap.
+It does not clear `needs-audit` on unreachable material.
+
+Measured 2026-08-10, before R6: 29 files claimed `stable`, none carried
+verification evidence, and 14 also carried `needs-audit`.

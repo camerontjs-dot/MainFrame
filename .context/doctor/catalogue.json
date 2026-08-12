@@ -60,7 +60,7 @@
       "owner": "mainframe-process-eval",
       "subsystem": "session",
       "layer": "contract/temporal",
-      "provider": "unimplemented",
+      "provider": "session_phase_alignment",
       "required": true,
       "mutates": false,
       "isolation": "live-read-only",
@@ -68,8 +68,8 @@
       "skip_policy": "fail",
       "freshness_seconds": 0,
       "pass_condition": "active phase/re-entry agrees with project state",
-      "remediation": "align plans status with README project_state",
-      "safe_fix_available": false,
+      "remediation": "align README project_state and next_action with focus/STATE selection",
+      "safe_fix_available": true,
       "contract_version": 1
     },
     {
@@ -272,7 +272,7 @@
       "skip_policy": "fail",
       "freshness_seconds": 86400,
       "pass_condition": "project namespaces match intended manifest and coverage policy",
-      "remediation": "update mindgraph-projects.json coverage policy",
+      "remediation": "update mindgraph-projects.json, then run the ADR-045 plan -> stage -> promote workflow",
       "safe_fix_available": true,
       "contract_version": 1
     },
@@ -383,7 +383,7 @@
       "owner": "mainframe-process-eval",
       "subsystem": "telemetry",
       "layer": "operational-health",
-      "provider": "unimplemented",
+      "provider": "tel_hash_integrity",
       "required": true,
       "mutates": false,
       "isolation": "live-read-only",
@@ -391,7 +391,7 @@
       "skip_policy": "fail",
       "freshness_seconds": 86400,
       "pass_condition": "event store parses and hash integrity holds",
-      "remediation": "workflow-event hash-chain repair",
+      "remediation": "workflow-event hash-chain repair on newest day file",
       "safe_fix_available": true,
       "contract_version": 1
     },
@@ -485,7 +485,7 @@
       "owner": "mainframe-process-eval",
       "subsystem": "structure",
       "layer": "static",
-      "provider": "unimplemented",
+      "provider": "structure_bounds",
       "required": true,
       "mutates": false,
       "isolation": "live-read-only",
@@ -493,8 +493,8 @@
       "skip_policy": "fail",
       "freshness_seconds": 0,
       "pass_condition": "structural links and private/public boundaries valid",
-      "remediation": "wikilink/structure checks",
-      "safe_fix_available": false,
+      "remediation": "restore root/lifecycle contracts and private boundary docs",
+      "safe_fix_available": true,
       "contract_version": 1
     },
     {

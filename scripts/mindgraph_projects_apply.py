@@ -22,6 +22,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,8 +79,11 @@ def coverage_report(manifest_projects: list[str], real_dirs: list[str]) -> dict[
 def namespaces_from_db(db_path: Path) -> dict[str, int]:
     if not db_path.exists():
         return {}
-    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    resolved = db_path.expanduser().resolve()
+    uri = f"file:{quote(str(resolved), safe='/')}?mode=ro&immutable=1"
+    con = sqlite3.connect(uri, uri=True)
     try:
+        con.execute("PRAGMA query_only = ON")
         rows = con.execute(
             "SELECT namespace, COUNT(*) FROM documents GROUP BY namespace ORDER BY 1"
         ).fetchall()

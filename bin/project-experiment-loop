@@ -1,0 +1,1139 @@
+#!/usr/bin/env python3
+"""Project experiment loop — measured runs with registry harvest + triage.
+
+Complements research-lane-loop (literature). This tool forces:
+  design identity (eval_run_id) → execute → harvest → action card
+
+Commands:
+  preflight --project <slug>
+  scaffold  --project <slug> --study-type ... --title ... --decision ...
+  canary    --fresh [--full-probe]   # MindGraph regression package
+  close     --project <slug>         # harvest + check
+  triage    [--scope canary|portfolio]  # action card (default: portfolio)
+  portfolio                          # alias for triage --scope portfolio
+
+See .context/workflows/project-experiment-loop.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS = ROOT / "30_projects"
+REGISTRY = ROOT / "20_live" / "eval-registry"
+ACTION_CARD = REGISTRY / "last-canary-action.md"  # MindGraph section (compat)
+EVAL_ACTION_CARD = REGISTRY / "last-eval-action.md"  # all MainFrame evals
+TEMPLATE = ROOT / ".context" / "templates" / "eval-output.md"
+WORKFLOW = ROOT / ".context" / "workflows" / "project-experiment-loop.md"
+MG_EVAL = PROJECTS / "mindgraph-eval"
+PROCESS_EVAL = PROJECTS / "mainframe-process-eval"
+EVAL_PROFILE_EXTRA = {"scaffold-claims-study", "skill-eval-workshop"}
+PROBE = MG_EVAL / "scripts" / "retrieval_quality_probe.py"
+LIVE_ENV = MG_EVAL / "scripts" / "live_envelope_probe.py"
+GRAPH_HEALTH = MG_EVAL / "scripts" / "graph_health_trend.py"
+MINDGRAPH_PROJECT = ROOT / "mindgraph"
+
+
+def run_cmd(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: int | None = 1200,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd or ROOT),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def mindgraph_uv_python(script: Path, *args: str) -> list[str] | None:
+    if not MINDGRAPH_PROJECT.is_dir():
+        return None
+    uv = subprocess.run(["which", "uv"], capture_output=True, text=True)
+    if uv.returncode != 0:
+        return None
+    return [
+        "uv",
+        "run",
+        "--project",
+        str(MINDGRAPH_PROJECT),
+        "python",
+        str(script),
+        *args,
+    ]
+
+
+def parse_frontmatter(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    block = text[3:end]
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def cmd_preflight(project: str) -> int:
+    proj = PROJECTS / project
+    if not proj.is_dir():
+        print(f"Project not found: {proj}", file=sys.stderr)
+        return 1
+    meth = proj / "methodology-approach.md"
+    readme = proj / "README.md"
+    outputs = proj / "outputs"
+    fm = parse_frontmatter(readme) if readme.exists() else {}
+
+    print(f"# Experiment preflight — {project}")
+    print()
+    print(f"- **path:** `{proj.relative_to(ROOT)}`")
+    print(f"- **project_state:** {fm.get('project_state') or fm.get('status') or '?'}")
+    print(f"- **next_action:** {fm.get('next_action', '(none)')[:160]}")
+    print(f"- **methodology-approach.md:** {'yes' if meth.exists() else 'MISSING'}")
+    print(f"- **outputs/:** {len(list(outputs.glob('*.md'))) if outputs.is_dir() else 0} md files")
+
+    # recent registry rows for project
+    runs_file = REGISTRY / "runs.jsonl"
+    recent = []
+    if runs_file.exists():
+        for line in runs_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("project") == project or row.get("registry", {}).get("project") == project:
+                recent.append(row)
+            # harvest may flatten keys
+            if isinstance(row, dict) and project in json.dumps(row):
+                if row not in recent:
+                    recent.append(row)
+    print(f"- **registry lines mentioning project:** ~{len(recent)} (approx scan)")
+
+    print()
+    print("## Required next (experiment loop)")
+    print("1. Design: decision_sentence, study_type, eval_run_id, protocol_ref")
+    print("2. Execute + write outputs/ with metric extract")
+    print("3. `bin/project-experiment-loop close --project", project + "`")
+    print("4. `bin/project-experiment-loop triage`  # action card")
+    print()
+    print(f"Workflow: `{WORKFLOW.relative_to(ROOT)}`")
+
+    # doctor if mindgraph-eval
+    if project == "mindgraph-eval":
+        print()
+        print("## MindGraph doctor (retrieval experiments)")
+        doc = run_cmd([str(ROOT / "bin" / "mindgraph"), "doctor"], timeout=60)
+        print(doc.stdout[-800:] if doc.stdout else doc.stderr[-400:])
+        if doc.returncode != 0:
+            print("(doctor non-zero — fix indexes before canary)", file=sys.stderr)
+            return doc.returncode
+    return 0
+
+
+def cmd_scaffold(
+    project: str,
+    study_type: str,
+    title: str,
+    decision: str,
+    protocol_ref: str | None,
+) -> int:
+    proj = PROJECTS / project
+    if not proj.is_dir():
+        print(f"Project not found: {proj}", file=sys.stderr)
+        return 1
+    today = date.today().isoformat()
+    slug = re.sub(r"[^a-z0-9-]+", "-", title.lower()).strip("-")[:48]
+    run_id = f"{today}-{slug}"
+    out_dir = proj / "outputs"
+    raw_dir = proj / "raw-materials" / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    protocol = protocol_ref or f"30_projects/{project}/methodology-approach.md"
+    body = f"""---
+title: "{title}"
+domain: "knowledge-systems"
+type: "lab-report"
+status: "running"
+study_type: "{study_type}"
+lab_report_id: "{run_id}"
+eval_run_id: "{run_id}"
+protocol_ref: "{protocol}"
+decision_sentence: "{decision.replace('"', "'")}"
+hypothesis: "Descriptive measurement — replace with directional hypothesis before run when applicable"
+disposition: "open"
+project: "{project}"
+tags: ["evaluation", "eval-registry", "project-experiment-loop", "lab-report"]
+updated: "{today}"
+source: "bin/project-experiment-loop scaffold"
+---
+
+<!-- Universal notebook form: .context/templates/lab-report.md · bin/lab-report -->
+
+# {title} — {today}
+
+## Boundary
+
+- Scope and non-claims go here.
+- MindGraph / harness results are nominations or measurements — not automatic truth.
+
+## Decision sentence
+
+{decision}
+
+## Hypothesis
+
+<!-- Expected result before outcomes -->
+
+## Inputs
+
+| Field | Value |
+|-------|-------|
+| study_type | {study_type} |
+| eval_run_id | {run_id} |
+| protocol_ref | {protocol} |
+| unit_of_analysis | |
+| primary metric | |
+| raw artifacts | `raw-materials/{run_id}/` |
+
+## Results
+
+<!-- Fill after execution -->
+
+## Irregularities
+
+<!-- Table or "None observed." -->
+
+## Counterevidence and limits
+
+<!-- Fill after execution -->
+
+## Disposition
+
+`open` — set accept | reject | hold | iterate when closing.
+
+## Metric extract (eval-registry)
+
+```yaml
+registry:
+  project: {project}
+  run_id: {run_id}
+  study_type: {study_type}
+  protocol_ref: {protocol}
+  date: {today}
+  decision_sentence: "{decision.replace('"', "'")}"
+  artifact_path: outputs/{run_id}.md
+  raw_path: raw-materials/{run_id}/
+  decision_use: {"regression_only" if study_type in {"regression", "observational"} else "exploratory_only"}
+metrics:
+  - name: placeholder_metric
+    slice: all
+    value: 0
+    n: 0
+    unit: count
+irregularities:
+  - id: scaffold-placeholder
+    severity: info
+    category: protocol
+    observation: "Scaffold only — replace metrics after real run"
+    context: "{run_id}"
+    resolved: false
+```
+
+## Claims (epistemic pass)
+
+| Statement | Type | Confidence |
+|-----------|------|------------|
+| | | |
+"""
+    out_path = out_dir / f"{run_id}.md"
+    if out_path.exists():
+        print(f"Refusing overwrite: {out_path}", file=sys.stderr)
+        return 1
+    out_path.write_text(body, encoding="utf-8")
+    print(f"Wrote {out_path.relative_to(ROOT)}")
+    print(f"Raw dir {raw_dir.relative_to(ROOT)}")
+    print(f"eval_run_id={run_id}")
+    print("Next: execute experiment, edit metrics, then:")
+    print(f"  bin/lab-report check --project {project} --id {run_id}")
+    print(f"  bin/project-experiment-loop close --project {project}")
+    return 0
+
+
+def cmd_close(project: str) -> int:
+    # Project-scoped harvest upgrades placeholder scaffolds (G3) without
+    # force-reharvesting the entire portfolio.
+    harvest = run_cmd(
+        [
+            str(ROOT / "bin" / "eval-registry"),
+            "harvest",
+            "--project",
+            project,
+        ],
+        timeout=300,
+    )
+    print(harvest.stdout or harvest.stderr)
+    if harvest.returncode != 0:
+        return harvest.returncode
+    check = run_cmd(
+        [str(ROOT / "bin" / "eval-registry"), "check", "--strict"],
+        timeout=120,
+    )
+    print(check.stdout or check.stderr)
+    # strict may fail other projects; still run triage
+    triage_code = cmd_triage(write=True)
+    if check.returncode != 0:
+        print(
+            "Note: eval-registry check --strict reported issues "
+            "(may be other projects).",
+            file=sys.stderr,
+        )
+    return triage_code if harvest.returncode == 0 else harvest.returncode
+
+
+def _latest_output(glob_pat: str) -> Path | None:
+    paths = sorted(MG_EVAL.glob(glob_pat), key=lambda p: p.stat().st_mtime, reverse=True)
+    return paths[0] if paths else None
+
+
+def _extract_metric_block(path: Path) -> dict[str, Any] | None:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    m = re.search(
+        r"## Metric extract \(eval-registry\)\s*```yaml\s*(.*?)```",
+        text,
+        re.S,
+    )
+    if not m:
+        return None
+    # light parse for key metrics
+    block = m.group(1)
+    metrics: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in block.splitlines():
+        if line.strip().startswith("- name:"):
+            if current:
+                metrics.append(current)
+            current = {"name": line.split(":", 1)[1].strip()}
+        elif current and line.strip().startswith("value:"):
+            val = line.split(":", 1)[1].strip()
+            try:
+                current["value"] = float(val) if "." in val else int(val)
+            except ValueError:
+                current["value"] = val
+        elif current and line.strip().startswith("slice:"):
+            current["slice"] = line.split(":", 1)[1].strip()
+    if current:
+        metrics.append(current)
+    fm = parse_frontmatter(path)
+    return {
+        "path": str(path.relative_to(ROOT)),
+        "eval_run_id": fm.get("eval_run_id", path.stem),
+        "study_type": fm.get("study_type", ""),
+        "decision_sentence": fm.get("decision_sentence", ""),
+        "metrics": metrics,
+        "updated": fm.get("updated", ""),
+    }
+
+
+
+def _sev_rank(s: str) -> int:
+    return {"info": 0, "low": 1, "medium": 2, "high": 3}.get(s, 0)
+
+
+def _bump(sev: str, new: str) -> str:
+    return new if _sev_rank(new) > _sev_rank(sev) else sev
+
+
+def discover_eval_projects() -> list[Path]:
+    out: list[Path] = []
+    if not PROJECTS.is_dir():
+        return out
+    for child in sorted(PROJECTS.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.name.endswith("-eval") or child.name in EVAL_PROFILE_EXTRA:
+            out.append(child)
+            continue
+        readme = child / "README.md"
+        if readme.exists() and "eval-profile" in readme.read_text(encoding="utf-8", errors="replace")[:2500]:
+            out.append(child)
+    return out
+
+
+def _latest_evalish_output(project: Path) -> Path | None:
+    """Prefer harvestable metric extracts over newer bare handoff notes."""
+    outputs = project / "outputs"
+    if not outputs.is_dir():
+        return None
+    scored: list[tuple[int, float, Path]] = []
+    for p in outputs.glob("*.md"):
+        name = p.name.lower()
+        if any(
+            x in name
+            for x in (
+                "walkthrough",
+                "blueprint",
+                "architecture-plan",
+                "start_here",
+                "__note__",
+            )
+        ):
+            continue
+        try:
+            head = p.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            continue
+        has_extract = "Metric extract (eval-registry)" in head
+        has_run_id = bool(re.search(r"(?m)^eval_run_id:\s*\S", head))
+        name_hit = any(
+            x in name for x in ("scheduled", "probe", "compare-", "core-h", "scorecard", "route")
+        )
+        if not (has_extract or has_run_id or name_hit or "handoff" in name):
+            continue
+        # Rank: suite/scorecard extracts first; handoffs with extracts still
+        # lose to non-handoff extracts so triage does not latch on lane notes.
+        if has_extract and "handoff" not in name:
+            rank = 0
+        elif has_extract and "handoff" in name:
+            rank = 2
+        elif has_run_id and "handoff" not in name:
+            rank = 1
+        elif "handoff" in name:
+            rank = 4
+        else:
+            rank = 3
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        scored.append((rank, -mtime, p))
+    if not scored:
+        return None
+    scored.sort()
+    return scored[0][2]
+
+
+def _load_dispositions() -> dict[str, dict[str, Any]]:
+    path = REGISTRY / "irregularity-dispositions.jsonl"
+    out: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        key = row.get("key") or "|".join(
+            [
+                str(row.get("project", "")),
+                str(row.get("run_id", "")),
+                str(row.get("irregularity_id", "")),
+            ]
+        )
+        out[str(key)] = row
+    return out
+
+
+_CLOSED_LIFECYCLE = frozenset({"accepted_risk", "waived", "superseded", "resolved"})
+
+
+def _irregularity_actionable(row: dict[str, Any], dispositions: dict[str, dict[str, Any]]) -> bool:
+    if row.get("resolved") is True:
+        return False
+    status = str(row.get("lifecycle_status") or "").lower()
+    if status in _CLOSED_LIFECYCLE:
+        return False
+    key = "|".join(
+        [
+            str(row.get("project", "")),
+            str(row.get("run_id", "")),
+            str(row.get("irregularity_id") or row.get("id") or ""),
+        ]
+    )
+    d = dispositions.get(key)
+    if d and str(d.get("status", "")).lower() in _CLOSED_LIFECYCLE:
+        return False
+    return True
+
+
+def _open_high_irregs_from_registry(project: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Latest high irregularities still actionable (G1 lifecycle-aware)."""
+    path = REGISTRY / "irregularities.jsonl"
+    if not path.exists():
+        return []
+    dispositions = _load_dispositions()
+    latest: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("project") != project:
+            continue
+        if str(row.get("severity", "")).lower() != "high":
+            continue
+        key = "|".join(
+            [
+                str(row.get("project", "")),
+                str(row.get("run_id", "")),
+                str(row.get("irregularity_id") or ""),
+            ]
+        )
+        latest[key] = row
+    rows = [r for r in latest.values() if _irregularity_actionable(r, dispositions)]
+    return rows[-limit:]
+
+
+def _is_operator_gated_context(next_action: str, row: dict[str, Any] | None = None) -> bool:
+    """G6: operator-gated work should not drive portfolio severity alone."""
+    if row and (
+        row.get("operator_gated") is True
+        or str(row.get("category", "")).lower() in {"operator", "calibration", "human_gold"}
+    ):
+        return True
+    na = (next_action or "").lower()
+    needles = (
+        "operator",
+        "calibration",
+        "human-gold",
+        "human gold",
+        "blind",
+        "cameron",
+        "iphone",
+        "tailscale",
+        "login",
+    )
+    return any(n in na for n in needles)
+
+
+def _schedule_health() -> dict[str, Any]:
+    proc = run_cmd([str(ROOT / "bin" / "eval-schedule"), "check"], timeout=60)
+    summary = (proc.stdout or "").strip().splitlines()
+    return {
+        "ok": proc.returncode == 0,
+        "summary": summary[0] if summary else "unknown",
+        "detail": "\n".join(summary[:8]),
+    }
+
+
+def _mindgraph_canary_section() -> tuple[list[str], list[str], str]:
+    """Returns (lines, actions, severity)."""
+    probe = _latest_output("outputs/*probe*.md")
+    envelope = _latest_output("outputs/*live-envelope*.md")
+    health = _latest_output("outputs/*graph-health*.md")
+    lines: list[str] = ["### MindGraph canaries (`mindgraph-eval`)", ""]
+    actions: list[str] = []
+    severity = "info"
+    for label, p in (
+        ("retrieval probe", probe),
+        ("live envelope", envelope),
+        ("graph health", health),
+    ):
+        lines.append(f"- **{label}:** `{p.relative_to(ROOT) if p else '(none)'}`")
+
+    probe_data = _extract_metric_block(probe) if probe else None
+    env_data = _extract_metric_block(envelope) if envelope else None
+    if probe_data:
+        lines.append(f"- probe run_id: `{probe_data['eval_run_id']}`")
+        failures = 0
+        for m in probe_data.get("metrics") or []:
+            name = m.get("name", "")
+            val = m.get("value")
+            lines.append(f"  - {name}: {val}")
+            if name == "probe_query_failures" and isinstance(val, (int, float)):
+                failures = val
+                if val > 0:
+                    severity = "high"
+                    actions.append(
+                        "[mindgraph-eval] Investigate probe_query_failures before changing ingest/embedder."
+                    )
+            if name in {
+                "probe_unprotected_scope_candidates",
+                "unprotected_scope_candidates",
+            } and isinstance(val, (int, float)) and val > 0:
+                severity = _bump(severity, "medium")
+                actions.append(
+                    "[mindgraph-eval] Review unprotected scope candidates on negative live/inbox queries."
+                )
+            # G13: freshness noise alone is not a red canary — low watch only.
+            # Split snapshot lag (frozen eval DB behind live tree) vs live-index lag
+            # (installed/frozen corpus missing recent hash matches) so triage does not
+            # read like a ranking failure.
+            if name == "probe_freshness_changed_or_missing" and isinstance(val, (int, float)):
+                if val > 0 and failures == 0:
+                    severity = _bump(severity, "low")
+                    kind = "index lag"
+                    # Prefer explicit submetrics when present in the same extract.
+                    missing = None
+                    hash_mm = None
+                    docs = None
+                    for m2 in probe_data.get("metrics") or []:
+                        n2 = m2.get("name", "")
+                        if n2 == "probe_freshness_missing_from_db":
+                            missing = m2.get("value")
+                        elif n2 == "probe_freshness_hash_mismatches":
+                            hash_mm = m2.get("value")
+                        elif n2 == "probe_db_documents":
+                            docs = m2.get("value")
+                    if isinstance(missing, (int, float)) and missing >= 100:
+                        kind = "snapshot lag (frozen eval DB behind live 10_knowledge/)"
+                    elif isinstance(hash_mm, (int, float)) and hash_mm > 0 and (
+                        not isinstance(missing, (int, float)) or missing < 50
+                    ):
+                        kind = "live/frozen hash drift (re-ingest or re-snapshot)"
+                    detail = f"n={int(val)}"
+                    if missing is not None or hash_mm is not None:
+                        detail += (
+                            f" missing={missing if missing is not None else '?'} "
+                            f"hash_mm={hash_mm if hash_mm is not None else '?'}"
+                        )
+                    if docs is not None:
+                        detail += f" db_docs={docs}"
+                    actions.append(
+                        f"[mindgraph-eval] Freshness {kind}: {detail} "
+                        "(watch only while query/rank stay green; "
+                        "refresh snapshots or `bin/mindgraph-refresh` — not a ranking defect)."
+                    )
+        if failures == 0:
+            actions.append(
+                "[mindgraph-eval] Probe green — keep weekly canary cadence."
+            )
+    else:
+        severity = "medium"
+        actions.append(
+            "[mindgraph-eval] No probe output — run `bin/project-experiment-loop canary --fresh`."
+        )
+
+    if env_data:
+        lines.append(f"- live envelope run_id: `{env_data['eval_run_id']}`")
+        for m in env_data.get("metrics") or []:
+            lines.append(f"  - {m.get('name')}: {m.get('value')}")
+            if m.get("name") in {"envelope_failures", "intent_failures"} and m.get("value", 0):
+                severity = "high"
+                actions.insert(
+                    0,
+                    "[mindgraph-eval] Live envelope/intent failed — re-check intent install.",
+                )
+    elif envelope:
+        # many envelope reports lack metric extract; use body pass line
+        body = envelope.read_text(encoding="utf-8", errors="replace")
+        if "failed=0" in body or "passed=" in body:
+            lines.append("- live envelope: report present (metric extract may be thin)")
+        if "failed=" in body and "failed=0" not in body:
+            # try parse failed=N
+            m = re.search(r"failed=(\d+)", body)
+            if m and int(m.group(1)) > 0:
+                severity = "high"
+                actions.insert(0, "[mindgraph-eval] Live envelope reported failures.")
+
+    doc = run_cmd([str(ROOT / "bin" / "mindgraph"), "doctor", "--json"], timeout=60)
+    doctor_ok = doc.returncode == 0
+    lines.append(f"- mindgraph doctor: {'OK' if doctor_ok else 'FAIL'}")
+    if not doctor_ok:
+        severity = "high"
+        actions.insert(
+            0,
+            "[mindgraph-eval] Fix `bin/mindgraph doctor` failures before retrieval work.",
+        )
+    lines.append("")
+    return lines, actions, severity
+
+
+def _process_eval_section() -> tuple[list[str], list[str], str]:
+    lines = ["### Scheduled process suite (`mainframe-process-eval`)", ""]
+    actions: list[str] = []
+    severity = "info"
+    sched = REGISTRY / "schedule-runs.jsonl"
+    last = None
+    if sched.exists():
+        for line in sched.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                last = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    health = _schedule_health()
+    lines.append(f"- eval-schedule check: {'OK' if health['ok'] else 'FAIL'} — {health['summary']}")
+    if not health["ok"]:
+        severity = "high"
+        actions.append(
+            "[mainframe-process-eval] `bin/eval-schedule check` failed — read OPERATOR.md and fix launchd/stale weekly."
+        )
+    if last:
+        lines.append(
+            f"- last schedule run: `{last.get('run_id')}` cadence={last.get('cadence')} "
+            f"all_passed={last.get('all_passed')}"
+        )
+        if last.get("all_passed") is False:
+            severity = _bump(severity, "high")
+            failed = [
+                s.get("name")
+                for s in last.get("steps") or []
+                if not s.get("skipped") and s.get("exit_code", 0) != 0
+            ]
+            actions.append(
+                f"[mainframe-process-eval] Last suite failed steps: {', '.join(failed) or 'unknown'} — fix before process changes."
+            )
+        else:
+            actions.append(
+                "[mainframe-process-eval] Last scheduled suite green — keep cadence."
+            )
+    else:
+        severity = _bump(severity, "medium")
+        actions.append("[mainframe-process-eval] No schedule-runs.jsonl rows — install/run eval-schedule.")
+
+    latest = _latest_evalish_output(PROCESS_EVAL)
+    if latest:
+        lines.append(f"- latest process output: `{latest.relative_to(ROOT)}`")
+    lines.append("")
+    return lines, actions, severity
+
+
+def _per_project_section(project: Path) -> tuple[list[str], list[str], str]:
+    slug = project.name
+    if slug in {"mindgraph-eval", "mainframe-process-eval"}:
+        return [], [], "info"
+    lines = [f"### `{slug}`", ""]
+    actions: list[str] = []
+    severity = "info"
+    fm = parse_frontmatter(project / "README.md")
+    state = fm.get("project_state") or fm.get("status") or "?"
+    next_action = fm.get("next_action", "")
+    lines.append(f"- state: **{state}**")
+    if next_action:
+        lines.append(f"- readme next_action: {next_action[:140]}")
+    meth = (project / "methodology-approach.md").exists()
+    lines.append(f"- methodology-approach.md: {'yes' if meth else 'MISSING'}")
+    if not meth and state == "active":
+        severity = "medium"
+        actions.append(f"[{slug}] Add methodology-approach.md (eval-profile requirement).")
+
+    latest = _latest_evalish_output(project)
+    if latest:
+        data = _extract_metric_block(latest)
+        lines.append(f"- latest evalish output: `{latest.relative_to(ROOT)}`")
+        if data:
+            lines.append(
+                f"  - run_id=`{data.get('eval_run_id')}` study_type=`{data.get('study_type')}`"
+            )
+            if data.get("decision_sentence"):
+                lines.append(f"  - decision: {data['decision_sentence'][:120]}")
+        else:
+            severity = _bump(severity, "medium")
+            actions.append(
+                f"[{slug}] Latest output lacks metric extract — retrofit or re-run via experiment loop scaffold."
+            )
+    else:
+        outs = list((project / "outputs").glob("*.md")) if (project / "outputs").is_dir() else []
+        if state == "active" and not outs:
+            severity = _bump(severity, "medium")
+            actions.append(
+                f"[{slug}] Active eval project with no outputs — plan first experiment or pause project."
+            )
+        elif state == "paused" and not outs:
+            lines.append("- no eval outputs yet (paused — OK)")
+        elif not latest and outs:
+            lines.append(f"- outputs present ({len(outs)}) but none look registry-shaped")
+            severity = _bump(severity, "low")
+            actions.append(
+                f"[{slug}] Convert decision-bearing outputs to eval-output template + harvest."
+            )
+
+    high = _open_high_irregs_from_registry(slug)
+    operator_high = [h for h in high if _is_operator_gated_context(next_action, h)]
+    agent_high = [h for h in high if h not in operator_high]
+    if agent_high:
+        severity = "high"
+        lines.append(f"- open high irregularities (actionable): {len(agent_high)}")
+        actions.insert(
+            0,
+            f"[{slug}] Resolve open high irregularity: "
+            f"{agent_high[-1].get('observation') or agent_high[-1].get('irregularity_id')}",
+        )
+    elif operator_high:
+        # G6: operator-gated highs inform but do not max severity alone
+        severity = _bump(severity, "medium")
+        lines.append(
+            f"- open high irregularities (operator-gated, not agent-runnable): {len(operator_high)}"
+        )
+        actions.append(
+            f"[{slug}] Operator-gated high irregularity remains "
+            f"({operator_high[-1].get('observation') or operator_high[-1].get('irregularity_id')}) "
+            "— schedule human step; do not block automated loops."
+        )
+    elif high:
+        lines.append(f"- open high irregularities (registry, filtered): 0 actionable of {len(high)}")
+
+    # project-specific nudges
+    if slug == "claim-audit-lab" or slug == "scaffold-claims-study":
+        if "calibration" in next_action.lower() or "gold" in next_action.lower() or "blind" in next_action.lower():
+            severity = _bump(severity, "medium")
+            actions.append(
+                f"[{slug}] Operator-blocked calibration/gold step is the experiment — track completion as calibration study_type."
+            )
+    if slug == "agent-harness-eval" and state == "paused":
+        actions.append(
+            "[agent-harness-eval] Paused with prior H1 rejection — next experiment is H4-asymmetric when reactivated."
+        )
+    if slug == "skill-eval-workshop" and state == "paused":
+        if latest and _extract_metric_block(latest):
+            # Observational status present — only remind reentry, not missing outputs.
+            actions.append(
+                "[skill-eval-workshop] Paused with registry status only — reentry is master-plan "
+                "workbench modules/cases/githooks before any skill graduation claim."
+            )
+        else:
+            actions.append(
+                "[skill-eval-workshop] Paused with 0 registry-shaped outputs — resume workbench "
+                "before claiming skill graduation."
+            )
+
+    lines.append("")
+    return lines, actions, severity
+
+
+def cmd_triage(*, write: bool = True, scope: str = "portfolio") -> int:
+    """Build action card for MindGraph canaries and/or all MainFrame evals."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    all_actions: list[str] = []
+    severity = "info"
+    sections: list[str] = []
+
+    if scope in {"canary", "portfolio"}:
+        lines, actions, sev = _mindgraph_canary_section()
+        sections.extend(lines)
+        all_actions.extend(actions)
+        severity = _bump(severity, sev)
+
+    if scope == "portfolio":
+        lines, actions, sev = _process_eval_section()
+        sections.extend(lines)
+        all_actions.extend(actions)
+        severity = _bump(severity, sev)
+
+        sections.append("### Other eval-profile projects")
+        sections.append("")
+        for proj in discover_eval_projects():
+            lines, actions, sev = _per_project_section(proj)
+            if not lines:
+                continue
+            sections.extend(lines)
+            all_actions.extend(actions)
+            severity = _bump(severity, sev)
+
+        # registry check summary (non-strict noise reduced by harvest skip)
+        check = run_cmd(
+            [str(ROOT / "bin" / "eval-registry"), "check", "--strict"],
+            timeout=120,
+        )
+        check_out = (check.stdout or "").strip()
+        sections.append("### Registry hygiene")
+        sections.append("")
+        if check.returncode == 0:
+            sections.append("- eval-registry check --strict: **OK**")
+            all_actions.append("[registry] Hygiene OK — keep writing registry-shaped outputs only.")
+        else:
+            # count problems
+            probs = [ln for ln in check_out.splitlines() if ln.strip().startswith("- ")]
+            n = len(probs)
+            sections.append(f"- eval-registry check --strict: **{n} problem(s)** (legacy/non-eval outputs or missing fields)")
+            severity = _bump(severity, "low" if n < 10 else "medium")
+            # show top 5
+            for ln in probs[:5]:
+                sections.append(f"  {ln}")
+            if n > 5:
+                sections.append(f"  - … +{n - 5} more")
+            all_actions.append(
+                f"[registry] Clean or retrofit {n} non-conforming outputs "
+                "(or keep them skipped via harvest filters)."
+            )
+        sections.append("")
+
+    # de-dupe actions
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for a in all_actions:
+        if a not in seen:
+            seen.add(a)
+            uniq.append(a)
+
+    # Prefer actionable failures as primary; demote pure watch / keep-cadence lines.
+    def _action_rank(a: str) -> int:
+        al = a.lower()
+        if any(k in al for k in ("investigate", "failed", "fix `", "fix ", "resolve")):
+            return 0
+        if "watch only" in al or "keep weekly" in al or "keep cadence" in al:
+            return 3
+        if "lacks metric extract" in al or "convert decision" in al or "paused with 0" in al:
+            return 1
+        return 2
+
+    primary = min(uniq, key=_action_rank) if uniq else "No action extracted."
+
+    title = (
+        "Last canary action"
+        if scope == "canary"
+        else "Last eval action (MainFrame portfolio)"
+    )
+    header = [
+        f"# {title} — {now}",
+        "",
+        f"Generated by `bin/project-experiment-loop triage --scope {scope}`.",
+        "Runs may be automated; **this card is the action layer** so results are useful.",
+        "",
+        f"## Severity: **{severity}**",
+        "",
+        "## Primary next action",
+        "",
+        primary,
+        "",
+        "## Sections",
+        "",
+    ]
+    footer = [
+        "## Full action list",
+        "",
+    ]
+    for a in uniq:
+        footer.append(f"- {a}")
+    footer.extend(
+        [
+            "",
+            "## Operator ritual",
+            "",
+            "1. Read this card on session-open or after weekly / `canary --fresh`.",
+            "2. If severity ≥ medium, put the primary action on the named project's `next_action`.",
+            "3. Literature gaps → research-lane-loop; measurements → this experiment loop.",
+            "4. Do not open new retrieval features while MindGraph probe_query_failures > 0.",
+            "",
+            f"Workflow: `{WORKFLOW.relative_to(ROOT)}`",
+            "",
+        ]
+    )
+    text = "\n".join(header + sections + footer)
+    print(text)
+    if write:
+        REGISTRY.mkdir(parents=True, exist_ok=True)
+        if scope == "canary":
+            ACTION_CARD.write_text(text, encoding="utf-8")
+            print(f"Wrote {ACTION_CARD.relative_to(ROOT)}", file=sys.stderr)
+        else:
+            EVAL_ACTION_CARD.write_text(text, encoding="utf-8")
+            print(f"Wrote {EVAL_ACTION_CARD.relative_to(ROOT)}", file=sys.stderr)
+            # keep canary card in sync as MindGraph subsection snapshot for old links
+            # write thin pointer canary card for back-compat paths
+            ACTION_CARD.write_text(
+                f"# Last canary action — see portfolio card\n\n"
+                f"Superseded by portfolio triage. Read:\n\n"
+                f"`{EVAL_ACTION_CARD.relative_to(ROOT)}`\n\n"
+                f"Severity: **{severity}**\n\nPrimary: {primary}\n",
+                encoding="utf-8",
+            )
+            print(f"Updated {ACTION_CARD.relative_to(ROOT)} (pointer)", file=sys.stderr)
+    return 0 if severity != "high" else 2
+
+
+def cmd_canary(*, fresh: bool, full_probe: bool) -> int:
+    """Run MindGraph regression package: doctor + probe + envelope + harvest + triage."""
+    if not fresh:
+        print("Use --fresh to run a new eval_run_id package.", file=sys.stderr)
+        return 2
+
+    # G9: unbuffered progress for background monitors
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    base_id = f"{stamp}-experiment-loop-canary"
+    print(f"# Project experiment canary — {base_id}", flush=True)
+    print(flush=True)
+
+    # 0 doctor
+    print("## Step 0 — mindgraph doctor")
+    doc = run_cmd([str(ROOT / "bin" / "mindgraph"), "doctor"], timeout=60)
+    print(doc.stdout or doc.stderr)
+    if doc.returncode != 0:
+        print("Doctor failed — aborting canary.", file=sys.stderr)
+        return doc.returncode
+
+    # 1 retrieval probe (scheduled query set by default)
+    probe_id = f"{base_id}-probe"
+    print(f"## Step 1 — retrieval probe ({probe_id})")
+    probe_cmd = [
+        sys.executable,
+        str(PROBE),
+        "--run-id",
+        probe_id,
+        "--registry",
+        "--fused-only",
+        "--query-ids",
+        "q04_memory_cite_forget,q07_ai_detection,q11_negative_live_state,q12_negative_inbox",
+    ]
+    if full_probe:
+        probe_cmd = [
+            sys.executable,
+            str(PROBE),
+            "--run-id",
+            probe_id,
+            "--registry",
+        ]
+    pr = run_cmd(probe_cmd, timeout=1200)
+    print(pr.stdout[-2000:] if pr.stdout else "")
+    if pr.stderr:
+        print(pr.stderr[-800:], file=sys.stderr)
+    if pr.returncode != 0:
+        print(f"Probe exit {pr.returncode}", file=sys.stderr)
+        # continue to harvest whatever was written
+
+    # 2 live envelope
+    env_id = f"{base_id}-live-envelope"
+    print(f"## Step 2 — live envelope ({env_id})")
+    live_cmd = mindgraph_uv_python(LIVE_ENV, "--run-id", env_id)
+    if live_cmd:
+        lr = run_cmd(live_cmd, timeout=1200)
+        print(lr.stdout[-1500:] if lr.stdout else "")
+        if lr.returncode != 0:
+            print(f"Live envelope exit {lr.returncode}", file=sys.stderr)
+    else:
+        print("SKIP live envelope (uv/mindgraph project missing)", file=sys.stderr)
+
+    # 3 graph health (optional, fast)
+    if GRAPH_HEALTH.exists():
+        print("## Step 3 — graph health trend")
+        gh = run_cmd([sys.executable, str(GRAPH_HEALTH)], timeout=120)
+        print(gh.stdout[-1200:] if gh.stdout else "")
+
+    # 4 harvest + triage
+    print("## Step 4 — harvest + triage")
+    code = cmd_close("mindgraph-eval")
+
+    # record experiment loop receipt
+    receipt = REGISTRY / "experiment-loop-runs.jsonl"
+    REGISTRY.mkdir(parents=True, exist_ok=True)
+    with receipt.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "base_id": base_id,
+                    "probe_id": probe_id,
+                    "envelope_id": env_id,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                    "doctor_ok": doc.returncode == 0,
+                    "probe_exit": pr.returncode,
+                    "kind": "mindgraph-canary",
+                }
+            )
+            + "\n"
+        )
+    print(f"Appended {receipt.relative_to(ROOT)}")
+    return 0 if pr.returncode == 0 and code in (0, 2) else pr.returncode or code
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Project experiment loop CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pf = sub.add_parser("preflight", help="Project experiment readiness")
+    pf.add_argument("--project", required=True)
+
+    sc = sub.add_parser("scaffold", help="Scaffold outputs/<eval_run_id>.md")
+    sc.add_argument("--project", required=True)
+    sc.add_argument("--study-type", required=True)
+    sc.add_argument("--title", required=True)
+    sc.add_argument("--decision", required=True)
+    sc.add_argument("--protocol-ref", default=None)
+
+    cl = sub.add_parser("close", help="Harvest registry + triage")
+    cl.add_argument("--project", required=True)
+
+    tr = sub.add_parser(
+        "triage",
+        help="Write action card (default: all MainFrame evals)",
+    )
+    tr.add_argument("--no-write", action="store_true")
+    tr.add_argument(
+        "--scope",
+        choices=["portfolio", "canary"],
+        default="portfolio",
+        help="portfolio = all evals (default); canary = MindGraph only",
+    )
+
+    sub.add_parser(
+        "portfolio",
+        help="Alias for: triage --scope portfolio (all MainFrame evals)",
+    )
+
+    cy = sub.add_parser(
+        "canary",
+        help="Fresh MindGraph regression: doctor+probe+envelope+harvest+triage",
+    )
+    cy.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Required: allocate new eval_run_id package",
+    )
+    cy.add_argument(
+        "--full-probe",
+        action="store_true",
+        help="Full query set instead of weekly 4-query canary",
+    )
+
+    args = p.parse_args()
+    if args.cmd == "preflight":
+        raise SystemExit(cmd_preflight(args.project))
+    if args.cmd == "scaffold":
+        raise SystemExit(
+            cmd_scaffold(
+                args.project,
+                args.study_type,
+                args.title,
+                args.decision,
+                args.protocol_ref,
+            )
+        )
+    if args.cmd == "close":
+        raise SystemExit(cmd_close(args.project))
+    if args.cmd == "triage":
+        raise SystemExit(
+            cmd_triage(write=not args.no_write, scope=args.scope)
+        )
+    if args.cmd == "portfolio":
+        raise SystemExit(cmd_triage(write=True, scope="portfolio"))
+    if args.cmd == "canary":
+        raise SystemExit(cmd_canary(fresh=args.fresh, full_probe=args.full_probe))
+    p.error(f"unknown {args.cmd}")
+
+
+if __name__ == "__main__":
+    main()

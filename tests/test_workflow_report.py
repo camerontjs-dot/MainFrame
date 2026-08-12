@@ -142,12 +142,22 @@ class WorkflowReportTests(unittest.TestCase):
         ]
         self.assertEqual(names, ["codex", "claude"])
 
-    def test_load_events_skips_malformed_lines(self) -> None:
+    def test_load_events_skips_malformed_and_non_object_json_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log_dir = Path(tmp)
             path = log_dir / "2099-01-01.jsonl"
             path.write_text(
-                json.dumps({"event": "SessionStart"}) + "\nnot-json\n",
+                "\n".join(
+                    [
+                        json.dumps({"event": "SessionStart"}),
+                        "not-json",
+                        "[]",
+                        "null",
+                        '"string"',
+                        "42",
+                    ]
+                )
+                + "\n",
                 encoding="utf-8",
             )
             events = workflow_report.load_events(log_dir, days=30000)

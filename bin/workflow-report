@@ -31,9 +31,11 @@ def load_events(log_dir: Path, days: int) -> list[dict]:
             if not line.strip():
                 continue
             try:
-                events.append(json.loads(line))
+                event = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(event, dict):
+                events.append(event)
     return events
 
 

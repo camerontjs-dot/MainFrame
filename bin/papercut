@@ -1,0 +1,753 @@
+#!/usr/bin/env python3
+"""Record friction encountered during work, and harvest it into fixes.
+
+## The gap this fills
+
+MainFrame's convention audit (`bin/contract-audit`) reads the repo. Every one of
+its checks looks at the same files with the same assumptions, which is a single
+detector — and this investigation has now watched a single detector under-count
+four separate times. The audit's own write-up names the missing axis:
+
+    L6 - No independent second opinion. Cross-checking a contract against how
+    agents actually behaved would be the independent axis, and it does not
+    exist yet.
+
+This is that axis. Not another read of the contracts: a record of what actually
+happened while working under them.
+
+## Why agents do not report friction on their own
+
+They push through. A dead-end tool call, a flag that silently did the wrong
+thing, a documented path that does not exist — all of it gets worked around
+in-context and never surfaces, because the task still completed. The work looks
+clean from the outside and the friction is invisible to everyone who was not
+watching the reasoning.
+
+Physical evidence, found 2026-08-10: a 24 KB file named `--fail-on-overflow`
+sitting in the repo root since 2026-08-04. It is an HTML render of
+`cameron-originated-prospect-nominations-priority-a-2026-08-04.md`. Something
+passed `--fail-on-overflow` where an output path belonged, the renderer wrote
+its output to a file named after the flag, and whoever hit it re-ran with the
+right arguments and moved on. Six days and an unknown number of `git status`
+calls later, nobody had recorded it.
+
+That is not a rare event. That is the normal event, and it is invisible.
+
+## Capture is trivial. The harvest is the product.
+
+The failure mode this tool must avoid is the one MainFrame demonstrably has:
+records that are written and never read. The 2026-06-22 architecture checklist
+sat unrun for seven weeks and named the exact defect that then caused a
+107-capture fabrication incident. `needs-audit` tags were applied faithfully and
+were invisible at query time because MindGraph returns body chunks. A papercut
+log with no consumption path is that failure a third time.
+
+So `harvest` is the real command. It clusters repeats, because **one papercut is
+noise and the same papercut three times is a defect with an address** — which is
+precisely checklist item 10.1, "repeated agent mistake -> add or update closest
+AGENTS.md, workflow, skill, hook, or script". That item is unautomatable today
+only because nothing records agent mistakes.
+
+## Scope: what, who, when
+
+Three lanes. They differ in who writes them, when, and what the harvest is
+allowed to conclude from a repeat.
+
+    LANE       WHO          WHEN                  REPEAT MEANS
+    auto       the hook     at the failure        an address worth explaining
+    observed   any agent    when noticed, or      a defect with an address;
+                            prompted at close      graduates to a fix
+    suggestion anyone       any time              one opinion, held more
+                                                   than once. Never graduates.
+
+**auto** is the only lane that does not depend on anyone remembering anything.
+`PostToolUseFailure` fires, a stub is written, nobody is asked. It captures the
+address and cannot capture the reason.
+
+**observed** is the lane with the value in it, and the one that needs a
+judgement call:
+
+    RECORD  a tool that failed in a way the docs did not predict
+            a documented path, flag, or command that does not work as written
+            a contract rule that could not be followed as literally stated
+            a dead end that cost real time and would cost the next agent the same
+
+    DO NOT  your own mistakes that the system handled correctly
+            anything you can fix in under a minute. Fix it instead
+
+    The bar is: **would the next agent hit this too?** If not, it is not one.
+
+**suggestion** is deliberately unbounded. "There is a better way to do this" is
+welcome even with nothing broken behind it, because the alternative is that the
+observation nobody could quite justify gets written nowhere. It lives in the
+same store and behind the same command so there is one habit and one place to
+look, and it is quarantined from the graduation count so an opinion can never
+masquerade as evidence:
+
+    bin/papercut --kind suggestion "workflows should all open with a trigger"
+
+That split is MainFrame's own epistemic line. An observation is a thing that
+happened; a suggestion is a hypothesis about what would be better. Three
+recordings of the first are three findings. Three recordings of the second are
+still one opinion.
+
+## Honest limits
+
+Self-reported friction is unfalsifiable, the same way a self-asserted
+`retrieved_at` is. The difference is stakes: a `retrieved_at` becomes a citation
+that downstream work trusts, whereas a papercut is a triage signal that gets
+verified before anything is built on it. Low cost if wrong. It is evidence about
+where to look, never evidence that something is true.
+
+Records land in `20_live/papercuts/` — volatile, gitignored, append-only. This is
+telemetry, not knowledge. It must never be written into `10_knowledge/`.
+
+Usage:
+  bin/papercut "yarn web:test needs a workspace-relative path; root-relative finds no files"
+  bin/papercut --where bin/capture-validate --kind broken "crashes on paths outside the repo"
+  bin/papercut harvest                  # clusters, repeats, graduation candidates
+  bin/papercut harvest --since 2026-08
+  bin/papercut list --limit 20
+  bin/papercut harvest --json out.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+STORE = ROOT / "20_live" / "papercuts"
+
+# A cluster this size stops being noise and becomes a defect with an address.
+# Deliberately low: the cost of investigating a false repeat is minutes, and the
+# cost of a real one going unnoticed is however long it has already been going
+# unnoticed.
+GRADUATION_THRESHOLD = 2
+
+# Max auto-stubs per (tool, command-head) per day, so a flapping command cannot
+# bury the hand-written entries. Announced in the harvest, never applied silently.
+AUTO_CAP = 3
+
+# Two populations, split on MainFrame's own epistemic line.
+#
+# OBSERVATION kinds record that something happened. They are evidence, so a
+# repeat is a defect with an address and can graduate to a fix on its own.
+#
+# The SUGGESTION kind records that something could be better. That is a
+# hypothesis, and a hypothesis repeated three times is still one opinion, not
+# three findings. It never auto-graduates and never counts toward a graduation
+# threshold, because letting opinion into that count would destroy the only
+# signal the harvest has.
+#
+# Same store and same command on purpose: one habit, one place to look. If
+# suggestions lived somewhere else they would be written nowhere.
+OBSERVATION_KINDS = {
+    "friction": "worked, but cost more than it should have",
+    "dead-end": "a path the docs suggested that goes nowhere",
+    "broken": "a tool or command that failed outright",
+    "stale": "documentation or a contract that no longer matches reality",
+    "surprise": "behaved correctly but not as any document described",
+    "contract-gap": "a rule that could not be followed as literally written",
+    "auto": "recorded by the PostToolUseFailure hook, no agent involved",
+}
+
+JUDGEMENT_KINDS = {
+    "suggestion": "there is a better way to do this. An opinion, and welcome",
+}
+
+KINDS = {**OBSERVATION_KINDS, **JUDGEMENT_KINDS}
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "be",
+    "to", "of", "in", "on", "at", "for", "with", "it", "this", "that", "i",
+    "so", "not", "no", "if", "when", "then", "than", "as", "by", "from",
+    "would", "could", "should", "does", "did", "has", "have", "had", "its",
+}
+
+
+def store_path(when: datetime) -> Path:
+    return STORE / f"{when:%Y-%m}.jsonl"
+
+
+def record(args: argparse.Namespace) -> int:
+    # Local time with offset, matching `logged_at` in 20_live/workflow-metrics/.
+    #
+    # The first version stamped UTC. Correlating a papercut with the tool failure
+    # that caused it is the entire point of `papercut prompt`, and after 20:00
+    # Eastern the two systems disagree about what day it is — so ten papercuts
+    # written this evening sat in the same file as failures they were about and
+    # matched none of them. Two clocks in two formats is not a correlation key.
+    now = datetime.now().astimezone()
+    STORE.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": now.isoformat(timespec="seconds"),
+        "client": args.client or os.environ.get("MAINFRAME_CLIENT", "unknown"),
+        "session": os.environ.get("CLAUDE_SESSION_ID", "")[:8],
+        "kind": args.kind,
+        "where": args.where or "",
+        "message": args.message.strip(),
+    }
+    if not entry["message"]:
+        print("papercut: nothing to record", file=sys.stderr)
+        return 2
+
+    path = store_path(now)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    print(f"recorded ({entry['kind']}) -> {path.relative_to(ROOT)}")
+    return 0
+
+
+# Set by load(). The reader's exit: a count that silently excluded records is
+# indistinguishable from a count that had nothing to exclude, and the smaller
+# number always looks like better news.
+LOAD_SKIPPED = 0
+STORE_MISSING = False
+
+
+def load(since: str = "") -> list[dict]:
+    global LOAD_SKIPPED, STORE_MISSING
+    LOAD_SKIPPED = 0
+    STORE_MISSING = not STORE.exists()
+    if STORE_MISSING:
+        return []
+    out: list[dict] = []
+    for p in sorted(STORE.glob("*.jsonl")):
+        if since and p.stem < since[:7]:
+            continue
+        try:
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            LOAD_SKIPPED += 1
+            print(f"papercut: could not read {p.name}: {exc}", file=sys.stderr)
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                # One malformed line must not hide the rest, and must not vanish
+                # from the count either. Silently dropping records is how a log
+                # becomes reassuring.
+                LOAD_SKIPPED += 1
+                print(f"papercut: skipped a malformed line in {p.name}", file=sys.stderr)
+    return out
+
+
+def signature(message: str) -> frozenset[str]:
+    """Content words, for clustering near-duplicates written by different agents.
+
+    Deliberately crude. The job is to notice that three agents hit the same wall
+    in three different phrasings, not to do topic modelling. A cluster is a
+    prompt to go look, and a human looks at the raw messages anyway.
+    """
+    words = re.findall(r"[a-z0-9_./-]{3,}", message.lower())
+    return frozenset(w for w in words if w not in STOPWORDS)
+
+
+def cluster(entries: list[dict]) -> list[list[dict]]:
+    clusters: list[list[dict]] = []
+    sigs: list[frozenset[str]] = []
+    for e in entries:
+        s = signature(e["message"])
+        placed = False
+        for i, other in enumerate(sigs):
+            overlap = len(s & other)
+            smaller = min(len(s), len(other)) or 1
+            if overlap / smaller >= 0.5:
+                clusters[i].append(e)
+                sigs[i] = s & other or s
+                placed = True
+                break
+        if not placed:
+            clusters.append([e])
+            sigs.append(s)
+    return clusters
+
+
+def harvest(args: argparse.Namespace) -> int:
+    all_entries = load(args.since)
+
+    # Split before anything else. Suggestions are hypotheses and must never
+    # reach a graduation count: three people wanting the same change is one
+    # opinion held three times, not three findings, and mixing them would make
+    # the only signal this tool produces unreadable.
+    entries = [e for e in all_entries if e.get("kind") not in JUDGEMENT_KINDS]
+    ideas = [e for e in all_entries if e.get("kind") in JUDGEMENT_KINDS]
+
+    # Auto stubs know an address but no reason. Surfaced separately so the
+    # short list of "repeated and still unexplained" is obvious at a glance.
+    autos = [e for e in entries if e.get("kind") == "auto"]
+    undiagnosed: Counter = Counter(
+        (e.get("where", ""), e.get("head", "")) for e in autos
+    )
+    if not all_entries:
+        # Three different worlds, and they must not print the same sentence.
+        if STORE_MISSING:
+            print(f"No store at {STORE.relative_to(ROOT)}. Nothing has ever been recorded,")
+            print("and nothing is wired to record it. This is a setup problem, not a result.")
+            return 2
+        if LOAD_SKIPPED:
+            print(f"The store exists but {LOAD_SKIPPED} record(s) could not be read,")
+            print("and nothing readable remains. Do not read this as a clean log.")
+            return 2
+        print("Store present and empty. No papercuts recorded.")
+        print()
+        print("That is not the same as no friction. It is more likely that nothing")
+        print("is calling `bin/papercut`, which is the state this tool exists to end.")
+        return 0
+
+    if LOAD_SKIPPED:
+        print(f"WARNING: {LOAD_SKIPPED} record(s) unreadable and excluded from every")
+        print("count below. The numbers are a floor, not a total.\n")
+
+    groups = sorted(cluster(entries), key=len, reverse=True)
+    repeats = [g for g in groups if len(g) >= GRADUATION_THRESHOLD]
+    singles = [g for g in groups if len(g) < GRADUATION_THRESHOLD]
+
+    print(f"{len(entries)} papercut(s) across {len(groups)} distinct issue(s)")
+    print(f"span: {entries[0]['ts'][:10]} .. {entries[-1]['ts'][:10]}")
+
+    by_kind = Counter(e["kind"] for e in entries)
+    print("by kind: " + ", ".join(f"{k} {v}" for k, v in by_kind.most_common()))
+
+    where = Counter(e["where"] for e in entries if e["where"])
+    if where:
+        print("most-implicated: " + ", ".join(f"{k} ({v})" for k, v in where.most_common(5)))
+
+    print()
+    print("=" * 78)
+    print(f"GRADUATION CANDIDATES  —  seen {GRADUATION_THRESHOLD}+ times")
+    print("=" * 78)
+    if not repeats:
+        print("  none yet. Every papercut so far is a one-off.")
+    for g in repeats:
+        addr = Counter(e["where"] for e in g if e["where"]).most_common(1)
+        target = addr[0][0] if addr else "(no path recorded)"
+        clients = sorted({e["client"] for e in g})
+        print(f"\n  [{len(g)}x]  {target}")
+        print(f"         kinds: {', '.join(sorted({e['kind'] for e in g}))}"
+              f"   clients: {', '.join(clients)}")
+        for e in g[:4]:
+            print(f"         {e['ts'][:10]}  {e['message'][:88]}")
+        if len(g) > 4:
+            print(f"         ... and {len(g) - 4} more")
+        print(f"         -> checklist 10.1: this wants a fix in the closest AGENTS.md,")
+        print(f"            workflow, skill, hook, or script — not another note.")
+
+    # Second graduation axis: the same address, hit by *different* problems.
+    # Message clustering only catches "we keep tripping on the same thing". Two
+    # unrelated bugs in one tool is the other signal — the tool is the defect,
+    # not either bug. Both `bin/papercut` entries below are distinct bugs, and
+    # counting only message-similarity would have called them one-offs forever.
+    by_addr: dict[str, list[dict]] = defaultdict(list)
+    for e in entries:
+        if e["where"]:
+            by_addr[e["where"]].append(e)
+    # A hot address means several *diagnosed* problems in one place. Auto stubs
+    # carry no diagnosis, and their messages are terse enough that "timed out"
+    # and "timed out after 120s" score as two different problems when they are
+    # one problem twice. Counting them here inflated `Bash` to three distinct
+    # issues that were all the same timeout. Auto entries have their own
+    # section; they do not get to vote in this one.
+    hot = {}
+    for addr, es in by_addr.items():
+        diagnosed = [e for e in es if e.get("kind") != "auto"]
+        if len(diagnosed) >= GRADUATION_THRESHOLD and len(
+            {frozenset(signature(x["message"])) for x in diagnosed}
+        ) > 1:
+            hot[addr] = diagnosed
+    if hot:
+        print()
+        print("=" * 78)
+        print(f"HOT ADDRESSES  —  {GRADUATION_THRESHOLD}+ *distinct* problems in one place")
+        print("=" * 78)
+        for addr, es in sorted(hot.items(), key=lambda kv: -len(kv[1])):
+            print(f"\n  [{len(es)} distinct]  {addr}")
+            for e in es[:4]:
+                print(f"         {e['kind']:<13} {e['message'][:76]}")
+            print("         -> the address is the defect, not any single entry.")
+
+    if undiagnosed:
+        repeated = [(k, n) for k, n in undiagnosed.most_common()
+                    if n >= GRADUATION_THRESHOLD]
+        if repeated:
+            print()
+            print("=" * 78)
+            print("AUTO-CAUGHT, REPEATED, STILL UNEXPLAINED")
+            print("=" * 78)
+            print("  The hook knows these failed more than once. It cannot know why.")
+            print("  A sentence each turns an address into a fixable defect.\n")
+            for (tool, head), n in repeated:
+                label = f"{tool}" + (f"  ({head}…)" if head else "")
+                capped = " [at daily cap, true count is higher]" if n >= AUTO_CAP else ""
+                print(f"  {n:>3}x  {label}{capped}")
+            print(f'\n    bin/papercut --kind broken --where <tool> "why this matters"')
+
+    if ideas:
+        print()
+        print("-" * 78)
+        print(f"SUGGESTIONS ({len(ideas)})  —  opinions, not findings")
+        print("-" * 78)
+        print("  Never graduate on their own. A repeated suggestion is one opinion")
+        print("  held more than once, and needs a person to agree with it.\n")
+        for e in ideas[-10:]:
+            w = f"  [{e['where']}]" if e.get("where") else ""
+            print(f"  {e['ts'][:10]}{w}")
+            print(f"      {e['message'][:88]}")
+        if len(ideas) > 10:
+            print(f"  ... and {len(ideas) - 10} more")
+
+    if singles and not args.repeats_only:
+        print()
+        print("-" * 78)
+        print(f"ONE-OFFS ({len(singles)})  —  watch, do not act yet")
+        print("-" * 78)
+        for g in singles[:15]:
+            e = g[0]
+            w = f"  [{e['where']}]" if e["where"] else ""
+            print(f"  {e['ts'][:10]}  {e['kind']:<13}{w}")
+            print(f"              {e['message'][:92]}")
+        if len(singles) > 15:
+            print(f"  ... and {len(singles) - 15} more (use --json for all)")
+
+    if args.json:
+        Path(args.json).write_text(json.dumps({
+            "as_of": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "total": len(entries),
+            "distinct": len(groups),
+            "graduation_candidates": [
+                {"count": len(g), "where": (Counter(e["where"] for e in g if e["where"])
+                                            .most_common(1) or [("", 0)])[0][0],
+                 "messages": [e["message"] for e in g]}
+                for g in repeats
+            ],
+        }, indent=2), encoding="utf-8")
+        print(f"\nwrote {args.json}")
+
+    # A harvest receipt is what makes checklist 10.1 machine-checkable: the audit
+    # can ask whether harvesting is happening, rather than trusting that it is.
+    receipt = STORE / "last-harvest.json"
+    receipt.write_text(json.dumps({
+        "harvested_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        # ALL entries, including suggestions. `entries` here is the observation
+        # subset, and using it left every suggestion looking permanently
+        # unharvested to contract-audit 10.1, which counts raw lines. Two
+        # denominators for the same log is how a staleness check cries wolf
+        # until nobody reads it.
+        "entries_seen": len(all_entries),
+        "observations_seen": len(entries),
+        "suggestions_seen": len(ideas),
+        "unreadable_skipped": LOAD_SKIPPED,
+        "distinct_issues": len(groups),
+        "graduation_candidates": len(repeats),
+    }, indent=2), encoding="utf-8")
+
+    return 0
+
+
+def auto(args: argparse.Namespace) -> int:
+    """PostToolUseFailure hook. Record that a tool failed, with no agent involved.
+
+    ## Why this is not optional
+
+    Everything else in this file depends on an agent choosing to write something
+    down, and the whole reason the tool exists is that they reliably do not. The
+    moment of friction is mid-task with a workaround already in mind. Asking for
+    a note there is a T0 advisory, and this repo measured what those are worth:
+    613 normative clauses, 6% enforcement.
+
+    So the mechanical half is taken away from the agent entirely. A failed tool
+    call writes its own stub. Who: nobody. When: at the moment of failure.
+
+    ## What a stub is and is not
+
+    An auto entry records the **address**: which tool, what the command started
+    with, when. It cannot record the diagnosis, because the hook payload does not
+    contain one and `20_live/workflow-metrics/` is metadata-only by contract
+    (item 9.1). `run_terminal_command failed, head "set"` will never tell you
+    that `grep` here is a ugrep wrapper honouring .gitignore.
+
+    That is the division of labour, and it is deliberate:
+
+        auto      THAT it failed.  Free, objective, complete.
+        agent     WHY it matters.  Costly, subjective, and the part with value.
+
+    `harvest` shows auto stubs that repeat and still carry no diagnosis. Those
+    are the ones worth a human sentence. The agent is handed a short list at
+    session close instead of being asked to remember anything.
+
+    ## Flood control
+
+    Capped at AUTO_CAP entries per (tool, command-head) per day. A flapping
+    command would otherwise bury every hand-written papercut, and a log nobody
+    can read is the failure mode this tool was built to avoid. The cap is
+    announced in the harvest rather than applied silently, because a silent cap
+    reads as "that only happened three times".
+
+    Fails open and silent. A hook that breaks the session to record a complaint
+    about a broken session is not a trade worth making.
+    """
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:  # noqa: BLE001
+        return 0
+
+    tool = payload.get("tool_name") or payload.get("toolName") or ""
+    if not tool:
+        return 0
+
+    tin = payload.get("tool_input") or payload.get("toolInput") or {}
+    head = ""
+    for key in ("command", "file_path", "path", "pattern", "url"):
+        val = tin.get(key)
+        if isinstance(val, str) and val.strip():
+            head = val.strip().split()[0][:48]
+            break
+
+    err = payload.get("tool_response") or payload.get("error") or ""
+    if isinstance(err, dict):
+        err = err.get("error") or err.get("stderr") or ""
+    err = re.sub(r"\s+", " ", str(err)).strip()[:180]
+
+    now = datetime.now().astimezone()
+    today = now.strftime("%Y-%m-%d")
+    same = [
+        e for e in load(today[:7])
+        if e.get("kind") == "auto" and e.get("where") == tool
+        and e.get("head", "") == head and e.get("ts", "").startswith(today)
+    ]
+    if len(same) >= AUTO_CAP:
+        return 0
+
+    STORE.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": now.isoformat(timespec="seconds"),
+        "client": os.environ.get("MAINFRAME_CLIENT", "unknown"),
+        "session": os.environ.get("CLAUDE_SESSION_ID", "")[:8],
+        "kind": "auto",
+        "where": tool,
+        "head": head,
+        "message": err or f"{tool} failed with no error text captured",
+        "diagnosed": False,
+    }
+    with store_path(now).open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return 0
+
+
+def prompt(args: argparse.Namespace) -> int:
+    """Show today's tool failures that carry no explanation.
+
+    ## Why this exists rather than "remember to run bin/papercut"
+
+    The moment of friction is not the moment of reflection. An agent that hits a
+    broken tool is mid-task, has a workaround in mind, and will take it. That is
+    the whole observation behind this tool: models push through and never mention
+    the problem. A convention that asks them to stop and log at exactly the worst
+    moment is a T0 advisory, and this repo has 613 normative clauses and a
+    measured 6% enforcement rate to show what those are worth.
+
+    So do not rely on remembering. `20_live/workflow-metrics/` already records
+    every `PostToolUseFailure` automatically, and `bin/session-close` already
+    runs at SessionEnd and PreCompact, when the agent is reflecting anyway.
+    This command joins the two: it hands over the list of things that broke, so
+    the agent supplies diagnosis rather than recall.
+
+    ## What each layer can and cannot do
+
+        workflow-metrics   THAT something failed.   automatic, objective, high
+                           volume, metadata-only by contract (item 9.1), so it
+                           records `run_terminal_command failed, command_head
+                           "set"` and can never tell you why.
+
+        bin/papercut       WHAT was wrong and why it will bite the next agent.
+                           Semantic, low volume, self-reported.
+
+    Neither derives from the other. Telemetry cannot know that `grep` here is a
+    ugrep wrapper honouring .gitignore; a papercut cannot know that the same
+    command failed eleven times this week.
+
+    ## This is a prompt, not a gate
+
+    Most tool failures deserve no papercut. A typo, a path that did not exist
+    yet, a deliberate probe: all expected, none worth recording. Demanding an
+    entry per failure would flood the log and make the harvest useless, which is
+    the failure mode that matters more than under-recording. The list is offered,
+    not enforced.
+
+    Correlation is coarse and stated as such: papercuts carry no telemetry id, so
+    matching is by tool name and day. It surfaces candidates. It proves nothing.
+    """
+    events_dir = ROOT / "20_live" / "workflow-metrics" / "events"
+    if not events_dir.exists():
+        print("No telemetry to read.")
+        return 0
+
+    day = args.since or datetime.now().strftime("%Y-%m-%d")
+    files = [p for p in sorted(events_dir.glob("*.jsonl")) if p.stem >= day[:10]]
+    if not files:
+        print(f"No telemetry on or after {day}.")
+        return 0
+
+    failures: Counter = Counter()
+    total = 0
+    for p in files:
+        for ln in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            if '"PostToolUseFailure"' not in ln and '"success": false' not in ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if d.get("event") != "PostToolUseFailure" and d.get("success") is not False:
+                continue
+            total += 1
+            head = (d.get("input_summary") or {}).get("command_head") or ""
+            failures[(d.get("tool_name", "?"), head)] += 1
+
+    recorded = load(day[:7])
+    explained = {e["where"].split("/")[-1].lower() for e in recorded if e["where"]}
+    explained |= {w for e in recorded for w in re.findall(r"[a-z_-]{4,}", e["message"].lower())}
+
+    print(f"{total} tool failure(s) recorded since {day}, "
+          f"{len(failures)} distinct shape(s).")
+    print(f"{len(recorded)} papercut(s) written in the same period.")
+
+    if not failures:
+        print("\nNothing broke. No prompt needed.")
+        return 0
+
+    unexplained = [
+        (tool, head, n) for (tool, head), n in failures.most_common()
+        if not ({tool.lower(), head.lower()} & explained)
+    ]
+
+    print("\n" + "-" * 74)
+    print("FAILED, WITH NO PAPERCUT EXPLAINING IT")
+    print("-" * 74)
+    if not unexplained:
+        print("  none. Every failure shape has a matching papercut.")
+    for tool, head, n in unexplained[:12]:
+        label = f"{tool}" + (f"  ({head}…)" if head else "")
+        print(f"  {n:>3}x  {label}")
+
+    print("\n  Most of these are expected: typos, missing paths, deliberate probes.")
+    print("  Record only the ones the next agent would hit too:")
+    print('    bin/papercut --kind broken --where <tool> "what went wrong and why"')
+    return 0
+
+
+def show_list(args: argparse.Namespace) -> int:
+    entries = load(args.since)
+    for e in entries[-args.limit:]:
+        w = f" [{e['where']}]" if e["where"] else ""
+        print(f"{e['ts'][:16]}  {e['kind']:<13}{w}\n    {e['message']}")
+    print(f"\n{len(entries)} total")
+    return 0
+
+
+SUBCOMMANDS = {"harvest", "list", "prompt", "auto"}
+
+
+def main() -> int:
+    """Dispatch by hand rather than with argparse subparsers.
+
+    Subparsers plus a positional `message` cannot coexist: argparse consumes the
+    first positional as the subcommand name and rejects any message that is not
+    "harvest" or "list". The first six real papercuts recorded with this tool all
+    bounced off that, and `--where --fail-on-overflow` bounced off argparse
+    reading a leading `--` as a flag.
+
+    Recorded as papercuts against this file, which is the correct outcome, but
+    the lesson is sharper than the bug: **a tool for capturing friction cannot
+    itself have any.** Anything that makes recording harder than pushing through
+    guarantees the tool goes unused and the log reads as an absence of problems.
+    """
+    argv = sys.argv[1:]
+
+    if argv and argv[0] in SUBCOMMANDS:
+        ap = argparse.ArgumentParser(prog=f"papercut {argv[0]}")
+        ap.add_argument("--since", default="", help="YYYY-MM")
+        ap.add_argument("--json", default="")
+        ap.add_argument("--limit", type=int, default=20)
+        ap.add_argument("--repeats-only", action="store_true")
+        args = ap.parse_args(argv[1:])
+        return {"harvest": harvest, "list": show_list,
+                "prompt": prompt, "auto": auto}[argv[0]](args)
+
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        print("kinds:")
+        for k, v in sorted(KINDS.items()):
+            print(f"  {k:<14} {v}")
+        return 0
+
+    # Everything else is a record. Options may appear anywhere; whatever is not
+    # an option is the message, joined. `--where` accepts a leading `--` value.
+    kind, where, client, parts = "friction", "", "", []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok.startswith("--") and "=" in tok:
+            key, _, val = tok.partition("=")
+            tok, nxt = key, val
+        elif tok in ("--kind", "--where", "--client"):
+            nxt = argv[i + 1] if i + 1 < len(argv) else ""
+            i += 1
+        else:
+            parts.append(tok)
+            i += 1
+            continue
+        if tok == "--kind":
+            if nxt not in KINDS:
+                print(f"papercut: unknown kind '{nxt}'. Choose from: "
+                      f"{', '.join(sorted(KINDS))}", file=sys.stderr)
+                return 2
+            kind = nxt
+        elif tok == "--where":
+            where = nxt
+        elif tok == "--client":
+            client = nxt
+        i += 1
+
+    return record(argparse.Namespace(
+        message=" ".join(parts), kind=kind, where=where, client=client))
+
+
+if __name__ == "__main__":
+    # Exit contract, stated because this tool runs in two very different places.
+    #
+    #   0  did what was asked
+    #   2  could not run (bad usage, unwritable store, internal failure)
+    #
+    # EXCEPT in `auto`, which is a PostToolUseFailure hook and must be
+    # **silent and always 0**. The docstring already promised that a hook must
+    # never break the session to record a complaint about a broken session, and
+    # the first version did not implement it: any exception printed to stderr
+    # and exited 2, injecting noise into the session at the exact moment
+    # something had already gone wrong. Found by sweeping bin/ for exactly this.
+    #
+    # Fail-open in the hook, fail-loud everywhere else. A dropped papercut costs
+    # one record. A hook that shouts costs the session.
+    is_hook = len(sys.argv) > 1 and sys.argv[1] == "auto"
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0 if is_hook else 130)
+    except Exception as exc:  # noqa: BLE001
+        if is_hook:
+            sys.exit(0)
+        print(f"papercut: failed to record ({type(exc).__name__}: {exc})", file=sys.stderr)
+        print("This is not a clean result. Do not read it as one.", file=sys.stderr)
+        sys.exit(2)

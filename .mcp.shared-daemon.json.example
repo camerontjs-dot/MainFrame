@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mindgraph": {
+      "command": "/path/to/MainFrame/bin/mindgraph",
+      "args": ["mcp-proxy", "--url", "http://127.0.0.1:8000/mcp"]
+    }
+  }
+}

@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import sqlite_vec
 
@@ -26,27 +27,77 @@ REQUIRED_QUERY_TABLES = frozenset(
 STUB_SIZE_BYTES = 16_384  # 16 KiB
 
 
-def get_db(db_path: str = "mindgraph.sqlite") -> sqlite3.Connection:
-    """Connect to the SQLite database and load the sqlite-vec extension."""
-    try:
-        conn = sqlite3.connect(db_path, timeout=30.0)
-        conn.enable_load_extension(True)
-        sqlite_vec.load(conn)
-        conn.enable_load_extension(False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
+def _configure_connection(
+    conn: sqlite3.Connection, *, read_only: bool
+) -> sqlite3.Connection:
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.enable_load_extension(False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    if read_only:
+        conn.execute("PRAGMA query_only = ON")
+        # Force SQLite to read the schema now. A WAL database can connect in
+        # mode=ro and then fail on its first query when the containing directory
+        # cannot host a shared-memory file; callers need that failure here so
+        # the immutable snapshot fallback can be selected deterministically.
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    else:
         # WAL lets the long-lived MCP reader and the ingest/refresh writer
         # coexist without `database is locked` errors. Journal mode is a
-        # persistent property of the file, so issuing it on every connection is
-        # idempotent and also migrates a pre-existing rollback-journal DB.
+        # persistent property of the file, so issuing it on every writable
+        # connection is idempotent and migrates pre-existing rollback journals.
         conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def _open_read_only(db_path: str) -> sqlite3.Connection:
+    """Open a query-only database, falling back to an immutable snapshot.
+
+    Normal ``mode=ro`` remains preferred because it observes a live WAL. The
+    immutable fallback is only used when SQLite cannot create/read WAL shared
+    memory in a non-writable runtime (for example, a sandbox-mounted index).
+    """
+    if db_path == ":memory:":
+        raise DatabaseError(":memory: cannot be opened read-only")
+
+    resolved = Path(db_path).expanduser().resolve()
+    base_uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
+    last_error: Exception | None = None
+    for immutable in (False, True):
+        conn: sqlite3.Connection | None = None
+        uri = f"{base_uri}&immutable=1" if immutable else base_uri
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=30.0)
+            return _configure_connection(conn, read_only=True)
+        except (sqlite3.Error, RuntimeError) as exc:
+            last_error = exc
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+    assert last_error is not None
+    raise DatabaseError(f"Failed to open database at {db_path}: {last_error}")
+
+
+def get_db(
+    db_path: str = "mindgraph.sqlite", *, read_only: bool = False
+) -> sqlite3.Connection:
+    """Connect to SQLite, load sqlite-vec, and apply the requested access mode."""
+    if read_only:
+        return _open_read_only(db_path)
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        _configure_connection(conn, read_only=False)
         if conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
         ).fetchone():
             with conn:
                 _ensure_document_provenance_columns(conn)
         return conn
-    except sqlite3.Error as e:
+    except (sqlite3.Error, RuntimeError) as e:
         raise DatabaseError(f"Failed to open database at {db_path}: {e}") from e
 
 
@@ -239,7 +290,7 @@ def inspect_database(
 
     conn: sqlite3.Connection | None = None
     try:
-        conn = get_db(str(path))
+        conn = get_db(str(path), read_only=True)
         tables = list_table_names(conn)
         report["tables_present"] = sorted(tables)
         missing = missing_required_tables(conn)

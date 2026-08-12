@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -25,6 +26,26 @@ def test_inspect_healthy_db(tmp_path):
     assert report["exists"] is True
     assert report["tables_missing"] == []
     assert report["counts"]["documents"] == 0
+
+
+def test_inspect_read_only_wal_db_without_writable_directory(tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    path = locked / "index.sqlite"
+    db.init_db(str(path)).close()
+    os.chmod(path, 0o444)
+    os.chmod(locked, 0o555)
+    try:
+        report = db.inspect_database(str(path), role="projects")
+        assert report["ok"] is True, report
+        conn = db.get_db(str(path), read_only=True)
+        try:
+            assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        finally:
+            conn.close()
+    finally:
+        os.chmod(locked, 0o755)
+        os.chmod(path, 0o644)
 
 
 def test_inspect_missing_file(tmp_path):

@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Process-evaluation loop CLI — deterministic preflight + loop decision surface.
+
+Pairs with `.context/workflows/process-evaluation.md` and the
+mainframe-process-eval project. Does not replace `bin/mainframe-doctor`
+(health vector) or `bin/eval-schedule` (scheduled suite).
+
+Commands:
+  preflight   Run the standard observational check pack (non-mutating).
+  status      Point at project surfaces and last eval artifacts.
+  close       Print loop-decision template after an eval pass.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".context" / "workflows" / "process-evaluation.md"
+PROJECT = ROOT / "30_projects" / "mainframe-process-eval"
+OUTPUTS = PROJECT / "outputs"
+BACKLOG = PROJECT / "improvement-backlog" / "items.md"
+
+
+def run_cmd(cmd: list[str], *, timeout: int = 180) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def preflight_steps() -> list[tuple[str, list[str]]]:
+    py = sys.executable
+    return [
+        ("unittest", [py, "-m", "unittest", "discover", "-s", "tests", "-q"]),
+        ("ingest_minion_dry_run", [str(ROOT / "bin" / "ingest-minion"), "run", "--dry-run"]),
+        ("mindgraph_refresh_dry_run", [str(ROOT / "bin" / "mindgraph-refresh"), "--dry-run"]),
+        ("sync_project_index_check", [str(ROOT / "bin" / "sync-project-index"), "--check"]),
+        ("session_open_json", [str(ROOT / "bin" / "session-open"), "--json"]),
+        ("session_close_check", [str(ROOT / "bin" / "session-close"), "--check"]),
+        ("eval_schedule_check", [str(ROOT / "bin" / "eval-schedule"), "check"]),
+        ("workflow_report_7d", [str(ROOT / "bin" / "workflow-report"), "--days", "7", "--json"]),
+        ("mainframe_doctor_quick", [str(ROOT / "bin" / "mainframe-doctor")]),
+        (
+            "loop_catalogue",
+            [
+                py,
+                str(
+                    PROJECT
+                    / "workbench"
+                    / "loop-eval"
+                    / "scripts"
+                    / "score_catalogue.py"
+                ),
+            ],
+        ),
+    ]
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    results: list[dict[str, Any]] = []
+    worst = 0
+    for name, cmd in preflight_steps():
+        if args.skip_doctor and name == "mainframe_doctor_quick":
+            results.append({"name": name, "exit": None, "skipped": True})
+            continue
+        if args.skip_unittest and name == "unittest":
+            results.append({"name": name, "exit": None, "skipped": True})
+            continue
+        try:
+            proc = run_cmd(cmd, timeout=args.timeout)
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            code = 124
+            proc = None  # type: ignore
+        except FileNotFoundError:
+            code = 127
+            proc = None  # type: ignore
+        # Tools that exit 1 when work remains / health is degraded — still "ran".
+        advisory = name in {
+            "session_close_check",
+            "mainframe_doctor_quick",
+            "sync_project_index_check",
+            "eval_schedule_check",
+        }
+        hard_fail = code not in (0, None) and not (advisory and code == 1)
+        results.append(
+            {
+                "name": name,
+                "exit": code,
+                "skipped": False,
+                "advisory": bool(advisory and code == 1),
+                "cmd": cmd,
+                "stdout_tail": (proc.stdout or "")[-400:] if proc else "",
+                "stderr_tail": (proc.stderr or "")[-400:] if proc else "",
+            }
+        )
+        if hard_fail:
+            worst = max(worst, 1)
+
+    if args.json:
+        print(json.dumps({"results": results, "ok": worst == 0}, indent=2))
+    else:
+        print("process-eval preflight")
+        print(f"workflow: {WORKFLOW.relative_to(ROOT)}")
+        for r in results:
+            if r.get("skipped"):
+                print(f"  - {r['name']}: SKIP")
+                continue
+            if r["exit"] == 0:
+                flag = "OK"
+            elif r.get("advisory"):
+                flag = f"ADVISORY exit={r['exit']}"
+            else:
+                flag = f"FAIL exit={r['exit']}"
+            print(f"  - {r['name']}: {flag}")
+        print()
+        print("next: sample ≥3 real cases → score → ≤2 improvement slices → rerun")
+        print("      then: bin/process-eval close")
+        print(f"outputs: {OUTPUTS.relative_to(ROOT)}/")
+        if worst == 0:
+            print("preflight: OK (advisory non-zeros do not fail the pack)")
+    return worst
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    latest = None
+    if OUTPUTS.is_dir():
+        mds = sorted(OUTPUTS.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        latest = mds[0] if mds else None
+    payload = {
+        "project": str(PROJECT.relative_to(ROOT)),
+        "workflow": str(WORKFLOW.relative_to(ROOT)) if WORKFLOW.exists() else None,
+        "backlog": str(BACKLOG.relative_to(ROOT)) if BACKLOG.exists() else None,
+        "latest_output": str(latest.relative_to(ROOT)) if latest else None,
+        "loop_eval": str(
+            (PROJECT / "workbench" / "loop-eval" / "catalogue" / "INDEX.md").relative_to(ROOT)
+        ),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print("process-eval status")
+        for k, v in payload.items():
+            print(f"  {k}: {v}")
+    return 0
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    """Emit loop-decision scaffold (operator fills after eval)."""
+    today = date.today().isoformat()
+    text = f"""# process-eval close — loop decision ({today})
+
+## Pass identity
+- eval_run_id: {args.run_id or f"{today}-process-eval"}
+- question: {args.question or "(one evaluation question)"}
+- output: 30_projects/mainframe-process-eval/outputs/{args.run_id or f"{today}-…"} .md
+
+## Checks
+- [ ] Baseline captured before changes
+- [ ] Deterministic pack rerun (`bin/process-eval preflight`)
+- [ ] ≥3 sampled cases (normal / boundary / failure) when available
+- [ ] Findings classified (code-defect | process-gap | adoption-gap | telemetry-gap | intentional-backlog)
+- [ ] ≤2 improvement slices selected (or none)
+- [ ] Metric extract + irregularities; `bin/eval-registry harvest`
+
+## Loop decision (pick one)
+- [ ] **same_slice** — continue same process area next pass
+- [ ] **new_question** — new observational question
+- [ ] **promote_pattern** — pattern ready for bin/workflow/skill (record destination)
+- [ ] **park** — blocked or low value; reason: …
+- [ ] **handoff** — ownership moves to project: …
+
+## Destinations (if promote)
+- bin / workflow / skill / agent / project-local / no-action
+
+## Next action
+- …
+
+Workflow: .context/workflows/process-evaluation.md
+"""
+    if args.write:
+        out = OUTPUTS / f"{args.run_id or today}-process-eval-close.md"
+        OUTPUTS.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        print(f"wrote {out.relative_to(ROOT)}")
+    else:
+        print(text)
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="MainFrame process-evaluation loop CLI",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("preflight", help="Run non-mutating check pack")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--skip-unittest", action="store_true")
+    p.add_argument("--skip-doctor", action="store_true")
+    p.add_argument("--timeout", type=int, default=300)
+    p.set_defaults(func=cmd_preflight)
+
+    s = sub.add_parser("status", help="Project + artifact pointers")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    c = sub.add_parser("close", help="Print or write loop-decision scaffold")
+    c.add_argument("--run-id", default="")
+    c.add_argument("--question", default="")
+    c.add_argument("--write", action="store_true", help=f"Write under {OUTPUTS}")
+    c.set_defaults(func=cmd_close)
+
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -16,6 +16,8 @@ sys.modules[SPEC.name] = minion_module
 SPEC.loader.exec_module(minion_module)
 
 IngestMinion = minion_module.IngestMinion
+FrontmatterError = minion_module.FrontmatterError
+validate_strict = minion_module.validate_strict
 
 
 def valid_note(domain: str = "ai-systems", item_type: str = "note", status: str = "queued") -> str:
@@ -64,6 +66,25 @@ def pdf_bytes_with_metadata(
     ).encode("utf-8")
 
 
+class FrontmatterValidationTests(unittest.TestCase):
+    def test_strict_validation_rejects_blank_tag_values(self) -> None:
+        metadata = {
+            "title": "Example Note",
+            "domain": "ai-systems",
+            "type": "note",
+            "status": "queued",
+            "source": "manual test source",
+            "tags": ["test", "   "],
+        }
+
+        with self.assertRaisesRegex(FrontmatterError, "only non-empty strings"):
+            validate_strict(metadata)
+
+    def test_strip_quotes_accepts_backticks_and_trims_wrappers(self) -> None:
+        self.assertEqual(minion_module.strip_quotes("` Example title `"), "Example title")
+        self.assertEqual(minion_module.strip_quotes("' Example source '"), "Example source")
+
+
 class IngestMinionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -82,6 +103,32 @@ class IngestMinionTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_reserved_operational_files_are_not_ingested(self) -> None:
+        """A contract file in 00_inbox governs the folder; it is not a capture.
+
+        Before 2026-08-10 the scanner returned every non-dotfile, so an
+        `AGENTS.md` written into `00_inbox/` to govern that folder was
+        normalized and moved to `01_ingest/ready/` on the first apply. The
+        contract silently migrated out of the folder it governed. The scanner
+        had no concept of a non-capture file, and treated presence in a
+        directory as intent to ingest.
+        """
+        for name in ("AGENTS.md", "README.md", "index.md", "agents.md"):
+            (self.root / "00_inbox" / name).write_text(
+                valid_note(), encoding="utf-8"
+            )
+        capture = self.root / "00_inbox" / "real-capture.md"
+        capture.write_text(valid_note(), encoding="utf-8")
+
+        found = {p.name for p in self.minion._files_in(self.root / "00_inbox")}
+
+        self.assertEqual(found, {"real-capture.md"})
+        for name in ("AGENTS.md", "README.md", "index.md", "agents.md"):
+            self.assertTrue(
+                (self.root / "00_inbox" / name).exists(),
+                f"{name} must stay where it was written",
+            )
 
     def test_routes_valid_markdown_from_inbox_through_queue(self) -> None:
         source = self.root / "00_inbox" / "2026-05-23__ai-systems__note__example.md"
@@ -123,6 +170,22 @@ class IngestMinionTests(unittest.TestCase):
         self.assertNotIn("normalize", [event.kind for event in result.events])
         self.assertIn("stage", [event.kind for event in result.events])
         self.assertIn("route", [event.kind for event in result.events])
+
+    def test_inbox_empty_tags_requires_enrichment_instead_of_routing(self) -> None:
+        source = self.root / "00_inbox" / "2026-05-24__ai-systems__note__untagged.md"
+        source.write_text(
+            valid_note().replace('tags: ["test", "ingest"]', "tags: []"),
+            encoding="utf-8",
+        )
+
+        result = self.minion.run(apply=True)
+
+        ready_target = self.root / "01_ingest" / "ready" / source.name
+        durable_target = self.root / "10_knowledge" / "ai-systems" / source.name
+        self.assertTrue(result.ok)
+        self.assertTrue(ready_target.exists())
+        self.assertFalse(durable_target.exists())
+        self.assertIn("tags: []", ready_target.read_text(encoding="utf-8"))
 
     def test_inbox_no_frontmatter_is_normalized_to_ready(self) -> None:
         source = self.root / "00_inbox" / "raw-clipping.md"
@@ -402,6 +465,24 @@ class IngestMinionTests(unittest.TestCase):
         self.assertIn('description: "Metadata subject"', stub_text)
         self.assertIn('keywords: ["agentic systems", "pdf metadata"]', stub_text)
         self.assertIn('created: "2026-05-28"', stub_text)
+
+    def test_malformed_pdf_octal_metadata_does_not_abort_routing(self) -> None:
+        source = self.root / "00_inbox" / "2026-05-21__ai-systems__raw__sample-paper.pdf"
+        source.write_bytes(pdf_bytes_with_metadata(title=r"Broken\777Title"))
+
+        result = self.minion.run(apply=True)
+
+        stub = (
+            self.root
+            / "10_knowledge"
+            / "ai-systems"
+            / "2026-05-21__ai-systems__raw__sample-paper.md"
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(stub.exists())
+        stub_text = stub.read_text(encoding="utf-8")
+        self.assertIn('title: "Sample Paper"', stub_text)
+        self.assertIn('author: ["Ada Lovelace"]', stub_text)
 
     def test_inbox_unconvention_named_pdf_suggests_without_rejecting(self) -> None:
         source = self.root / "00_inbox" / "Prompting in the Wild.pdf"

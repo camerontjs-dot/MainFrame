@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""G6 — does a capture's claimed paper actually exist?
+
+Automates the manual check run on 2026-08-09, which found that **21 of 21**
+claimed titles did not exist: every exact-title search returned real work on the
+subject by named authors, and never the cited paper. See
+`20_live/security/2026-08-09__g6-title-existence-check.md`.
+
+## This tool nominates. It does not convict.
+
+Crossref does not index arXiv preprints or much of the ACL Anthology. "Not found
+in Crossref" is therefore **not** evidence of fabrication, and a tool that said
+otherwise would falsely accuse most of the machine-learning literature. Measured
+during development:
+
+    Crossref's own relevance score is worthless as a discriminator.
+    A fabricated title scored 40.8; "Attention Is All You Need" scored 33.1.
+
+So this checks **title similarity** against two sources (Crossref and arXiv), and
+reports a band rather than a verdict:
+
+    likely-real    a near-exact title match exists somewhere
+    inconclusive   partial match only, or plausible coverage gap  -> human check
+    no-match       nothing resembling this title in either source -> human check
+
+Only `no-match` is worth a person's attention, and even then the output is a
+question, not an accusation.
+
+**Controls run in the same batch.** Known-real titles must land in `likely-real`
+and a known-fabricated title must land in `no-match`. If they do not, the run is
+reported BROKEN and its results are not evidence. Same discipline as
+`bin/citation-resolvability-sweep`.
+
+Usage:
+  bin/title-existence-check --file 10_knowledge/domain/foo.md
+  bin/title-existence-check --from-list 20_live/security/sweeps/<file>.txt
+  bin/title-existence-check --title "Some Paper Title"
+  bin/title-existence-check --from-list ... --json out.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+# Crossref's "polite pool" gives better rate limits when the User-Agent carries a
+# contact address. Read it from the environment so a real address is never committed.
+# Matches the UNPAYWALL_EMAIL convention in scripts/fetch_source_text.py.
+_CONTACT = os.environ.get("MAINFRAME_CONTACT_EMAIL", "mainframe@local")
+UA = f"MainFrame-audit/1.0 (integrity audit; mailto:{_CONTACT})"
+
+# Calibrated on the 2026-08-09 corpus: fabricated titles scored 0.44-0.50,
+# real titles 0.65-1.00. The bands are deliberately wide, with everything
+# between them routed to a human rather than guessed at.
+LIKELY_REAL = 0.85
+NO_MATCH = 0.55
+
+REAL_CONTROLS = [
+    "Attention Is All You Need",
+    "Computing Inter-Rater Reliability and Its Variance in the Presence of High Agreement",
+]
+FAKE_CONTROL = "Chunk Granularity and Retrieval Floors in Multi-Stage RAG/NLI Pipelines"
+
+
+def normalize(s: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", s.lower()).split())
+
+
+def similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, normalize(a), normalize(b)).ratio()
+
+
+def _get(url: str, timeout: float = 25.0) -> bytes | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:  # noqa: BLE001 — a dead source is inconclusive, not proof
+        return None
+
+
+def crossref_best(title: str) -> tuple[float, str]:
+    q = urllib.parse.urlencode(
+        {"query.bibliographic": title, "rows": 5, "select": "title,DOI"}
+    )
+    raw = _get(f"https://api.crossref.org/works?{q}")
+    if raw is None:
+        return (-1.0, "(crossref unreachable)")
+    try:
+        items = json.loads(raw)["message"]["items"]
+    except Exception:  # noqa: BLE001
+        return (-1.0, "(crossref unparseable)")
+    best, best_t = 0.0, ""
+    for it in items:
+        for t in it.get("title") or []:
+            if (s := similarity(title, t)) > best:
+                best, best_t = s, t
+    return best, best_t
+
+
+def arxiv_best(title: str) -> tuple[float, str]:
+    q = urllib.parse.urlencode(
+        {"search_query": f'ti:"{title}"', "max_results": 5}
+    )
+    raw = _get(f"http://export.arxiv.org/api/query?{q}")
+    if raw is None:
+        return (-1.0, "(arxiv unreachable)")
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return (-1.0, "(arxiv unparseable)")
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    best, best_t = 0.0, ""
+    for entry in root.findall("a:entry", ns):
+        node = entry.find("a:title", ns)
+        if node is not None and node.text:
+            if (s := similarity(title, node.text)) > best:
+                best, best_t = s, " ".join(node.text.split())
+    return best, best_t
+
+
+def check(title: str) -> dict[str, Any]:
+    cs, ct = crossref_best(title)
+    as_, at = arxiv_best(title)
+    best = max(cs, as_)
+    source, match = ("crossref", ct) if cs >= as_ else ("arxiv", at)
+
+    if best < 0:
+        band = "inconclusive"
+    elif best >= LIKELY_REAL:
+        band = "likely-real"
+    elif best < NO_MATCH:
+        band = "no-match"
+    else:
+        band = "inconclusive"
+
+    return {
+        "title": title, "band": band, "best_similarity": round(best, 3),
+        "best_source": source, "best_match": match,
+        "crossref": round(cs, 3), "arxiv": round(as_, 3),
+    }
+
+
+def title_of(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if m := re.search(r'^title:\s*"?(.+?)"?\s*$', text[:2000], re.M):
+        return m.group(1)
+    if m := re.search(r"^#\s+(.+)$", text, re.M):
+        return m.group(1)
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--title", action="append", default=[])
+    ap.add_argument("--file", action="append", default=[])
+    ap.add_argument("--from-list", type=str, default="")
+    ap.add_argument("--json", type=str, default="")
+    args = ap.parse_args()
+
+    targets: list[tuple[str, str]] = [(t, "(--title)") for t in args.title]
+    paths = [Path(f) for f in args.file]
+    if args.from_list:
+        paths += [ROOT / line for line in Path(args.from_list).read_text().split()]
+    for p in paths:
+        if t := title_of(p):
+            targets.append((t, str(p)))
+
+    if not targets:
+        ap.error("nothing to check — pass --title, --file, or --from-list")
+
+    print("=== CONTROL GATE ===", file=sys.stderr)
+    ctrl_ok = True
+    for c in REAL_CONTROLS:
+        r = check(c)
+        ok = r["band"] == "likely-real"
+        ctrl_ok &= ok
+        print(f"  [+] {'PASS' if ok else 'FAIL'}  {r['band']:<13} {r['best_similarity']:.2f}  {c[:50]}",
+              file=sys.stderr)
+    rf = check(FAKE_CONTROL)
+    ok = rf["band"] == "no-match"
+    ctrl_ok &= ok
+    print(f"  [-] {'PASS' if ok else 'FAIL'}  {rf['band']:<13} {rf['best_similarity']:.2f}  "
+          f"{FAKE_CONTROL[:50]}", file=sys.stderr)
+
+    if not ctrl_ok:
+        print("\n*** BROKEN CHECK — results below are NOT evidence. ***", file=sys.stderr)
+
+    results = []
+    for title, origin in targets:
+        r = check(title)
+        r["file"] = origin
+        results.append(r)
+        flag = {"no-match": "NO MATCH    ", "inconclusive": "inconclusive",
+                "likely-real": "likely-real "}[r["band"]]
+        print(f"{flag} {r['best_similarity']:.2f}  {title[:64]}")
+        if r["band"] != "likely-real":
+            print(f"             closest ({r['best_source']}): {r['best_match'][:64]}")
+            print(f"             {origin}")
+
+    counts = {b: sum(1 for r in results if r["band"] == b)
+              for b in ("no-match", "inconclusive", "likely-real")}
+    print(f"\nchecked {len(results)}: " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+    print("\nA `no-match` is a question for a human, not a verdict. Crossref does not "
+          "index arXiv or much of ACL.")
+
+    if args.json:
+        Path(args.json).write_text(json.dumps(
+            {"controls_ok": ctrl_ok, "counts": counts, "results": results}, indent=2
+        ), encoding="utf-8")
+        print(f"wrote {args.json}")
+
+    return 0 if ctrl_ok else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

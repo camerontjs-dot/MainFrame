@@ -36,6 +36,32 @@ MainFrame uses **two equivalent graph channels**. MindGraph indexes **both** at 
 
 **Non-resolving targets** (project slugs, external URLs, ambiguous slugs) may remain in `links:` as intent markers; they stay dangling in the graph until the target exists or a bridge is approved.
 
+### Graph authorship and review disposition
+
+Body wikilinks remain the canonical readable edge. Existing untyped links are
+valid and do not need to be rewritten. For new typed body links, use only the
+small optional vocabulary already accepted by the parser:
+`evidence`, `extends`, `contrasts`, `implements`, or `navigation`, written as
+`[[target]] (relationship)`. A relationship label is descriptive metadata, not
+claim verification.
+
+Use a canonical path or full filename stem when a slug is not unique. A
+trailing slug is a safe alias only when the current parser resolves it to one
+target in the same ingest scope. Do not fuzzy-select, invent, or bulk-add
+links. A source rename requires an audit before and after the rename; only an
+unambiguous canonical/alias resolution may be reviewed for repair, followed by
+the normal refresh and probe sequence.
+
+Raw evidence documents are expected to be leaves by default. Their zero
+resolved authored outbound links are an informational classification queue,
+not a health failure and not proof that every raw item is intentionally
+isolated. Curated `type: note` documents should have at least one supported
+resolved relationship when one exists. If source inspection finds no valid
+relationship, record `graph_disposition: reviewed-no-link` or
+`graph_disposition: standalone` in the note's frontmatter; never add a
+fabricated edge to satisfy a metric. The audit reports these valid dispositions
+as reviewed/informational rather than actionable zero-outbound defects.
+
 ## Optional Source Metadata
 
 Captured material may include additional provenance fields when they are available. These fields are optional and should not block ingest:

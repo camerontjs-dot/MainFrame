@@ -15,9 +15,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +39,20 @@ KNOWLEDGE = ROOT / "10_knowledge"
 USER_AGENT = "MainFrame-fetch-source-text/1.0 (mailto:mainframe@local)"
 EXCERPT_MAX = 6000
 HTTP_TIMEOUT = 45
+HTTP_MAX_BYTES = 25 * 1024 * 1024
+LOCK_RETRIES = 4
+
+
+class PathScopeError(ValueError):
+    """Raised when a requested stub is outside the durable knowledge tree."""
+
+
+class DownloadTooLargeError(urllib.error.URLError):
+    """Raised when a remote response exceeds the configured download bound."""
+
+
+class ConcurrentUpdateError(RuntimeError):
+    """Raised when a stub changes while an atomic update is being prepared."""
 
 
 @dataclass
@@ -112,16 +129,38 @@ def extract_identifiers(fm: dict[str, str]) -> tuple[str | None, str | None]:
     return doi, pmid
 
 
-def http_get(url: str, accept: str = "*/*") -> bytes:
+def http_get(
+    url: str,
+    accept: str = "*/*",
+    *,
+    max_bytes: int = HTTP_MAX_BYTES,
+) -> bytes:
     url = normalize_source_url(url) if " " in url or ";" in url else url
     if not url.startswith(("http://", "https://")):
         raise urllib.error.URLError(f"unsupported URL: {url!r}")
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
     req = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT, "Accept": accept},
     )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return resp.read()
+        content_length = resp.headers.get("Content-Length")
+        if content_length:
+            try:
+                declared_bytes = int(content_length)
+            except (TypeError, ValueError):
+                declared_bytes = -1
+            if declared_bytes > max_bytes:
+                raise DownloadTooLargeError(
+                    f"response declares {declared_bytes} bytes; limit is {max_bytes}"
+                )
+        data = resp.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise DownloadTooLargeError(
+                f"response exceeded download limit of {max_bytes} bytes"
+            )
+        return data
 
 
 def http_get_json(url: str) -> Any:
@@ -546,21 +585,172 @@ def apply_result(path: Path, original: str, result: FetchResult, today: str) -> 
     return f"---\n{header}\n---\n{body}"
 
 
+def resolve_knowledge_file(path: Path) -> Path:
+    """Resolve an existing Markdown stub and keep it inside 10_knowledge/."""
+    knowledge_root = KNOWLEDGE.resolve()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise PathScopeError(f"stub does not exist: {path}") from exc
+    try:
+        resolved.relative_to(knowledge_root)
+    except ValueError as exc:
+        raise PathScopeError(
+            f"stub must be inside {knowledge_root}: {path}"
+        ) from exc
+    if not resolved.is_file():
+        raise PathScopeError(f"stub is not a regular file: {path}")
+    if resolved.suffix.lower() != ".md":
+        raise PathScopeError(f"stub must be a Markdown file: {path}")
+    return resolved
+
+
+def resolve_knowledge_directory(path: Path) -> Path:
+    """Resolve a requested scan root without permitting traversal escapes."""
+    knowledge_root = KNOWLEDGE.resolve()
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(knowledge_root)
+    except ValueError as exc:
+        raise PathScopeError(
+            f"subset must stay inside {knowledge_root}: {path}"
+        ) from exc
+    return resolved
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _same_version(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def atomic_replace_text(
+    path: Path,
+    text: str,
+    *,
+    expected: os.stat_result,
+) -> None:
+    """Durably replace a file, refusing a known competing modification."""
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            temp_path = Path(tmp.name)
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(temp_path, stat.S_IMODE(expected.st_mode))
+
+        current = os.stat(path, follow_symlinks=False)
+        if not _same_version(expected, current):
+            raise ConcurrentUpdateError(f"stub changed before replace: {path}")
+
+        os.replace(temp_path, path)
+        temp_path = None
+
+        try:
+            parent_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            # Some filesystems do not support directory fsync. The file replace
+            # is still atomic; only the extra crash-durability barrier is absent.
+            pass
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def apply_result_atomically(
+    path: Path,
+    result: FetchResult,
+    *,
+    today: str,
+    force: bool,
+) -> bool:
+    """Apply a fetched section once, preserving edits from competing runs."""
+    path = resolve_knowledge_file(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+
+    for _ in range(LOCK_RETRIES):
+        fd = os.open(path, os.O_RDONLY | nofollow)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked_stat = os.fstat(fd)
+            path_stat = os.stat(path, follow_symlinks=False)
+            if not _same_file(locked_stat, path_stat):
+                continue
+
+            # Re-resolve after taking the lock so a swapped symlink or parent
+            # cannot redirect the update beyond the knowledge tree.
+            if resolve_knowledge_file(path) != path:
+                raise ConcurrentUpdateError(f"stub path changed before apply: {path}")
+
+            with os.fdopen(os.dup(fd), "r", encoding="utf-8") as current_file:
+                original = current_file.read()
+            current_fm, current_body = parse_frontmatter(original)
+            if current_fm.get("type", "").lower() != "raw":
+                return False
+            if has_fulltext_section(current_body) and not force:
+                return False
+
+            updated = apply_result(path, original, result, today)
+            atomic_replace_text(path, updated, expected=locked_stat)
+            return True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    raise ConcurrentUpdateError(f"stub kept changing while acquiring lock: {path}")
+
+
 def find_stubs(subset: str | None, file_arg: str | None) -> list[Path]:
     if file_arg:
         p = Path(file_arg)
         if not p.is_absolute():
             p = ROOT / p
-        return [p] if p.is_file() else []
-    base = KNOWLEDGE / subset if subset else KNOWLEDGE
+        return [resolve_knowledge_file(p)]
+    base = resolve_knowledge_directory(KNOWLEDGE / subset if subset else KNOWLEDGE)
     if not base.is_dir():
         return []
     out: list[Path] = []
+    seen: set[Path] = set()
     for p in sorted(base.rglob("*.md")):
         if p.name.lower() == "index.md":
             continue
         if "__raw__" in p.name or p.parent.name == "raw":
-            out.append(p)
+            try:
+                resolved = resolve_knowledge_file(p)
+            except PathScopeError:
+                continue
+            if resolved not in seen:
+                seen.add(resolved)
+                out.append(resolved)
     return out
 
 
@@ -583,7 +773,10 @@ def main(argv: list[str] | None = None) -> int:
         or __import__("os").environ.get("MAINFRAME_UNPAYWALL_EMAIL")
     )
 
-    stubs = find_stubs(args.subset, args.file)
+    try:
+        stubs = find_stubs(args.subset, args.file)
+    except PathScopeError as exc:
+        parser.error(str(exc))
     results: list[FetchResult] = []
     for path in stubs:
         try:
@@ -598,9 +791,22 @@ def main(argv: list[str] | None = None) -> int:
             )
         results.append(result)
         if args.apply and result.section and result.status in ("fetched", "pending", "na"):
-            original = path.read_text(encoding="utf-8")
-            updated = apply_result(path, original, result, today)
-            path.write_text(updated, encoding="utf-8")
+            try:
+                applied = apply_result_atomically(
+                    path,
+                    result,
+                    today=today,
+                    force=args.force,
+                )
+            except (OSError, PathScopeError, ConcurrentUpdateError) as exc:
+                result.status = "error"
+                result.section = ""
+                result.message = f"apply failed: {exc}"
+            else:
+                if not applied:
+                    result.status = "skipped"
+                    result.section = ""
+                    result.message = "stub changed before apply; left unchanged"
 
     if args.json:
         print(json.dumps([asdict(r) for r in results], indent=2))

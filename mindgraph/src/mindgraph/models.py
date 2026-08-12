@@ -62,6 +62,8 @@ class QueryResult(BaseModel):
     source_root: str | None = None
     source_path: str | None = None
     display_path: str | None = None
+    content_hash: str | None = None
+    eligibility_run_id: str | None = None
     signal: Signal
     rrf_score: float
     lexical_rank: int | None
@@ -69,6 +71,15 @@ class QueryResult(BaseModel):
     semantic_distance: float | None = None
     weak_fit: bool = False
     query_scope_warning: QueryScopeWarning | None = None
+    #: Set when the source document is quarantined or otherwise not citable.
+    #: Travels on EVERY chunk, which is the whole point: on 2026-08-09, 103
+    #: captures with fabricated citations were found in `10_knowledge/`. Each
+    #: carried a `needs-audit` tag and later a body banner — but a banner only
+    #: appears in chunk 0, and a frontmatter tag never appears in chunk text at
+    #: all. A query landing on chunk 3 returned authoritative-looking prose with
+    #: no indication the source did not exist. A trust flag that is invisible at
+    #: query time is not a control.
+    provenance_warning: str | None = None
     chunk_text: str
     expansion_depth: int = 0
     association_depth: int = 0

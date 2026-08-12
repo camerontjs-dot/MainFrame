@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Does every raw capture in 10_knowledge/ have an ingest record?
+
+The third and most important layer of the ingest boundary, because it is the only
+one that cannot be bypassed by a tool nobody remembered to guard. The PreToolUse
+hook guards agent writes; the provenance gate guards `minion.py`; **this checks
+the resulting state** and therefore catches whatever got in by any route at all,
+including routes that do not exist yet.
+
+## What it found on 2026-08-10, the first time it ran
+
+    10_knowledge/ files:            2,879
+    with an ingest-log record:      1,747  (61%)
+    with none:                      1,132  (39%)
+
+    of those, `type: raw`:            449   <- protocol violations
+    written in the preceding 10 days: 395
+
+Notes and run-notes dominate the unlogged population and that is correct: they are
+authored in place by design. **Raw captures are the violation**, because a raw is
+by definition something retrieved from outside, and the ingest gate is where
+provenance gets checked.
+
+The 2026-08-07 fabricated-citation batch sits inside that 449.
+
+## Reading the output
+
+A finding here is not an accusation of fabrication. It says the file skipped the
+check, so nobody knows either way. Run `bin/capture-validate` on the listed paths
+to find out which of them actually carry unearned citations.
+
+Usage:
+  bin/knowledge-reconcile                 # summary
+  bin/knowledge-reconcile --list          # every unlogged raw
+  bin/knowledge-reconcile --since 2026-08 # only recent
+  bin/knowledge-reconcile --json out.json
+  bin/knowledge-reconcile --fail-on-new   # CI: nonzero if any unlogged raw exists
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+KNOWLEDGE = ROOT / "10_knowledge"
+LOGS = [ROOT / "01_ingest" / "ingest-log.md", ROOT / "01_ingest" / "prep-ingest-log.md"]
+
+# Types authored directly in 10_knowledge by design. Not violations.
+AUTHORED_TYPES = {
+    "note", "index", "source-literature-run", "synthesis", "project",
+    "lab-report", "adr", "decision", "incident-finding", "draft",
+}
+
+FILENAME_RE = re.compile(r"([0-9A-Za-z_.\-]+\.md)")
+TYPE_RE = re.compile(r'^type:\s*"?([A-Za-z-]+)"?', re.M)
+DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def logged_basenames() -> set[str]:
+    names: set[str] = set()
+    for log in LOGS:
+        if log.exists():
+            names |= set(FILENAME_RE.findall(log.read_text(encoding="utf-8", errors="replace")))
+    return names
+
+
+def doc_type(path: Path) -> str | None:
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace")[:1500]
+    except OSError:
+        return None
+    m = TYPE_RE.search(head)
+    return m.group(1).lower() if m else None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--since", type=str, default="", help="YYYY-MM or YYYY-MM-DD prefix")
+    ap.add_argument("--json", type=str, default="")
+    ap.add_argument("--fail-on-new", action="store_true")
+    args = ap.parse_args()
+
+    logged = logged_basenames()
+    if not logged:
+        print("ERROR: no ingest log found or it is empty. Cannot reconcile — "
+              "reporting nothing rather than reporting everything as a violation.",
+              file=sys.stderr)
+        return 2
+
+    total = 0
+    by_type: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
+    violations: list[Path] = []
+
+    for path in KNOWLEDGE.rglob("*.md"):
+        total += 1
+        dtype = doc_type(path) or "(none)"
+        is_logged = path.name in logged
+        by_type[dtype][0 if is_logged else 1] += 1
+        if not is_logged and dtype == "raw":
+            if args.since and not (m := DATE_RE.search(path.name)) or (
+                args.since and not m.group(1).startswith(args.since)
+            ):
+                continue
+            violations.append(path)
+
+    unlogged_total = sum(v[1] for v in by_type.values())
+    print(f"10_knowledge files:        {total}")
+    print(f"  with an ingest record:   {total - unlogged_total}"
+          f"  ({100 * (total - unlogged_total) / max(total, 1):.0f}%)")
+    print(f"  with none:               {unlogged_total}"
+          f"  ({100 * unlogged_total / max(total, 1):.0f}%)")
+
+    print(f"\n{'type':<24}{'logged':>8}{'unlogged':>10}{'%':>6}")
+    for t, (a, b) in sorted(by_type.items(), key=lambda kv: -(kv[1][0] + kv[1][1])):
+        if a + b < 5:
+            continue
+        note = "  <- authored in place, expected" if t in AUTHORED_TYPES else ""
+        print(f"{t:<24}{a:>8}{b:>10}{100 * b / (a + b):>5.0f}%{note}")
+
+    print(f"\n*** VIOLATIONS: {len(violations)} `type: raw` capture(s) with no ingest record ***")
+    if violations:
+        print("    A raw is by definition retrieved from outside. Skipping ingest skips")
+        print("    the provenance gate, so nobody knows whether its citation is real.")
+        months = collections.Counter(
+            m.group(1)[:7] for p in violations if (m := DATE_RE.search(p.name))
+        )
+        print("\n    by month: " + ", ".join(f"{k} {v}" for k, v in sorted(months.items())))
+        domains = collections.Counter(
+            str(p.relative_to(KNOWLEDGE)).split("/")[0] for p in violations
+        )
+        print("    by domain: " + ", ".join(f"{k} {v}" for k, v in domains.most_common(6)))
+        print(f"\n    Next: bin/capture-validate {' '.join(str(p.relative_to(ROOT)) for p in violations[:2])} ...")
+
+    if args.list:
+        print()
+        for p in sorted(violations):
+            print(f"  {p.relative_to(ROOT)}")
+
+    if args.json:
+        Path(args.json).write_text(json.dumps({
+            "as_of": date.today().isoformat(),
+            "total": total,
+            "unlogged": unlogged_total,
+            "violations": [str(p.relative_to(ROOT)) for p in sorted(violations)],
+            "by_type": {t: {"logged": a, "unlogged": b} for t, (a, b) in by_type.items()},
+        }, indent=2), encoding="utf-8")
+        print(f"\nwrote {args.json}")
+
+    return 1 if (args.fail_on_new and violations) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

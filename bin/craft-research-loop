@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+"""Craft research loop — product/trial-and-error research with finishable FINDINGS.
+
+Separate from research-lane-loop (literature) and project-experiment-loop (evals).
+
+Commands:
+  preflight --project <slug>
+  scaffold  --project <slug> --question ... --decision ... [--slug ...]
+  close     --project <slug> --trial <id> --verdict keep|kill|iterate --findings ...
+  triage    --project <slug>
+  promote   --project <slug> --trial <id> --to knowledge|experiment|lane
+
+See .context/workflows/craft-research-loop.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS = ROOT / "30_projects"
+TEMPLATE = ROOT / ".context" / "templates" / "craft-trial.md"
+WORKFLOW = ROOT / ".context" / "workflows" / "craft-research-loop.md"
+TODAY = date.today().isoformat()
+
+
+def project_dir(slug: str) -> Path:
+    p = PROJECTS / slug
+    if not p.is_dir():
+        raise SystemExit(f"Project not found: {p}")
+    return p
+
+
+def parse_frontmatter(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in text[3:end].splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def set_frontmatter_field(path: Path, key: str, value: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return
+    end = text.find("\n---", 3)
+    if end < 0:
+        return
+    block = text[3:end]
+    body = text[end:]
+    pattern = rf"(?m)^{re.escape(key)}:\s*.*$"
+    line = f'{key}: "{value}"'
+    if re.search(pattern, block):
+        block = re.sub(pattern, line, block)
+    else:
+        block = block.rstrip() + "\n" + line + "\n"
+    path.write_text("---" + block + body, encoding="utf-8")
+
+
+def proof_index_path(proj: Path) -> Path:
+    # Prefer outputs/RESEARCH_PROOF_INDEX.md; allow README pointer later
+    return proj / "outputs" / "RESEARCH_PROOF_INDEX.md"
+
+
+def action_card_path(proj: Path) -> Path:
+    return proj / "outputs" / "LAST_CRAFT_ACTION.md"
+
+
+def list_trial_dirs(proj: Path) -> list[Path]:
+    outputs = proj / "outputs"
+    if not outputs.is_dir():
+        return []
+    trials: list[Path] = []
+    for p in sorted(outputs.iterdir()):
+        if not p.is_dir():
+            continue
+        if p.name.startswith("."):
+            continue
+        # Heuristic: trial folders are dated or contain TRIAL/FINDINGS
+        if re.match(r"^\d{4}-\d{2}-\d{2}", p.name) or (p / "TRIAL.md").exists() or (
+            p / "FINDINGS.md"
+        ).exists():
+            trials.append(p)
+    return trials
+
+
+def trial_status(trial: Path) -> str:
+    findings = trial / "FINDINGS.md"
+    trial_md = trial / "TRIAL.md"
+    if findings.exists():
+        text = findings.read_text(encoding="utf-8", errors="replace").lower()
+        # closed only when verdict is explicit keep|kill|iterate
+        for v in ("keep", "kill", "iterate"):
+            if re.search(rf"`{v}`|\*\*{v}\*\*|verdict:\s*{v}|\bverdict\b[^\n]*\b{v}\b", text):
+                # open findings template has `open`
+                if v == "open":
+                    continue
+                return v
+        if re.search(r"`open`|verdict:\s*open|status:\s*\*\*open\*\*", text):
+            return "running"
+        if "verdict" in text:
+            return "findings-present"
+        return "findings-present"
+    if trial_md.exists():
+        fm = parse_frontmatter(trial_md)
+        v = (fm.get("verdict") or "").lower()
+        if v in {"keep", "kill", "iterate"}:
+            return v
+        st = (fm.get("status") or "").lower()
+        if st in {"complete", "closed"}:
+            return "closed"
+        return "running"
+    return "artifact-only"
+
+
+def cmd_preflight(project: str) -> int:
+    proj = project_dir(project)
+    fm = parse_frontmatter(proj / "README.md")
+    proof = proof_index_path(proj)
+    trials = list_trial_dirs(proj)
+    open_t = [t for t in trials if trial_status(t) in {"running", "open", "artifact-only", "findings-present"}]
+    closed = [t for t in trials if trial_status(t) in {"keep", "kill", "iterate", "closed"}]
+
+    print(f"# Craft research preflight — {project}")
+    print()
+    print(f"- **path:** `{proj.relative_to(ROOT)}`")
+    print(f"- **project_state:** {fm.get('project_state') or fm.get('status') or '?'}")
+    print(f"- **next_action:** {(fm.get('next_action') or '')[:160]}")
+    print(f"- **proof index:** {'yes' if proof.exists() else 'MISSING (will create on first close)'}")
+    print(f"- **trial folders:** {len(trials)} (open-ish={len(open_t)}, closed-ish={len(closed)})")
+    if open_t:
+        print()
+        print("## Open / incomplete trials")
+        for t in open_t[:12]:
+            print(f"- `{t.relative_to(ROOT)}` status={trial_status(t)}")
+    print()
+    print("## Next")
+    print("1. scaffold a trial (or close an open one)")
+    print("2. run workbench procedure")
+    print("3. close with --verdict keep|kill|iterate")
+    print(f"Workflow: `{WORKFLOW.relative_to(ROOT)}`")
+    return 0
+
+
+def cmd_scaffold(
+    project: str,
+    question: str,
+    decision: str,
+    slug: str | None,
+    hypothesis: str | None,
+) -> int:
+    proj = project_dir(project)
+    out = proj / "outputs"
+    out.mkdir(parents=True, exist_ok=True)
+    slug_clean = re.sub(r"[^a-z0-9-]+", "-", (slug or question[:40]).lower()).strip("-")[:48]
+    trial_id = f"{TODAY}-{slug_clean}"
+    trial_dir = out / trial_id
+    if trial_dir.exists():
+        print(f"Refusing overwrite: {trial_dir}", file=sys.stderr)
+        return 1
+    trial_dir.mkdir(parents=True)
+
+    fm_domain = parse_frontmatter(proj / "README.md").get("domain", "general")
+    trial_body = f"""---
+title: "Craft trial — {slug_clean}"
+domain: "{fm_domain}"
+type: "project"
+status: "running"
+craft_trial_id: "{trial_id}"
+project: "{project}"
+verdict: "open"
+decision_sentence: "{decision.replace('"', "'")}"
+tags: ["craft-research", "trial"]
+updated: "{TODAY}"
+source: "bin/craft-research-loop scaffold"
+---
+
+# Craft trial — {slug_clean}
+
+## Question
+
+{question}
+
+## Decision this trial supports
+
+{decision}
+
+## Hypothesis
+
+{hypothesis or "(state expected result before ranking outputs)"}
+
+## Success criteria
+
+(define before reviewing winners)
+
+## Fixed inputs
+
+- assets:
+- models / stack:
+- hardware:
+- software versions:
+
+## Variables
+
+- independent:
+- controlled:
+- observed:
+
+## Procedure
+
+1.
+2.
+3.
+
+## Run table
+
+| Run | Config | Result | Notes |
+|-----|--------|--------|-------|
+
+## Observations
+
+(facts only — fill during/after runs)
+
+## Interpretation
+
+(inferences labeled)
+
+## Limitations
+
+## Verdict
+
+`open`
+
+### If keep / kill / iterate
+
+(fill at close)
+
+## Promotion
+
+- [ ] none (local product only)
+- [ ] decisions.md
+- [ ] extract-knowledge / research-lane-loop
+- [ ] project-experiment-loop
+"""
+    (trial_dir / "TRIAL.md").write_text(trial_body, encoding="utf-8")
+    (trial_dir / "FINDINGS.md").write_text(
+        f"""# FINDINGS — {trial_id}
+
+Status: **open** (fill at close via `bin/craft-research-loop close`)
+
+## Observations
+
+## Interpretation
+
+## Limitations
+
+## Verdict
+
+`open`
+
+## Next trial (if iterate)
+
+## Promotion
+
+none yet
+""",
+        encoding="utf-8",
+    )
+
+    # ensure proof index exists
+    proof = proof_index_path(proj)
+    if not proof.exists():
+        proof.write_text(
+            f"""# Research / craft proof index — {project}
+
+Curated evidence only. Ephemeral intermediates should be culled at trial close.
+
+## Open trials
+
+| Trial | Question | Status |
+|-------|----------|--------|
+| `{trial_id}` | {question[:80]} | running |
+
+## Keep (canonical proof)
+
+| Path | Why it stays |
+|------|----------------|
+| | |
+
+## Removed
+
+| Path | Why removed |
+|------|-------------|
+| | |
+
+## How to re-run
+
+See project `plans/` and latest `LAST_CRAFT_ACTION.md`.
+
+Updated: {TODAY}
+""",
+            encoding="utf-8",
+        )
+    else:
+        text = proof.read_text(encoding="utf-8")
+        if "## Open trials" in text and trial_id not in text:
+            text = text.replace(
+                "## Open trials",
+                f"## Open trials\n\n| `{trial_id}` | {question[:60]} | running |",
+                1,
+            )
+            # if table header missing, still ok
+            proof.write_text(text, encoding="utf-8")
+        elif "## Open trials" not in text:
+            proof.write_text(
+                text.rstrip()
+                + f"\n\n## Open trials\n\n| Trial | Question | Status |\n|-------|----------|--------|\n| `{trial_id}` | {question[:60]} | running |\n",
+                encoding="utf-8",
+            )
+
+    next_a = f"Execute craft trial `{trial_id}` then close with keep|kill|iterate."
+    set_frontmatter_field(proj / "README.md", "next_action", next_a)
+    set_frontmatter_field(proj / "README.md", "updated", TODAY)
+    write_action_card(
+        proj,
+        severity="info",
+        primary=next_a,
+        extras=[
+            f"Scaffolded `{trial_dir.relative_to(ROOT)}`",
+            f"Question: {question}",
+        ],
+    )
+    print(f"Wrote {trial_dir.relative_to(ROOT)}/TRIAL.md")
+    print(f"craft_trial_id={trial_id}")
+    print("Next: execute procedure, then:")
+    print(
+        f"  bin/craft-research-loop close --project {project} "
+        f"--trial {trial_id} --verdict keep|kill|iterate --findings \"...\""
+    )
+    return 0
+
+
+def ensure_findings(
+    trial_dir: Path,
+    trial_id: str,
+    verdict: str,
+    findings: str,
+    question: str,
+) -> None:
+    path = trial_dir / "FINDINGS.md"
+    body = f"""# FINDINGS — {trial_id}
+
+Closed: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+Verdict: **{verdict}**
+
+## Question
+
+{question}
+
+## Observations
+
+{findings}
+
+## Interpretation
+
+(see observations; expand if needed)
+
+## Limitations
+
+Single-trial craft result — not a formal eval-registry study unless promoted.
+
+## Verdict
+
+`{verdict}`
+
+## Promotion
+
+- none unless explicitly run `craft-research-loop promote`
+"""
+    path.write_text(body, encoding="utf-8")
+
+
+def update_proof_index_on_close(
+    proj: Path, trial_id: str, verdict: str, findings: str
+) -> None:
+    """G11: maintain Keep/Removed/Open tables without duplicate section noise."""
+    proof = proof_index_path(proj)
+    rel = f"outputs/{trial_id}/"
+    why = findings.replace("\n", " ").replace("|", "/")[:120]
+    header = (
+        f"# Research / craft proof index — {proj.name}\n\n"
+        "Curated evidence only. Ephemeral intermediates should be culled at trial close.\n\n"
+        f"Last close: {TODAY}\n\n"
+    )
+
+    def _parse_table_rows(section_body: str) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        for line in section_body.splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if len(cells) < 2:
+                continue
+            if cells[0].lower() in {"path", "trial"} or set(cells[0]) <= {"-"}:
+                continue
+            rows.append((cells[0], cells[1]))
+        return rows
+
+    def _extract_sections(src: str) -> dict[str, str]:
+        parts = re.split(r"(?m)^(## .+)$", src)
+        sections: dict[str, str] = {"_preamble": parts[0] if parts else ""}
+        i = 1
+        while i < len(parts) - 1:
+            sections[parts[i].strip()] = parts[i + 1]
+            i += 2
+        return sections
+
+    raw = proof.read_text(encoding="utf-8") if proof.exists() else header
+    sections = _extract_sections(raw)
+    keep_key = next((k for k in sections if k.lower().startswith("## keep")), "## Keep")
+    rem_key = next((k for k in sections if k.lower().startswith("## removed")), "## Removed")
+    open_key = next((k for k in sections if "open" in k.lower()), "## Open trials")
+
+    keep_rows = _parse_table_rows(sections.get(keep_key, ""))
+    rem_rows = _parse_table_rows(sections.get(rem_key, ""))
+    open_rows = _parse_table_rows(sections.get(open_key, ""))
+
+    def _drop(rows: list[tuple[str, str]], needle: str) -> list[tuple[str, str]]:
+        return [r for r in rows if needle not in r[0] and needle not in r[1]]
+
+    keep_rows = _drop(keep_rows, trial_id)
+    rem_rows = _drop(rem_rows, trial_id)
+    open_rows = _drop(open_rows, trial_id)
+
+    if verdict == "keep":
+        keep_rows.append((f"`{rel}`", why))
+    elif verdict == "kill":
+        rem_rows.append((f"`{rel}`", f"killed: {why}"))
+    else:
+        open_rows.append((f"`{trial_id}`", "iterate — see FINDINGS; closed→next"))
+
+    def _fmt(title: str, h0: str, h1: str, rows: list[tuple[str, str]]) -> str:
+        out_lines = [title, "", f"| {h0} | {h1} |", "|------|-----|"]
+        for a, b in rows:
+            out_lines.append(f"| {a} | {b} |")
+        out_lines.append("")
+        return "\n".join(out_lines)
+
+    body = (
+        header
+        + _fmt("## Keep", "Path", "Why", keep_rows)
+        + "\n"
+        + _fmt("## Removed", "Path", "Why", rem_rows)
+        + "\n"
+        + _fmt("## Open trials", "Trial", "Status", open_rows)
+        + f"\n<!-- craft-research-loop close {TODAY} {trial_id} {verdict} -->\n"
+    )
+    extra = []
+    for k, v in sections.items():
+        if k in {"_preamble", keep_key, rem_key, open_key}:
+            continue
+        if k.startswith("## How") or "re-run" in k.lower():
+            extra.append(f"{k}\n{v.rstrip()}\n")
+    if extra:
+        body = body.rstrip() + "\n\n" + "\n".join(extra) + "\n"
+    proof.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+
+def append_log(proj: Path, entry: str) -> None:
+    log = proj / "log.md"
+    block = f"\n## {TODAY} | craft-research-loop\n\n{entry}\n"
+    if log.exists():
+        log.write_text(log.read_text(encoding="utf-8") + block, encoding="utf-8")
+    else:
+        log.write_text("# Log\n" + block, encoding="utf-8")
+
+
+def write_action_card(
+    proj: Path, *, severity: str, primary: str, extras: list[str] | None = None
+) -> None:
+    lines = [
+        f"# Last craft action — {proj.name}",
+        f"",
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"",
+        f"## Severity: **{severity}**",
+        f"",
+        f"## Primary next action",
+        f"",
+        primary,
+        f"",
+        f"## Notes",
+        f"",
+    ]
+    for e in extras or []:
+        lines.append(f"- {e}")
+    lines.extend(
+        [
+            "",
+            "Project-local (not on last-eval-action.md).",
+            f"Workflow: `{WORKFLOW.relative_to(ROOT)}`",
+            "",
+        ]
+    )
+    out = action_card_path(proj)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines), encoding="utf-8")
+
+
+def cmd_close(
+    project: str,
+    trial: str,
+    verdict: str,
+    findings: str,
+    blocked_on: str | None = None,
+    blocked_reason: str | None = None,
+) -> int:
+    verdict = verdict.lower().strip()
+    if verdict not in {"keep", "kill", "iterate"}:
+        print("verdict must be keep|kill|iterate", file=sys.stderr)
+        return 2
+    proj = project_dir(project)
+    trial_dir = proj / "outputs" / trial
+    if not trial_dir.is_dir():
+        # allow bare slug match
+        matches = [p for p in list_trial_dirs(proj) if p.name == trial or p.name.endswith(trial)]
+        if not matches:
+            print(f"Trial folder not found under outputs/: {trial}", file=sys.stderr)
+            return 1
+        trial_dir = matches[0]
+        trial = trial_dir.name
+
+    question = ""
+    trial_md = trial_dir / "TRIAL.md"
+    if not trial_md.exists():
+        # Legacy artifact folder close — write minimal TRIAL.md for loop shape
+        trial_md.write_text(
+            f"""---
+title: "Craft trial — {trial}"
+domain: "general"
+type: "project"
+status: "complete"
+craft_trial_id: "{trial}"
+project: "{project}"
+verdict: "{verdict}"
+decision_sentence: "Retroactive craft close"
+tags: ["craft-research", "trial", "retroactive"]
+updated: "{TODAY}"
+source: "bin/craft-research-loop close"
+---
+
+# Craft trial — {trial}
+
+## Question
+
+(retroactive close — see FINDINGS)
+
+## Verdict
+
+`{verdict}`
+""",
+            encoding="utf-8",
+        )
+    if trial_md.exists():
+        t = trial_md.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"## Question\s*\n+(.+?)(\n## |\Z)", t, re.S)
+        if m:
+            question = m.group(1).strip()
+        set_frontmatter_field(trial_md, "verdict", verdict)
+        set_frontmatter_field(trial_md, "status", "complete")
+        set_frontmatter_field(trial_md, "updated", TODAY)
+
+    ensure_findings(trial_dir, trial, verdict, findings, question or "(see FINDINGS)")
+    update_proof_index_on_close(proj, trial, verdict, findings)
+
+    blocked_on = (blocked_on or "").strip().lower() or None
+    if verdict == "iterate" and blocked_on == "operator":
+        reason = (blocked_reason or "").strip() or "operator step required"
+        next_a = (
+            f"Waiting on operator ({reason}) before continuing from `{trial}`."
+        )
+        sev = "info"
+    elif verdict == "iterate":
+        next_a = f"Open next craft trial continuing from `{trial}` (iterate)."
+        sev = "medium"
+    elif verdict == "keep":
+        next_a = f"Adopt keep from `{trial}`; optional decisions.md + next product step."
+        sev = "info"
+    else:
+        next_a = f"Record kill from `{trial}`; do not re-run without new hypothesis."
+        sev = "medium"
+
+    set_frontmatter_field(proj / "README.md", "next_action", next_a)
+    set_frontmatter_field(proj / "README.md", "updated", TODAY)
+
+    append_log(
+        proj,
+        f"- **Trial:** `{trial}`\n- **Verdict:** {verdict}\n- **Findings:** {findings[:300]}\n"
+        f"- **Proof index:** updated\n- **Action:** {next_a}"
+        + (f"\n- **blocked_on:** {blocked_on} ({blocked_reason})" if blocked_on else ""),
+    )
+    extras = [f"Closed `{trial}` with verdict={verdict}", findings[:200]]
+    if blocked_on:
+        extras.insert(0, f"blocked_on={blocked_on}: {blocked_reason or ''}")
+    write_action_card(
+        proj,
+        severity=sev,
+        primary=next_a,
+        extras=extras,
+    )
+    print(f"Closed {trial_dir.relative_to(ROOT)} verdict={verdict}")
+    print(f"Wrote {action_card_path(proj).relative_to(ROOT)}")
+    print(f"next_action: {next_a}")
+    if verdict == "iterate":
+        print("Tip: scaffold the follow-up trial now with a tighter question.")
+    return 0
+
+
+def cmd_triage(project: str) -> int:
+    proj = project_dir(project)
+    fm = parse_frontmatter(proj / "README.md")
+    trials = list_trial_dirs(proj)
+    open_t = []
+    closed = []
+    for t in trials:
+        st = trial_status(t)
+        if st in {"keep", "kill", "iterate", "closed"}:
+            closed.append((t, st))
+        else:
+            open_t.append((t, st))
+
+    # Prefer formal running trials (TRIAL.md) over legacy artifact-only folders
+    running = [(t, s) for t, s in open_t if s == "running"]
+    running.sort(key=lambda x: x[0].name, reverse=True)  # newest date-slug first
+    legacy = [(t, s) for t, s in open_t if s != "running"]
+
+    proof = proof_index_path(proj)
+    extras = [
+        f"proof_index={'yes' if proof.exists() else 'MISSING'}",
+        f"open_trials={len(open_t)} (formal_running={len(running)}) closed_ish={len(closed)}",
+    ]
+    for t, st in (running + legacy)[:10]:
+        extras.append(f"open: {t.name} ({st})")
+
+    na = fm.get("next_action") or ""
+    if running:
+        primary = (
+            f"Execute then close formal trial `{running[0][0].name}` "
+            f"(keep|kill|iterate)."
+        )
+        sev = "info"
+    elif na and "craft trial" in na.lower():
+        primary = na
+        sev = "info"
+    elif legacy:
+        primary = (
+            f"Backfill craft close on legacy proof `{legacy[0][0].name}` "
+            f"or ignore if already in RESEARCH_PROOF_INDEX Keep table."
+        )
+        sev = "low"
+    elif na:
+        primary = na
+        sev = "info"
+    else:
+        primary = "Scaffold a craft trial from README goal (one question)."
+        sev = "medium"
+
+    write_action_card(proj, severity=sev, primary=primary, extras=extras)
+    text = action_card_path(proj).read_text(encoding="utf-8")
+    print(text)
+    return 0
+
+
+def cmd_promote(project: str, trial: str, to: str) -> int:
+    proj = project_dir(project)
+    trial_dir = proj / "outputs" / trial
+    if not trial_dir.is_dir():
+        print(f"Trial not found: {trial_dir}", file=sys.stderr)
+        return 1
+    rel = trial_dir.relative_to(ROOT)
+    if to == "knowledge":
+        print("Promotion: durable knowledge")
+        print(f"  1. Review FINDINGS in {rel}")
+        print(
+            f"  2. bin/extract-knowledge --project {project} --domain <domain> "
+            f"--title \"craft lesson from {trial}\" --write"
+        )
+        print("  3. Or capture literature via research-lane-loop if sources external")
+    elif to == "experiment":
+        print("Promotion: formal measured experiment")
+        print(
+            f"  bin/project-experiment-loop scaffold --project {project} "
+            f"--study-type exploratory --title \"{trial}\" "
+            f"--decision \"Graduate craft trial {trial} to measured decision\""
+        )
+        print("  Then run protocol, fill metrics, close/harvest.")
+    elif to == "lane":
+        print("Promotion: research lane")
+        print("  Emit ## Research Lane Candidate in FINDINGS or log, then:")
+        print(f"  bin/lane-intake scan 30_projects/{project}/outputs/{trial}/FINDINGS.md")
+    else:
+        print("to must be knowledge|experiment|lane", file=sys.stderr)
+        return 2
+    append_log(proj, f"- promote `{trial}` → **{to}** (instructions emitted; not auto-executed)")
+    return 0
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Craft research loop CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pf = sub.add_parser("preflight")
+    pf.add_argument("--project", required=True)
+
+    sc = sub.add_parser("scaffold")
+    sc.add_argument("--project", required=True)
+    sc.add_argument("--question", required=True)
+    sc.add_argument("--decision", required=True)
+    sc.add_argument("--slug", default=None)
+    sc.add_argument("--hypothesis", default=None)
+
+    cl = sub.add_parser("close")
+    cl.add_argument("--project", required=True)
+    cl.add_argument("--trial", required=True, help="outputs/<trial-id> folder name")
+    cl.add_argument("--verdict", required=True, choices=["keep", "kill", "iterate"])
+    cl.add_argument("--findings", required=True)
+    cl.add_argument(
+        "--blocked-on",
+        default=None,
+        choices=["operator", "install", "external"],
+        help="G5: iterate waiting on non-agent work (keeps severity info)",
+    )
+    cl.add_argument("--blocked-reason", default=None)
+
+    tr = sub.add_parser("triage")
+    tr.add_argument("--project", required=True)
+
+    pr = sub.add_parser("promote")
+    pr.add_argument("--project", required=True)
+    pr.add_argument("--trial", required=True)
+    pr.add_argument("--to", required=True, choices=["knowledge", "experiment", "lane"])
+
+    args = p.parse_args()
+    if args.cmd == "preflight":
+        raise SystemExit(cmd_preflight(args.project))
+    if args.cmd == "scaffold":
+        raise SystemExit(
+            cmd_scaffold(
+                args.project,
+                args.question,
+                args.decision,
+                args.slug,
+                args.hypothesis,
+            )
+        )
+    if args.cmd == "close":
+        raise SystemExit(
+            cmd_close(
+                args.project,
+                args.trial,
+                args.verdict,
+                args.findings,
+                blocked_on=getattr(args, "blocked_on", None),
+                blocked_reason=getattr(args, "blocked_reason", None),
+            )
+        )
+    if args.cmd == "triage":
+        raise SystemExit(cmd_triage(args.project))
+    if args.cmd == "promote":
+        raise SystemExit(cmd_promote(args.project, args.trial, args.to))
+    p.error(f"unknown {args.cmd}")
+
+
+if __name__ == "__main__":
+    main()

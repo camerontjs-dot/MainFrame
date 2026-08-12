@@ -2,7 +2,7 @@
 
 This directory contains active work with concrete outcomes. Project folders may include the full local workbench for that outcome, but the outer MainFrame repo treats project contents as private ignored state.
 
-## Project States (ADR-041: evidence-based, WIP-capped)
+## Project States (ADR-041 / ADR-046: evidence-based, dual-pool WIP)
 
 `bin/sync-project-index --check` enforces these semantics and fails loudly
 when a state contradicts observed activity (file mtimes + nested-repo
@@ -11,8 +11,17 @@ uses). Self-reported `updated:` is display metadata only; activity truth
 comes from evidence.
 
 - `active`: Work is moving now. Requires activity evidence within the last
-  14 days **and** a `next_action`. **WIP cap: at most 5 projects may be
-  `active`.** Activating a sixth means pausing one first — visibly.
+  14 days **and** a `next_action`. Dual-pool WIP (ADR-046):
+  - **Product seats:** at most **5** `active` projects with `wip_class:
+    product` (default).
+  - **Eval seats:** measurement / eval / instrument projects
+    (`wip_class: eval`, or slug ending in `-eval`, or known eval slugs)
+    may stay `active` **without consuming product seats**.
+  - **Anchor:** strategic hub (`wip_class: anchor`, default for
+    `income-engine`) stays `active` and consumes **neither** product nor
+    total seats — other projects are meant to feed it.
+  - **Total ceiling:** at most **10** product+eval projects may be `active`.
+    Activating past a cap means pausing one first — visibly.
 - `paused`: Deliberately shelved; the healthy default for real-but-not-now
   work. Requires a `next_action` reentry pointer. No evidence requirement.
 - `planned`: Registered but not started; name the activation gate in
@@ -43,6 +52,7 @@ domain: "Broad area"
 type: "project"
 status: "active"
 project_state: "active"
+wip_class: "product"   # optional: product (default) | eval | anchor
 goal: "Outcome this project is meant to produce"
 next_action: "Single next step"
 updated: "YYYY-MM-DD"
@@ -50,6 +60,11 @@ source: "local"
 tags: []
 ---
 ```
+
+`wip_class` is optional. When omitted: `income-engine` → `anchor`; slugs
+ending in `-eval` and the known eval/instrument set (`claim-audit-lab`,
+`skill-eval-workshop`, `scaffold-claims-study`, `reliability-eval-framework`,
+`verified-done`) → `eval`; everything else → `product`.
 
 ## Workbench Layout
 Project folders contain both coordination records and the working project itself. The four coordination entries are required for tracked outcomes; lighter experiments may start with fewer (see create-project workflow for light mode + graduation). The rest exist as needed:
@@ -69,6 +84,8 @@ Project folders contain both coordination records and the working project itself
 **Synthesis & extraction (Fix 3):** After meaningful work, use `bin/extract-knowledge --project <slug> --domain <...> --write` (or the new audit-sweep synthesis signals) to push reusable lessons into `10_knowledge/`. Do not leave durable knowledge trapped in project workbenches.
 
 **Craft / trial-and-error research:** Use `.context/workflows/craft-research-loop.md` and `bin/craft-research-loop` for product bake-offs and stack trials (image lab, integration prototypes). Close every trial with keep|kill|iterate + proof index. Do **not** put craft smokes on `last-eval-action.md` unless promoted via experiment-loop.
+
+**Lab reports (all measured experiments):** Decision-bearing tests use the universal lab-report notebook (question, design, results, irregularities, limits, disposition). Scaffold with `bin/lab-report scaffold --project <slug> …`; convention in `.context/workflows/lab-report.md`. Eval-registry harvest still uses the metric YAML block (eval-output specialization).
 
 The `workbench/` directory may be a nested Git repository, a local source tree, or a collection of drafts and artifacts. A workbench may keep its own internal records (STATUS, DECISIONS, ADRs); the project-level files above stay the coordination surface and point into the workbench rather than duplicating it. Keep reusable lessons in `10_knowledge/` only after an explicit extraction step.
 
@@ -163,24 +180,31 @@ remains the source of truth. See
 
 ## Local Coder Capabilities & Delegation Limits
 
-Based on empirical runs in the `agent-harness-eval` matrix under the `H1-packet` harness, delegation to local coder agent profiles must adhere to the following routing, scope, and verification boundaries:
+Based on empirical runs in `agent-harness-eval` (H1-packet multi-path hard screens 2026-07-18 + earlier matrices). Full per-model Can/Cannot:
+`30_projects/agent-harness-eval/outputs/CAPABILITIES_CARD.md`.
+Usage wishlist: `30_projects/agent-harness-eval/outputs/MAINFRAME_USAGE_ROADMAP.md`.
+**Real-tree dispatch** only for tuples in `workstation/server/graduated-tuples.json` (currently `aider` × `local-qwen25-coder-14b` × `mechanical-edit`).
 
 ### 1. Model Routing Matrix
-- **Multi-File Coordination** (up to 4 files): Route **only** to `local-qwen25-coder-14b`. (Qwen3 and Qwen3.5 profiles fail on multi-file changes and are prone to false completion claims).
-- **Large Context / Search-Heavy Reference**: Route to `local-qwen3-14b` or `local-qwen35-9b` (Qwen2.5-coder is extremely fragile under large contexts). However, tasks assigned to Qwen3/3.5 **must be restricted to single-file edits**.
+- **Multi-File Coordination** (up to 4 files, real-tree): Route to **graduated** `local-qwen25-coder-14b` unless operator adds another tuple. Hard-screen evidence also supports **`local-qwen35-9b`** for *isolated/pilot* multi-file (8/8, two-file 2/2, lighter RAM) — **not** auto-graduated for live trees.
+- **Do not multi-file:** `local-qwen3-14b` (hard two-file 0/2; H2 does not rescue; historical false-completion risk). Same restriction for Gemma-class / devstral / mistral-small on hard suite.
+- **Efficiency multi-file (pilot):** Prefer `local-qwen35-9b` when RAM is tight; prefer `local-qwen25-coder-14b` for default reliability / graduated path.
+- **Large context / search-heavy reference:** Prefer `local-qwen35-9b` or `local-qwen3-14b` for *read* load; keep editable surface single-file unless profile is 14b-coder or pilot 9b multi-file. Qwen2.5-coder remains fragile under huge read-only context — keep refs minimal.
+- **Constrained dry prose / filler:** Prefer `local-qwen35-9b`. **Do not** use `local-qwen25-coder-14b` for P1-style filler (0 auto-clean on fixture-safety).
+- **Claim extraction:** Prefer MLX Llama-3.1-8B + light scaffold (`format_only`); see capabilities card — not the coding profiles.
 
 ### 2. Scope Boundaries
-- **Editable Limit**: Maximum of **4 files** for `local-qwen25-coder-14b`, and **1 file** for `local-qwen3-14b` or `local-qwen35-9b`.
-- **Commit Restriction**: Local agents are strictly prohibited from creating Git commits. The operator maintains exclusive authority over git tree state and merges.
+- **Editable Limit:** Maximum of **4 files** for `local-qwen25-coder-14b` (and for pilot `local-qwen35-9b` multi-file). **1 file** for `local-qwen3-14b` and other non-multi-file profiles.
+- **Commit Restriction:** Local agents are strictly prohibited from creating Git commits. The operator maintains exclusive authority over git tree state and merges.
 
 ### 3. Context Limits
-- **Read-Only Volume**: For `local-qwen25-coder-14b`, reference context files (`read_only_files`) must be minimal and clean (under 100 lines total).
-- **Aider Warning**: Stop and split the task immediately if Aider reports that the estimated context exceeds the model's limit.
+- **Read-Only Volume:** For `local-qwen25-coder-14b`, reference context files (`read_only_files`) must be minimal and clean (under 100 lines total).
+- **Aider Warning:** Stop and split the task immediately if Aider reports that the estimated context exceeds the model's limit.
 
 ### 4. Verification Requirements
 - Every packet **must** declare at least one deterministic verification command.
 - Runs are accepted only when external verification commands pass with exit code `0`.
-- If verification fails, a single fresh-context repair run (`H2-repair` logic) may be performed with the error output and current diff appended.
+- If verification fails, a single fresh-context repair run (`H2-repair` logic) may be performed with the error output and current diff appended. H2 helps **near-miss coders** (e.g. 30b residual); it does **not** rescue wrong model class on multi-file.
 
 ## Agent Protocol
 1. Create projects with the `create-project` workflow.

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLIST="$HOME/Library/LaunchAgents/com.user.mindgraph-daemon.plist"
+STATE_DIR="$HOME/.mindgraph/run"
+LABEL="com.user.mindgraph-daemon"
+DOMAIN="gui/$(id -u)"
+
+usage() {
+  echo "usage: bin/mindgraph-idle-lifecycle activate --confirm-no-active-clients [IDLE_SECONDS]" >&2
+  echo "       bin/mindgraph-idle-lifecycle rollback PLIST_BACKUP" >&2
+}
+
+case "${1:-}" in
+  activate)
+    if [[ "${2:-}" != "--confirm-no-active-clients" ]]; then
+      echo "refusing: activation unloads the live daemon; confirm a verified idle window" >&2
+      usage
+      exit 2
+    fi
+    idle_seconds="${3:-900}"
+    if [[ ! "$idle_seconds" =~ ^[0-9]+$ ]] || (( idle_seconds < 60 )); then
+      echo "refusing: IDLE_SECONDS must be an integer >= 60" >&2
+      exit 2
+    fi
+    if [[ ! -f "$PLIST" ]]; then
+      echo "refusing: expected plist not found: $PLIST" >&2
+      exit 2
+    fi
+    if [[ -e "${PLIST}.disabled" ]]; then
+      echo "refusing: disabled plist target already exists: ${PLIST}.disabled" >&2
+      exit 2
+    fi
+    if ! /usr/libexec/PlistBuddy -c 'Print :KeepAlive' "$PLIST" 2>/dev/null | grep -qx true; then
+      echo "refusing: expected KeepAlive=true plist was not found" >&2
+      exit 2
+    fi
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup="${PLIST}.keepalive-backup-${stamp}"
+    cp -p "$PLIST" "$backup"
+    launchctl bootout "$DOMAIN/$LABEL"
+    mv "$PLIST" "${PLIST}.disabled"
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$idle_seconds" > "$STATE_DIR/idle-lifecycle.enabled"
+    chmod 600 "$STATE_DIR/idle-lifecycle.enabled"
+    echo "idle lifecycle activated; rollback backup: $backup"
+    ;;
+  rollback)
+    backup="${2:-}"
+    if [[ -z "$backup" || ! -f "$backup" ]]; then
+      echo "refusing: provide the exact backup path emitted by activate" >&2
+      exit 2
+    fi
+    rm -f "$STATE_DIR/idle-lifecycle.enabled"
+    if [[ -f "${PLIST}.disabled" ]]; then
+      mv "${PLIST}.disabled" "$PLIST"
+    else
+      cp -p "$backup" "$PLIST"
+    fi
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+    echo "KeepAlive LaunchAgent restored from: $backup"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

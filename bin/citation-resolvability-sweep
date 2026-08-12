@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""G5 — resolution-test every citation-shaped URL in 10_knowledge/.
+
+Built after the 2026-08-09 integrity finding
+(`20_live/security/2026-08-09__fabricated-source-captures-in-10-knowledge.md`),
+which found 21 fabricated DOI citations with a hand-rolled one-off probe. This
+turns that probe into a standing control.
+
+Two independent detectors, deliberately kept separate:
+
+  1. STRUCTURAL (offline, high precision, zero network):
+     DOI suffixes that are human-readable slugs rather than registrant-issued
+     identifiers. `10.1145/retrieval-granularity-2025` is not a DOI shape any
+     registration agency emits. Catches fabrication without touching the wire.
+
+  2. NETWORK (resolution test):
+     Does the identifier resolve at all? doi.org answers 3xx for a registered
+     DOI and 404 for one that was never registered.
+
+**Positive controls run in the same batch.** If a control fails, the run is
+reported as BROKEN-PROBE, never as a clean sweep. A network outage that silently
+reported "all fine" would be worse than not running at all — that is the failure
+mode this guard exists to prevent.
+
+Usage:
+  bin/citation-resolvability-sweep --dry-run          # what would be tested
+  bin/citation-resolvability-sweep --structural-only  # offline detector only
+  bin/citation-resolvability-sweep --run              # full sweep (network)
+  bin/citation-resolvability-sweep --run --limit 50   # bounded smoke test
+  bin/citation-resolvability-sweep --run --json OUT.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+KNOWLEDGE = ROOT / "10_knowledge"
+
+URL_RE = re.compile(r"""https?://[^\s>\]"'`,]+""")
+
+# DOI suffixes legitimately contain parentheses — 10.1016/0895-4356(90)90159-M is
+# a real Elsevier DOI. A regex that stops at the first ')' truncates it and the
+# truncated form 404s, which would be reported as a fabricated citation. That is
+# a false accusation, so parens are balanced rather than excluded.
+# Markdown/HTML also leak into scraped URLs: '&#34' (a stray &quot;), a trailing
+# backslash, a ']( ' from a markdown link. All stripped before probing.
+HTML_JUNK_RE = re.compile(r"(&#\d+;?|&quot;?|&amp;?|\\+)$")
+
+
+def balance_parens(url: str) -> str:
+    """Drop a trailing ')' only when it does not close a '(' inside the URL."""
+    while url.endswith(")") and url.count("(") < url.count(")"):
+        url = url[:-1]
+    return url
+
+
+# Literal placeholders. Distinct from a slug DOI: these are not even trying to
+# look real — they are template text that was never filled in.
+PLACEHOLDER_RE = re.compile(
+    r"(?:/10\.x{3,}/)"           # 10.xxxx/ — unfilled registrant prefix
+    r"|(?:\bx{4,}\b)"            # 2403.xxxx, 2510.xxxxx
+    r"|(?:\b0{5,}\b)"            # 2309.00000, s42256-024-00000-0
+    r"|(?:\b(\d)\1{5,}\b)"       # 3468.888888
+    r"|placeholder|dummy-|/example[-./]",
+    re.I,
+)
+
+# Hosts that carry a bibliographic claim. Social/code/vendor links are excluded:
+# a dead github link is link rot, a dead DOI is a citation that never existed.
+CITATION_HOSTS = (
+    "doi.org",
+    "arxiv.org",
+    "aclanthology.org",
+    "openreview.net",
+    "ncbi.nlm.nih.gov",
+    "dl.acm.org",
+    "ieeexplore.ieee.org",
+    "link.springer.com",
+    "sciencedirect.com",
+    "nature.com",
+    "jmlr.org",
+    "proceedings.mlr.press",
+    "pubmed.ncbi.nlm.nih.gov",
+)
+
+# Known-good, stable, and cheap. If any of these fails the probe is broken.
+POSITIVE_CONTROLS = [
+    "https://doi.org/10.1000/182",  # the DOI Handbook's own DOI
+    "https://doi.org/10.48550/arXiv.2112.07618",
+    "https://arxiv.org/abs/1706.03762",  # Attention Is All You Need
+    "https://aclanthology.org/2020.acl-main.677/",
+]
+
+# Must NOT resolve. Guards the opposite failure: a probe that answers 200 to
+# everything (captive portal, proxy interception) would report a clean sweep.
+NEGATIVE_CONTROLS = [
+    "https://doi.org/10.1145/this-doi-was-invented-for-a-control-2026",
+    "https://arxiv.org/abs/9999.99999",
+]
+
+UA = "MainFrame-citation-sweep/1.0 (integrity audit; local)"
+
+# A registered DOI suffix is registrant-assigned and effectively opaque.
+# Fabrications read like article titles: all-lowercase alphabetic words joined by
+# hyphens, often with a trailing year. This is the detector that found the
+# original 21.
+#
+# Deliberately narrow. Real suffixes carry structure that breaks the pattern:
+#   10.1146/annurev-psych-033020-014116   digit runs that are not years
+#   10.1108/ijcma-02-2018-0027            interleaved numeric segments
+#   10.18653/v1/2023.emnlp-main.397       dots and path segments
+#   10.1038/s41586-020-2649-2             alphanumeric registrant tokens
+# A handful of publishers do mint readable suffixes, so a structural hit is a
+# "check this", not a verdict — it is paired with the network probe below.
+DOI_SLUG_RE = re.compile(
+    r"^10\.\d{4,9}/[a-z]+(?:-[a-z]+){1,}(?:-(?:19|20)\d{2})?$"
+)
+
+
+def strip_trailing_punct(url: str) -> str:
+    url = url.split("](")[0]           # markdown link that swallowed its target
+    url = HTML_JUNK_RE.sub("", url)
+    url = url.rstrip(".,;:'\"`]}>!*_")
+    return balance_parens(url)
+
+
+def is_citation_url(url: str) -> bool:
+    return any(h in url for h in CITATION_HOSTS)
+
+
+def collect_urls() -> dict[str, set[str]]:
+    """url -> set of repo-relative file paths citing it."""
+    index: dict[str, set[str]] = defaultdict(set)
+    for path in KNOWLEDGE.rglob("*.md"):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = str(path.relative_to(ROOT))
+        for raw in URL_RE.findall(text):
+            url = strip_trailing_punct(raw)
+            if is_citation_url(url):
+                index[url].add(rel)
+    return index
+
+
+def doi_suffix(url: str) -> str | None:
+    m = re.search(r"doi\.org/(10\.\d{4,9}/\S+)", url)
+    return m.group(1) if m else None
+
+
+def structural_verdict(url: str) -> str | None:
+    """Offline detector. Returns a reason string when the shape is wrong."""
+    if PLACEHOLDER_RE.search(url):
+        return "unfilled placeholder identifier (template text, never a real ID)"
+    suffix = doi_suffix(url)
+    if suffix and DOI_SLUG_RE.match(suffix.lower()):
+        return "slug-style DOI suffix (not a registrant-issued identifier)"
+    # arXiv IDs have exactly two legal forms. Rather than enumerate fabrication
+    # shapes (the first version matched only hyphenated slugs and so missed
+    # `abs/physalign` and `abs/track4animate3d`), assert the legal form and
+    # reject everything else. Allow-list, not deny-list.
+    m = re.search(r"arxiv\.org/(?:abs|pdf)/([^/?#]+)", url)
+    if m:
+        ident = m.group(1).removesuffix(".pdf")
+        modern = re.fullmatch(r"\d{4}\.\d{4,5}(v\d+)?", ident)
+        legacy = re.fullmatch(r"[a-z-]+(\.[A-Z]{2})?/\d{7}(v\d+)?", ident)
+        if not (modern or legacy):
+            return ("not a valid arXiv ID (must be YYMM.NNNNN or "
+                    "archive/YYMMNNN)")
+    return None
+
+
+def probe(url: str, timeout: float = 20.0) -> dict[str, Any]:
+    """Resolution test. 3xx counts as resolved — doi.org redirects on success."""
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_args, **_kwargs):  # noqa: ANN002
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return {"url": url, "status": resp.status, "resolved": True}
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            return {"url": url, "status": exc.code, "resolved": True}
+        if exc.code in (401, 403, 405, 429):
+            # Bot-blocked, auth-required, or HEAD-unsupported. Not evidence
+            # either way — arXiv's /auth/show-endorsers/ URLs are real pages
+            # behind a login, and calling them fabricated would be wrong.
+            return {
+                "url": url,
+                "status": exc.code,
+                "resolved": None,
+                "note": "inconclusive (blocked, auth-required, or HEAD unsupported)",
+            }
+        return {"url": url, "status": exc.code, "resolved": False}
+    except Exception as exc:  # noqa: BLE001 - network errors are data here
+        return {
+            "url": url,
+            "status": None,
+            "resolved": None,
+            "note": f"inconclusive ({type(exc).__name__}: {exc})",
+        }
+
+
+def run_probes(urls: list[str], workers: int = 12) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(probe, u): u for u in urls}
+        done = 0
+        for fut in as_completed(futures):
+            res = fut.result()
+            out[res["url"]] = res
+            done += 1
+            if done % 50 == 0:
+                print(f"  ... {done}/{len(urls)}", file=sys.stderr, flush=True)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--run", action="store_true", help="execute the network sweep")
+    ap.add_argument("--dry-run", action="store_true", help="show scope only")
+    ap.add_argument("--structural-only", action="store_true")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--json", type=str, default="")
+    args = ap.parse_args()
+
+    if not (args.run or args.dry_run or args.structural_only):
+        ap.error("choose one of --run / --dry-run / --structural-only")
+
+    index = collect_urls()
+    urls = sorted(index)
+    print(f"citation-shaped URLs in 10_knowledge: {len(urls)}")
+    print(f"files citing them: {len({f for s in index.values() for f in s})}")
+
+    structural = {u: r for u in urls if (r := structural_verdict(u))}
+    print(f"\nSTRUCTURAL detector (offline): {len(structural)} bad-shape DOIs")
+    for u, reason in sorted(structural.items()):
+        print(f"  FABRICATED-SHAPE  {u}\n      {reason}")
+        for f in sorted(index[u]):
+            print(f"      cited by: {f}")
+
+    if args.dry_run or args.structural_only:
+        by_host: dict[str, int] = defaultdict(int)
+        for u in urls:
+            by_host[re.sub(r"^https?://([^/]+).*", r"\1", u)] += 1
+        print("\nwould probe, by host:")
+        for h, n in sorted(by_host.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:5d}  {h}")
+        return 0
+
+    target = urls[: args.limit] if args.limit else urls
+    controls = POSITIVE_CONTROLS + NEGATIVE_CONTROLS
+    print(f"\nprobing {len(target)} URLs + {len(controls)} controls "
+          f"({args.workers} workers)...", file=sys.stderr)
+
+    results = run_probes(target + controls, workers=args.workers)
+
+    # --- control gate: evaluate BEFORE reporting any finding ---------------
+    pos_fail = [u for u in POSITIVE_CONTROLS if results.get(u, {}).get("resolved") is not True]
+    neg_fail = [u for u in NEGATIVE_CONTROLS if results.get(u, {}).get("resolved") is not False]
+    probe_ok = not pos_fail and not neg_fail
+
+    print("\n=== CONTROL GATE ===")
+    for u in POSITIVE_CONTROLS:
+        r = results.get(u, {})
+        print(f"  [+] {'PASS' if r.get('resolved') is True else 'FAIL'}  {r.get('status')}  {u}")
+    for u in NEGATIVE_CONTROLS:
+        r = results.get(u, {})
+        print(f"  [-] {'PASS' if r.get('resolved') is False else 'FAIL'}  {r.get('status')}  {u}")
+
+    if not probe_ok:
+        print("\n*** BROKEN PROBE — results below are NOT a clean sweep. ***")
+        print("*** Do not record this run as evidence of anything.      ***")
+
+    unresolved = {u: results[u] for u in target if results.get(u, {}).get("resolved") is False}
+    inconclusive = {u: results[u] for u in target if results.get(u, {}).get("resolved") is None}
+    resolved_n = len(target) - len(unresolved) - len(inconclusive)
+
+    print("\n=== RESULT ===")
+    print(f"  probed:        {len(target)}")
+    print(f"  resolved:      {resolved_n}")
+    print(f"  UNRESOLVED:    {len(unresolved)}")
+    print(f"  inconclusive:  {len(inconclusive)}  (blocked / timeout — not evidence)")
+
+    if unresolved:
+        print("\n--- UNRESOLVED (identifier does not exist) ---")
+        for u, r in sorted(unresolved.items()):
+            flag = " [ALSO BAD SHAPE]" if u in structural else ""
+            print(f"\n  {r['status']}  {u}{flag}")
+            for f in sorted(index[u]):
+                print(f"      cited by: {f}")
+
+    payload = {
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "probe_ok": probe_ok,
+        "control_failures": {"positive": pos_fail, "negative": neg_fail},
+        "counts": {
+            "citation_urls_total": len(urls),
+            "probed": len(target),
+            "resolved": resolved_n,
+            "unresolved": len(unresolved),
+            "inconclusive": len(inconclusive),
+            "structural_bad_shape": len(structural),
+        },
+        "structural": {u: {"reason": r, "files": sorted(index[u])} for u, r in structural.items()},
+        "unresolved": {u: {**r, "files": sorted(index[u])} for u, r in unresolved.items()},
+        "inconclusive": {u: {**r, "files": sorted(index[u])} for u, r in inconclusive.items()},
+    }
+    if args.json:
+        Path(args.json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"\nwrote {args.json}")
+
+    return 0 if probe_ok else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

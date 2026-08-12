@@ -119,6 +119,35 @@ class PrepIngestTests(unittest.TestCase):
         self.assertEqual(result.events[0].kind, "blocked")
         self.assertIn("frontmatter not ready", result.events[0].message)
 
+    def test_skip_invalid_demotes_validation_block_to_warning(self) -> None:
+        source = self._write_ready(
+            "2026-05-27__ai-systems__note__partial.md",
+            "\n".join(
+                [
+                    "---",
+                    'title: "Partial"',
+                    'domain: "ai-systems"',
+                    'type: "note"',
+                    'status: "extracted"',
+                    "---",
+                    "",
+                ]
+            ),
+        )
+
+        result = self.prep.run(apply=False, skip_invalid=True)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(source.exists())
+        self.assertEqual(result.events[0].severity, "warning")
+
+    def test_root_option_is_preserved_for_cli_compatibility(self) -> None:
+        args = prep_module.build_parser().parse_args(
+            ["--root", str(self.root), "run", "--dry-run"]
+        )
+
+        self.assertEqual(args.root, str(self.root))
+
     def test_blocks_non_extracted_status(self) -> None:
         source = self._write_ready(
             "2026-05-27__ai-systems__note__premature.md",

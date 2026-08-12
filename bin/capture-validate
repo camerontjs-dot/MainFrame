@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""G2 — a capture may not wear a citation it did not earn.
+
+Gate for the ingest pipeline, built after the 2026-08-09 integrity finding
+(`20_live/security/2026-08-09__fabricated-source-captures-in-10-knowledge.md`):
+50 captures in `10_knowledge/` carried invented titles, invented institutional
+"authors", and identifiers that do not resolve.
+
+The root cause was not a bad model. The capture schema **required** `url`,
+`authors` and `year`, nothing verified them, and the research loop asked for a
+count of sources. Filling those fields with plausible text was the only way to
+comply. This validator removes that path:
+
+    no successful fetch  ->  no citation fields  ->  it is a hypothesis, not a source
+
+A capture with no retrieval is still welcome. It just cannot claim provenance.
+
+Rules
+  R1  CITATION-WITHOUT-FETCH   fetch_method none/absent but url|doi|authors|year set
+  R2  FABRICATED-SHAPE         identifier is a slug or unfilled placeholder
+  R3  NO-RECEIPT               literature capture with no retrieval_receipt
+  R4  NON-HUMAN-AUTHOR         "author" is an institution, committee, or venue
+  R5  PLACEHOLDER-TEXT         template text left in any frontmatter value
+  R7  BARE-DOMAIN              citation URL resolves only to a domain root
+
+Usage:
+  bin/capture-validate 00_inbox/foo.md ...
+  bin/capture-validate --inbox            # gate 00_inbox/ before ingest
+  bin/capture-validate --ingest-ready     # gate 01_ingest/ready/
+  bin/capture-validate --knowledge        # audit 10_knowledge/ (reports only)
+  bin/capture-validate --inbox --strict   # promote R3/R4 warnings to errors
+  bin/capture-validate --inbox --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import re
+import sys
+from dataclasses import dataclass
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# Reuse the sweep's detectors rather than re-deriving them: one definition of
+# "fabricated shape" for the whole repo.
+_LOADER = SourceFileLoader("_sweep", str(ROOT / "bin" / "citation-resolvability-sweep"))
+_SPEC = importlib.util.spec_from_loader(_LOADER.name, _LOADER)
+assert _SPEC and _SPEC.loader
+sweep = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = sweep
+_SPEC.loader.exec_module(sweep)
+
+CITATION_FIELDS = ("url", "doi", "authors", "author", "year", "journal", "venue")
+
+# A fetch actually happened. Anything else is "we did not retrieve this."
+REAL_FETCH = {
+    "direct-html", "pdf", "api", "manual-paste", "browser", "webfetch",
+    "crossref", "pubmed", "local-file", "direct-pdf", "arxiv-api",
+}
+NO_FETCH = {"", "none", "n/a", "na", "pending", "unknown", "null", "-"}
+
+# The tell that found the original batch: 21 captures, 21 distinct "authors",
+# zero human names. A conference is a venue, not an author.
+NON_HUMAN_AUTHOR_RE = re.compile(
+    r"(consortium|task\s*force|working\s*group|standards?\s*group|committee|"
+    r"conference|symposium|joint\s*\w+|initiative|alliance|board|council)\b",
+    re.I,
+)
+HUMAN_NAME_HINT_RE = re.compile(r"[A-Z][a-z]+,\s*[A-Z]|\bet\s+al\.|[A-Z]\.\s*[A-Z][a-z]+")
+
+PLACEHOLDER_TEXT_RE = re.compile(
+    r"\b(TODO|TBD|FIXME|lorem ipsum|placeholder|your[-_ ]?name|xxxx+|"
+    r"example\.com|<[a-z-]+>)\b",
+    re.I,
+)
+
+# Statuses that assert a human or a deterministic sweep has checked the content.
+# `synthesized` is deliberately absent: EPISTEMIC_STANCE.md's promotion table
+# defines it as "claim types labeled; confidence assigned", which an LLM may do
+# on its own. `stable` and `audited` are the ones that claim someone looked.
+VERIFIED_STATUSES = {"stable", "audited"}
+
+SEVERITY_ORDER = {"error": 0, "warn": 1}
+
+
+@dataclass
+class Finding:
+    rule: str
+    severity: str
+    message: str
+    detail: str = ""
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    """Lightweight scalar frontmatter reader. Lists collapse to their raw text."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    out: dict[str, str] = {}
+    for line in text[3:end].splitlines():
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
+        if m:
+            out[m.group(1).strip().lower()] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def body_fetch_method(text: str) -> str | None:
+    """Captures also record fetch method in the body: '**Fetch method:** none'."""
+    m = re.search(r"\*\*Fetch method:\*\*\s*(.+)", text, re.I)
+    return m.group(1).strip().lower() if m else None
+
+
+def had_real_fetch(fm: dict[str, str], text: str) -> bool:
+    for value in (fm.get("fetch_method"), body_fetch_method(text)):
+        if value and value.strip().lower() not in NO_FETCH:
+            return True
+    if fm.get("retrieval_receipt"):
+        return True
+    # An explicit "full text retrieved / verified" marker also counts.
+    if re.search(r"\*\*Full[- ]text:\*\*\s*verified|full-text-retrieved", text, re.I):
+        return True
+    return False
+
+
+def nonempty_citation_fields(fm: dict[str, str]) -> dict[str, str]:
+    return {
+        k: v for k in CITATION_FIELDS
+        if (v := fm.get(k, "").strip()) and v.lower() not in {"none", "n/a", "unknown", "[]"}
+    }
+
+
+def is_literature(fm: dict[str, str]) -> bool:
+    blob = f"{fm.get('source_type', '')} {fm.get('type', '')} {fm.get('tags', '')}".lower()
+    return any(w in blob for w in ("literature", "paper", "preprint", "journal",
+                                   "peer-review", "regulation", "standard"))
+
+
+def is_bare_domain_url(value: str) -> bool:
+    """Return whether an HTTP(S) URL names only its domain root.
+
+    A root URL may resolve successfully while failing to identify the document
+    that supports a claim. That is a provenance warning, not evidence that the
+    source itself is fabricated, so callers should keep this check warning-only.
+    """
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.netloc)
+        and parsed.path in {"", "/"}
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def validate(path: Path, strict: bool = False) -> list[Finding]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [Finding("R0", "error", f"unreadable: {exc}")]
+
+    fm = parse_frontmatter(text)
+    if not fm:
+        return []
+
+    findings: list[Finding] = []
+    fetched = had_real_fetch(fm, text)
+    cited = nonempty_citation_fields(fm)
+
+    # R1 — the core rule. Scoped to captures that actually claim an external
+    # source. A MainFrame-authored spec or template legitimately carries an
+    # `authors:` line with nothing to fetch; flagging those would drown the
+    # signal in noise and teach people to ignore the validator.
+    claims_external = bool(
+        (fm.get("url", "") or fm.get("doi", "") or fm.get("source", "")).strip().startswith("http")
+    )
+    if not fetched and cited and claims_external:
+        findings.append(Finding(
+            "R1", "error",
+            "citation fields present but nothing was fetched",
+            "fields: " + ", ".join(f"{k}={v!r}" for k, v in cited.items())
+            + "\n      Fix: either record a real retrieval (fetch_method + "
+              "retrieval_receipt), or clear these fields and set type: hypothesis.",
+        ))
+
+    # R2 — fabricated identifier shape, no network needed.
+    for field in ("url", "doi"):
+        val = fm.get(field, "").strip()
+        if val and (reason := sweep.structural_verdict(val)):
+            findings.append(Finding("R2", "error", f"{field} is not a real identifier",
+                                    f"{val}\n      {reason}"))
+    for url in sweep.URL_RE.findall(text):
+        url = sweep.strip_trailing_punct(url)
+        if (reason := sweep.structural_verdict(url)):
+            findings.append(Finding("R2", "error", "fabricated identifier in body",
+                                    f"{url}\n      {reason}"))
+
+    # R3 — a literature claim needs a receipt.
+    if is_literature(fm) and not fm.get("retrieval_receipt") and cited:
+        findings.append(Finding(
+            "R3", "error" if strict else "warn",
+            "literature capture has no retrieval_receipt",
+            "Add retrieval_receipt: \"<ISO8601> HTTP <status> sha256:<hash of what "
+            "was fetched>\" — or drop the citation fields.",
+        ))
+
+    # R4 — "author" that is not a person.
+    authors = fm.get("authors") or fm.get("author") or ""
+    if authors and NON_HUMAN_AUTHOR_RE.search(authors) and not HUMAN_NAME_HINT_RE.search(authors):
+        findings.append(Finding(
+            "R4", "error" if strict else "warn",
+            "author looks like an institution or venue, not a researcher",
+            f"authors: {authors!r}\n      Every fabricated capture in the 2026-08-09 "
+            "finding had a byline of exactly this shape and zero named researchers.",
+        ))
+
+    # R5 — unfilled template text.
+    for key, val in fm.items():
+        if val and PLACEHOLDER_TEXT_RE.search(val):
+            findings.append(Finding("R5", "warn", f"placeholder text in '{key}'", repr(val)))
+
+    # R7 — a resolving homepage is not a document citation. Limit this to
+    # frontmatter source fields so ordinary prose/code examples do not become
+    # citation findings. This deliberately remains a warning: a domain root
+    # can be a useful navigation source, but it cannot by itself substantiate a
+    # document-level claim.
+    seen_bare_urls: set[str] = set()
+    for field in ("source", "source_url", "url"):
+        for value in sweep.URL_RE.findall(fm.get(field, "")):
+            value = sweep.strip_trailing_punct(value)
+            if value in seen_bare_urls or not is_bare_domain_url(value):
+                continue
+            seen_bare_urls.add(value)
+            findings.append(Finding(
+                "R7", "warn", "citation URL is a bare domain",
+                f"{field}: {value}\n      Fix: record the specific document URL, or mark the source as a lead/manual-review item.",
+            ))
+
+    # R6 — a verified status must be earned.
+    #
+    # EPISTEMIC_STANCE.md's promotion gate says `stable` is "Operator-verified or
+    # audit-sweep cleared — **never** from LLM output alone". Measured on
+    # 2026-08-10, nothing in the repo enforced that: 29 files claimed `stable`,
+    # all 29 carried no verification evidence of any kind, and **16 of them
+    # simultaneously carried the `needs-audit` tag**. The highest trust tier in
+    # the system was 55% self-contradictory.
+    #
+    # R6a needs no judgement at all. A file cannot be both operator-verified and
+    # awaiting audit; one of the two fields is simply false, and which one does
+    # not matter for the purpose of refusing to trust it.
+    status = fm.get("status", "").strip().strip('"').lower()
+    tags = fm.get("tags", "")
+    if status in VERIFIED_STATUSES and "needs-audit" in tags:
+        findings.append(Finding(
+            "R6", "error",
+            f"status '{status}' contradicts the needs-audit tag",
+            "A note cannot be operator-verified and awaiting audit at the same "
+            "time. Drop needs-audit, or lower the status to 'synthesized'.",
+        ))
+
+    # R6b — the receipt must name something that can be checked. A bare
+    # `verified_by: operator` is still self-asserted, and this investigation has
+    # already established what a self-asserted field is worth: captures claiming
+    # `retrieved_at` were citing hard 404s. So a receipt pointing at an audit
+    # artifact must point at one that exists. That does not make the claim
+    # unforgeable — it makes it falsifiable, which is the whole difference
+    # between a receipt and a decoration.
+    if status in VERIFIED_STATUSES:
+        receipt = (fm.get("audit_receipt") or fm.get("verified_by") or "").strip()
+        if not receipt:
+            findings.append(Finding(
+                "R6", "error" if strict else "warn",
+                f"status '{status}' with no verification evidence",
+                "Add audit_receipt: <path to the audit artifact> or verified_by: "
+                "<who> plus verified_on: <date>. Per EPISTEMIC_STANCE.md this "
+                "status may never come from LLM output alone.",
+            ))
+        elif "/" in receipt and not (ROOT / receipt.strip('"')).exists():
+            findings.append(Finding(
+                "R6", "error",
+                f"audit_receipt points at a file that does not exist",
+                f"{receipt}\n      A receipt naming a missing artifact is worse "
+                "than no receipt: it reads as verification to everything "
+                "downstream and cannot be checked by anyone in a hurry.",
+            ))
+
+    return findings
+
+
+def gather(args: argparse.Namespace) -> list[Path]:
+    paths: list[Path] = [Path(p) for p in args.paths]
+    if args.inbox:
+        paths += sorted((ROOT / "00_inbox").glob("*.md"))
+    if args.ingest_ready:
+        paths += sorted((ROOT / "01_ingest" / "ready").rglob("*.md"))
+    if args.knowledge:
+        paths += sorted((ROOT / "10_knowledge").rglob("*.md"))
+    return paths
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("--inbox", action="store_true")
+    ap.add_argument("--ingest-ready", action="store_true")
+    ap.add_argument("--knowledge", action="store_true")
+    ap.add_argument("--strict", action="store_true",
+                    help="promote R3/R4 warnings to errors")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    paths = gather(args)
+    if not paths:
+        ap.error("nothing to validate — pass paths or --inbox / --ingest-ready / --knowledge")
+
+    def label(p: Path) -> str:
+        """Repo-relative when possible, absolute otherwise.
+
+        `Path.relative_to` raises for anything outside ROOT, which used to abort
+        the whole run with a traceback the moment someone validated a scratch
+        file or a staging directory outside the repo. A validator that dies on an
+        out-of-tree path cannot be used as a control, which is how
+        `bin/contract-audit`'s positive control found this.
+        """
+        try:
+            return str(p.relative_to(ROOT))
+        except ValueError:
+            return str(p)
+
+    results: dict[str, list[Finding]] = {}
+    for p in paths:
+        if fs := validate(p, strict=args.strict):
+            results[label(p)] = fs
+
+    errors = sum(1 for fs in results.values() for f in fs if f.severity == "error")
+    warns = sum(1 for fs in results.values() for f in fs if f.severity == "warn")
+
+    if args.json:
+        print(json.dumps({
+            "checked": len(paths),
+            "files_with_findings": len(results),
+            "errors": errors, "warnings": warns,
+            "findings": {k: [vars(f) for f in v] for k, v in results.items()},
+        }, indent=2))
+        return 1 if errors else 0
+
+    for path, fs in sorted(results.items()):
+        print(f"\n{path}")
+        for f in sorted(fs, key=lambda x: SEVERITY_ORDER[x.severity]):
+            print(f"  [{f.severity.upper():5}] {f.rule}  {f.message}")
+            if f.detail:
+                for line in f.detail.splitlines():
+                    print(f"      {line}")
+
+    print(f"\nchecked {len(paths)} file(s): {errors} error(s), {warns} warning(s) "
+          f"across {len(results)} file(s)")
+    if errors:
+        print("\nA capture may not wear a citation it did not earn. "
+              "Fetch it, or drop the citation fields.")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    # Exit codes are part of the contract, because a caller must be able to tell
+    # "ran and found problems" from "did not run". Those were both 1 until
+    # 2026-08-10, which means a crashed validator was indistinguishable from a
+    # validator reporting findings — the captive-portal failure mode, in the tool
+    # built to catch captive-portal failure modes.
+    #   0  ran, nothing wrong
+    #   1  ran, found errors
+    #   2  did not run (bad usage, unreadable path, internal failure)
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 — report, never masquerade as a result
+        print(f"capture-validate FAILED TO RUN: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        print("This is not a clean result. Do not read it as one.", file=sys.stderr)
+        sys.exit(2)

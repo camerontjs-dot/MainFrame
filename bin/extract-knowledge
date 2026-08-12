@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PROJECTS_DIR = ROOT / "30_projects"
 KNOWLEDGE_DIR = ROOT / "10_knowledge"
+SAFE_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 
 @dataclass(frozen=True)
@@ -29,12 +31,13 @@ class Prerequisite:
 class ExtractResult:
     prerequisites: list[Prerequisite] = field(default_factory=list)
     target_path: str | None = None
+    input_error: str | None = None
     collision: bool = False
     written: bool = False
 
     @property
     def ok(self) -> bool:
-        if self.collision:
+        if self.input_error or self.collision:
             return False
         return all(p.exists for p in self.prerequisites if p.required)
 
@@ -50,11 +53,11 @@ def scaffold_content(title: str, domain: str, project_slug: str,
     tag_str = json_tags(tags)
     return (
         f"---\n"
-        f'title: "{title}"\n'
-        f'domain: "{domain}"\n'
+        f"title: {json.dumps(title)}\n"
+        f"domain: {json.dumps(domain)}\n"
         f'type: "note"\n'
         f'status: "queued"\n'
-        f'source: "30_projects/{project_slug}/README.md"\n'
+        f"source: {json.dumps(f'30_projects/{project_slug}/README.md')}\n"
         f"tags: {tag_str}\n"
         f"---\n"
         f"\n"
@@ -64,28 +67,49 @@ def scaffold_content(title: str, domain: str, project_slug: str,
 
 
 def json_tags(tags: list[str]) -> str:
-    inner = ", ".join(f'"{t}"' for t in tags)
-    return f"[{inner}]"
+    return json.dumps(tags)
+
+
+def _contained_directory(base: Path, candidate: Path) -> bool:
+    if not candidate.is_dir():
+        return False
+    try:
+        candidate.resolve(strict=True).relative_to(base.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _contained_file(base: Path, candidate: Path) -> bool:
+    if not candidate.is_file():
+        return False
+    try:
+        candidate.resolve(strict=True).relative_to(base.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def check_prerequisites(root: Path, project_slug: str,
                         domain: str) -> list[Prerequisite]:
     prereqs: list[Prerequisite] = []
 
-    proj_dir = root / "30_projects" / project_slug
+    projects_dir = root / "30_projects"
+    proj_dir = projects_dir / project_slug
+    project_exists = _contained_directory(projects_dir, proj_dir)
     prereqs.append(Prerequisite(
         name="project directory",
         path=f"30_projects/{project_slug}",
-        exists=proj_dir.is_dir(),
+        exists=project_exists,
         required=True,
-        message="project directory must exist",
+        message="project directory must exist inside 30_projects/",
     ))
 
     readme = proj_dir / "README.md"
     prereqs.append(Prerequisite(
         name="project README",
         path=f"30_projects/{project_slug}/README.md",
-        exists=readme.exists(),
+        exists=project_exists and _contained_file(proj_dir, readme),
         required=True,
         message="project README is the extraction source",
     ))
@@ -94,7 +118,7 @@ def check_prerequisites(root: Path, project_slug: str,
     prereqs.append(Prerequisite(
         name="project log",
         path=f"30_projects/{project_slug}/log.md",
-        exists=log.exists(),
+        exists=project_exists and _contained_file(proj_dir, log),
         required=False,
         message="log.md is optional but useful for extraction",
     ))
@@ -103,18 +127,19 @@ def check_prerequisites(root: Path, project_slug: str,
     prereqs.append(Prerequisite(
         name="project decisions",
         path=f"30_projects/{project_slug}/decisions.md",
-        exists=decisions.exists(),
+        exists=project_exists and _contained_file(proj_dir, decisions),
         required=False,
         message="decisions.md is optional but useful for extraction",
     ))
 
-    domain_dir = root / "10_knowledge" / domain
+    knowledge_dir = root / "10_knowledge"
+    domain_dir = knowledge_dir / domain
     prereqs.append(Prerequisite(
         name="knowledge domain",
         path=f"10_knowledge/{domain}",
-        exists=domain_dir.is_dir(),
+        exists=_contained_directory(knowledge_dir, domain_dir),
         required=True,
-        message="target domain must exist in 10_knowledge/",
+        message="target domain must exist inside 10_knowledge/",
     ))
 
     return prereqs
@@ -123,13 +148,30 @@ def check_prerequisites(root: Path, project_slug: str,
 def run_extract(root: Path, project_slug: str, domain: str, title: str,
                 tags: list[str], write: bool = False) -> ExtractResult:
     result = ExtractResult()
+    if not SAFE_SEGMENT.fullmatch(project_slug):
+        result.input_error = (
+            "project slug must be one path segment using lowercase letters, "
+            "digits, dots, dashes, or underscores"
+        )
+        return result
+    if not SAFE_SEGMENT.fullmatch(domain):
+        result.input_error = (
+            "domain must be one path segment using lowercase letters, digits, "
+            "dots, dashes, or underscores"
+        )
+        return result
+    if not title.strip() or not slugify(title) or any(
+        character in title for character in ("\x00", "\n", "\r")
+    ):
+        result.input_error = "title must be a non-empty single-line title"
+        return result
     result.prerequisites = check_prerequisites(root, project_slug, domain)
 
     filename = f"{date.today().isoformat()}__{domain}__note__{slugify(title)}.md"
     target = root / "10_knowledge" / domain / filename
     result.target_path = f"10_knowledge/{domain}/{filename}"
 
-    if target.exists():
+    if target.exists() or target.is_symlink():
         result.collision = True
 
     if not result.ok:
@@ -137,8 +179,13 @@ def run_extract(root: Path, project_slug: str, domain: str, title: str,
 
     if write:
         content = scaffold_content(title, domain, project_slug, tags)
-        target.write_text(content, encoding="utf-8")
-        result.written = True
+        try:
+            with target.open("x", encoding="utf-8") as handle:
+                handle.write(content)
+        except FileExistsError:
+            result.collision = True
+        else:
+            result.written = True
 
     return result
 
@@ -149,6 +196,8 @@ def print_result(result: ExtractResult) -> None:
         print(f"  [{status:>7}] {p.path}  — {p.message}")
 
     print()
+    if result.input_error:
+        print(f"  ERROR: {result.input_error}")
     if result.target_path:
         print(f"  target: {result.target_path}")
     if result.collision:

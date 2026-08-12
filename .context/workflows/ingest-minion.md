@@ -44,6 +44,13 @@ Files in `queue/` go through the strict v1 quality gate, unchanged from ADR-007:
    ```
    Runs `bin/fetch-source-text --apply` (Europe PMC, direct PDF/HTML, Unpaywall when `UNPAYWALL_EMAIL` is set), then `bin/mindgraph-refresh`. Use `--dry-run` to preview; `--file` for a single stub.
 9. Run `bin/mindgraph-refresh` alone if only notes changed (no new raw stubs) and search should be refreshed immediately.
+10. Run the advisory graph audit before and after a durable refresh when reviewing link or metadata hygiene. Preserve the pre-refresh receipt, inspect/edit source notes, refresh, then compare the post-refresh receipt and probe:
+    ```sh
+    bin/mindgraph-audit-links --dry-run --scope 10_knowledge --output-dir <pre-audit-receipt-dir>
+    bin/mindgraph-refresh
+    bin/mindgraph-audit-links --dry-run --scope 10_knowledge --output-dir <post-audit-receipt-dir>
+    ```
+    This emits JSON/Markdown action-queue receipts, never blocks routing, and never rewrites source notes.
 
 ## File Rules
 - Markdown files must contain the standard metadata from `.context/primitives.md`: `title`, `domain`, `type`, `status`, `source`, and `tags`. The minion fills missing keys during pass-1 normalization; pass-2 routing requires all keys filled with valid values.
@@ -53,6 +60,7 @@ Files in `queue/` go through the strict v1 quality gate, unchanged from ADR-007:
 - Topics should begin as notes or index entries. Promote a topic to a domain or subdomain only when it is broad, recurring, and has enough material to need its own navigation.
 - Raw PDFs should use `YYYY-MM-DD__domain__raw__slug.pdf`. If a raw PDF does not follow the filename convention, pass `--domain <domain>` and review the generated stub name before applying.
 - Generated raw stubs may include optional source metadata extracted from the file. The raw file remains the source of truth.
+- Graph authorship follows `.context/primitives.md` and `.context/workflows/graph-link-audit.md`. Do not add links merely to improve a count; inspect source context first.
 
 ## Guardrails
 - Dry-run first. The script refuses destination collisions and never overwrites existing files.
@@ -60,3 +68,24 @@ Files in `queue/` go through the strict v1 quality gate, unchanged from ADR-007:
 - First-pass inbox problems produce suggestions instead of rejects. Rejected files move to `01_ingest/rejected/` only during strict pass-2 apply from `01_ingest/queue/`.
 - The raw PDF is preserved as evidence; the generated Markdown stub is only the searchable MindGraph wrapper.
 - Do not use this workflow for `20_live/` state or `30_projects/` records.
+
+## Claim discipline at the gate
+
+This workflow is in the provenance path, so the epistemic standard binds here
+and is enforced, not merely referenced.
+
+- Classify claims and assign confidence per
+  [epistemic-standard.md](epistemic-standard.md) and `EPISTEMIC_STANCE.md`.
+- `bin/capture-validate` runs inside `01_ingest/minion.py::_route_markdown` and
+  refuses any capture carrying `url` / `doi` / `authors` / `year` with no
+  retrieval receipt (R1-R3), a fabricated identifier shape (R2), or an unearned
+  `status: stable` / `audited` (R6).
+- **Escape:** a capture with no fetched source is still welcome. Drop the
+  citation fields and set `type: hypothesis`. A documented gap is a better
+  result than an invented source, and nothing penalises it.
+
+**Stop state.** If the gate rejects a file, do not edit the frontmatter to get
+past it. Either record a real retrieval or drop the citation. Repeated rejections
+of the same shape are a `bin/papercut`, not a workaround.
+
+Background: `20_live/security/2026-08-09__fabricated-source-captures-in-10-knowledge.md`.

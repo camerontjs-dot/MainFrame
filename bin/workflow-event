@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import fcntl
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,6 +17,8 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIR = ROOT / "20_live" / "workflow-metrics" / "events"
 TZ = ZoneInfo("America/Toronto")
+MAX_EVENT_LINE_BYTES = 256 * 1024
+MAX_HOOK_PAYLOAD_CHARS = 1024 * 1024
 
 # A leading shell token shaped like NAME=value is an inline env assignment
 # (e.g. ``FOO=/tmp/bar cmd``). Skip it when picking the command head so the
@@ -483,6 +486,36 @@ def compute_hash(event_data: dict, prev_hash: str) -> str:
     return h.hexdigest()[:16]
 
 
+def _last_event_from_locked_file(handle) -> dict | None:
+    """Return the final non-empty JSONL record without reading the whole log."""
+    handle.seek(0, os.SEEK_END)
+    end = handle.tell()
+    if end == 0:
+        return None
+
+    start = max(0, end - MAX_EVENT_LINE_BYTES - 1)
+    handle.seek(start)
+    tail = handle.read(end - start).rstrip()
+    if not tail:
+        if end > MAX_EVENT_LINE_BYTES:
+            raise ValueError("telemetry tail exceeds size limit")
+        return None
+
+    newline = tail.rfind(b"\n")
+    if newline < 0:
+        if start > 0:
+            raise ValueError("final telemetry record exceeds size limit")
+        line = tail
+    else:
+        line = tail[newline + 1 :]
+    if len(line) > MAX_EVENT_LINE_BYTES:
+        raise ValueError("final telemetry record exceeds size limit")
+    value = json.loads(line.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("final telemetry record is not an object")
+    return value
+
+
 def post_or_append_event(event: dict, log_path: Path, allow_post: bool = True) -> bool:
     import urllib.request
     import urllib.error
@@ -507,26 +540,28 @@ def post_or_append_event(event: dict, log_path: Path, allow_post: bool = True) -
         except Exception as e:
             print(f"Server log-event endpoint unavailable ({e}); falling back to local file append", file=sys.stderr)
 
-    # Fallback: compute hash chain locally and append
-    prev_hash = "genesis-seed"
-    if log_path.exists():
-        try:
-            with log_path.open("r", encoding="utf-8") as f:
-                lines = [l for l in f.read().splitlines() if l.strip()]
-                if lines:
-                    last_line = lines[-1]
-                    last_event = json.loads(last_line)
-                    if last_event and last_event.get("hash_chain"):
-                        prev_hash = last_event["hash_chain"]
-        except Exception:
-            pass
-
-    curr_hash = compute_hash(event_without_hash, prev_hash)
-    event["hash_chain"] = curr_hash
-
+    # Fallback: hold one cross-process lock across tail read, hash calculation,
+    # and append. Without this critical section concurrent hooks can fork the
+    # linear chain by deriving two records from the same predecessor.
     try:
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        with log_path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            last_event = _last_event_from_locked_file(handle)
+            prev_hash = "genesis-seed"
+            if last_event is not None:
+                previous = last_event.get("hash_chain")
+                if not isinstance(previous, str) or not previous:
+                    raise ValueError("final telemetry record has no hash_chain")
+                prev_hash = previous
+
+            event["hash_chain"] = compute_hash(event_without_hash, prev_hash)
+            encoded = (
+                json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            if len(encoded) > MAX_EVENT_LINE_BYTES:
+                raise ValueError("telemetry record exceeds size limit")
+            handle.write(encoded)
+            handle.flush()
         return True
     except Exception as exc:
         print(f"workflow-event local append failed: {exc}", file=sys.stderr)
@@ -547,9 +582,11 @@ def main() -> int:
         elif override:
             client = override
     try:
-        payload = sys.stdin.read()
+        payload = sys.stdin.read(MAX_HOOK_PAYLOAD_CHARS + 1)
         if not payload.strip():
             return 0
+        if len(payload) > MAX_HOOK_PAYLOAD_CHARS:
+            raise ValueError("hook payload exceeds size limit")
         raw = normalize_hook_payload(json.loads(payload))
         if client == "grok":
             raw.setdefault("source", "grok")
@@ -584,44 +621,9 @@ def main() -> int:
             return 1
 
 
-        # Wait loop for PermissionRequest
-        if event.get("event") == "PermissionRequest" and event.get("session_hash") and "PYTEST_CURRENT_TEST" not in os.environ:
-            import time
-            session_hash = event["session_hash"]
-            approvals_dir = ROOT / "20_live" / "workflow-metrics" / "approvals"
-            approvals_dir.mkdir(parents=True, exist_ok=True)
-            approval_file = approvals_dir / f"{session_hash}.json"
-
-            if approval_file.exists():
-                try:
-                    approval_file.unlink()
-                except Exception:
-                    pass
-
-            print(f"Awaiting human approval via Workstation UI for session {session_hash}...", file=sys.stderr)
-            timeout = 60.0
-            start_time = time.time()
-
-            while time.time() - start_time < timeout:
-                if approval_file.exists():
-                    try:
-                        with approval_file.open("r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        approved = data.get("approved", False)
-                        approval_file.unlink()
-                        if approved:
-                            print("Approved via Workstation UI.", file=sys.stderr)
-                            return 0
-                        else:
-                            print("Denied via Workstation UI.", file=sys.stderr)
-                            return 1
-                    except Exception as e:
-                        print(f"Error reading approval: {e}", file=sys.stderr)
-                        time.sleep(0.5)
-                time.sleep(0.25)
-
-            print("Approval request timed out after 60s. Denying.", file=sys.stderr)
-            return 1
+        # PermissionRequest is telemetry only. Permission decisions remain with
+        # the native client; this recorder must never poll approval files,
+        # delay the client, or return an approve/deny decision.
     except Exception as exc:
         print(f"workflow-event telemetry skipped: {exc}", file=sys.stderr)
     return 0

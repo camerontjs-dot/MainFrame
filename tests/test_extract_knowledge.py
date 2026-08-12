@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -115,6 +116,93 @@ class ExtractKnowledgeTests(unittest.TestCase):
                          if p.name == "knowledge domain"][0]
         self.assertFalse(domain_prereq.exists)
 
+    def test_rejects_path_bearing_project_and_domain_values(self) -> None:
+        make_project(self.root)
+        make_domain(self.root)
+        cases = (
+            ("../test-proj", "ai-systems"),
+            ("test-proj", "../ai-systems"),
+            ("test-proj", "/tmp/ai-systems"),
+        )
+        for project, domain in cases:
+            with self.subTest(project=project, domain=domain):
+                result = run_extract(
+                    self.root,
+                    project,
+                    domain,
+                    "Test Note",
+                    ["extracted"],
+                    write=True,
+                )
+                self.assertFalse(result.ok)
+                self.assertIsNotNone(result.input_error)
+                self.assertIsNone(result.target_path)
+                self.assertFalse(result.written)
+
+    def test_rejects_empty_or_multiline_titles(self) -> None:
+        make_project(self.root)
+        make_domain(self.root)
+        for title in ("", "---", "Injected\nstatus: stable"):
+            with self.subTest(title=title):
+                result = run_extract(
+                    self.root,
+                    "test-proj",
+                    "ai-systems",
+                    title,
+                    ["extracted"],
+                    write=True,
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(
+                    result.input_error, "title must be a non-empty single-line title"
+                )
+                self.assertFalse(result.written)
+
+    def test_rejects_symlinked_domain_that_escapes_knowledge_root(self) -> None:
+        make_project(self.root)
+        outside = self.root / "outside"
+        outside.mkdir()
+        knowledge = self.root / "10_knowledge"
+        knowledge.mkdir()
+        (knowledge / "escaped").symlink_to(outside, target_is_directory=True)
+
+        result = run_extract(
+            self.root,
+            "test-proj",
+            "escaped",
+            "Test Note",
+            ["extracted"],
+            write=True,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.written)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_broken_target_symlink_cannot_redirect_write(self) -> None:
+        make_project(self.root)
+        make_domain(self.root)
+        check = run_extract(
+            self.root, "test-proj", "ai-systems", "Test Note", ["extracted"]
+        )
+        outside = self.root / "outside-note.md"
+        target = self.root / check.target_path
+        target.symlink_to(outside)
+
+        result = run_extract(
+            self.root,
+            "test-proj",
+            "ai-systems",
+            "Test Note",
+            ["extracted"],
+            write=True,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.collision)
+        self.assertFalse(result.written)
+        self.assertFalse(outside.exists())
+
     def test_write_creates_scaffold(self) -> None:
         make_project(self.root)
         make_domain(self.root)
@@ -160,6 +248,25 @@ class ExtractKnowledgeTests(unittest.TestCase):
         target = self.root / result.target_path
         content = target.read_text(encoding="utf-8")
         self.assertIn('["foo", "bar"]', content)
+
+    def test_scaffold_json_escapes_metadata_values(self) -> None:
+        make_project(self.root)
+        make_domain(self.root)
+        title = 'Quoted "title"'
+        tags = ['tag"\nstatus: stable']
+        result = run_extract(
+            self.root,
+            "test-proj",
+            "ai-systems",
+            title,
+            tags,
+            write=True,
+        )
+
+        content = (self.root / result.target_path).read_text(encoding="utf-8")
+        self.assertIn(f"title: {json.dumps(title)}", content)
+        self.assertIn(f"tags: {json.dumps(tags)}", content)
+        self.assertEqual(content.count("\nstatus:"), 1)
 
     def test_check_mode_does_not_write(self) -> None:
         make_project(self.root)

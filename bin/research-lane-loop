@@ -1,0 +1,1316 @@
+#!/usr/bin/env python3
+"""Research-lane-loop preflight and health checks.
+
+Hardens the operator loop from `.context/workflows/research-lane-loop.md`
+by classifying resume state before agents re-run source-literature.
+
+Commands:
+  bin/research-lane-loop preflight [--slug SLUG | --priority P0] [--json]
+  bin/research-lane-loop audit-indexes [--status active] [--json]
+  bin/research-lane-loop doctor   # same as: preflight --priority P0 (top pick)
+
+Does not write knowledge or run source-literature. Dry diagnostics only
+unless --repair-index is passed on audit-indexes (rewrites stale 00_inbox
+paths in lane capture tables when the file already exists under 10_knowledge/).
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import re
+import sys
+from dataclasses import asdict, dataclass, field
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+LANES_DIR = ROOT / "30_projects" / "research-lanes-strategy" / "lanes"
+COMPLETED_DIR = LANES_DIR / "completed"
+INBOX = ROOT / "00_inbox"
+KNOWLEDGE = ROOT / "10_knowledge"
+WORKFLOW = ROOT / ".context" / "workflows" / "research-lane-loop.md"
+
+# Load lane-intake list helpers without shelling out.
+_LOADER = SourceFileLoader("lane_intake_mod", str(ROOT / "bin" / "lane-intake"))
+_SPEC = importlib.util.spec_from_loader(_LOADER.name, _LOADER)
+assert _SPEC and _SPEC.loader
+lane_intake = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = lane_intake
+_SPEC.loader.exec_module(lane_intake)
+
+
+# G1 — never quota evidence.
+#
+# This loop used to emit "need ~3–4 raws" and "fill to batch size" whenever a
+# lane held fewer than three captures. On 2026-08-07 an agent obeyed that
+# instruction across lanes C68–C74 and produced exactly three captures per lane,
+# with invented titles, invented institutional authors, and DOIs that do not
+# resolve. See 20_live/security/2026-08-09__fabricated-source-captures-in-10-knowledge.md.
+#
+# The agent was not malfunctioning. A quota for evidence, plus mandatory citation
+# fields, plus no fetch verification, leaves fabrication as the only compliant
+# response — there was no way to answer "I looked, and only one source exists."
+#
+# The threshold below is now a trigger for a COVERAGE REVIEW, not a target to
+# reach. Nothing downstream may require a count of sources, and every prompt this
+# tool emits must leave "record the gap" available as a valid outcome.
+COVERAGE_REVIEW_THRESHOLD = 3
+
+NO_QUOTA_NOTICE = (
+    "# NO QUOTA: capture only what you actually retrieved. Finding one real "
+    "source and recording the gap is a BETTER result than three invented ones. "
+    "If you cannot fetch it, do not give it a citation."
+)
+
+INBOX_PATH_RE = re.compile(r"`?(00_inbox/[A-Za-z0-9_./-]+\.md)`?")
+KNOWLEDGE_PATH_RE = re.compile(r"`?(10_knowledge/[A-Za-z0-9_./-]+\.md)`?")
+LANE_TAG_RE = re.compile(r"lane-[a-z0-9]+", re.I)
+
+
+@dataclass
+class StaleRef:
+    tracker_path: str
+    basename: str
+    knowledge_path: str | None
+    still_in_inbox: bool
+
+
+@dataclass
+class PreflightReport:
+    slug: str
+    lane_id: str
+    priority: str
+    status: str
+    knowledge_domain: str
+    capture_tags: list[str]
+    resume_class: str
+    resume_reason: str
+    inbox_stubs: list[str] = field(default_factory=list)
+    knowledge_raws: list[str] = field(default_factory=list)
+    knowledge_notes: list[str] = field(default_factory=list)
+    stale_index_refs: list[dict[str, Any]] = field(default_factory=list)
+    recommended_step: str = ""
+    command_card: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    # G2: machine-readable phase / routing (avoids class-C parking lot)
+    phase_status: dict[str, str] = field(default_factory=dict)
+    next_phase: str = ""
+    blocker: str = "none"  # literature|project|operator|none
+    suggested_command: str = ""
+    handoff: str = ""
+
+
+def parse_frontmatter(path: Path) -> dict[str, str]:
+    return lane_intake.parse_frontmatter(path)
+
+
+def parse_capture_tags(fm: dict[str, str], readme_text: str) -> list[str]:
+    raw = fm.get("capture_tags", "")
+    tags: list[str] = []
+    if raw:
+        # capture_tags: ["a", "b"] or JSON-ish
+        for m in re.finditer(r'["\']([^"\']+)["\']', raw):
+            tags.append(m.group(1))
+    if not tags:
+        # fallback: lane-xx from body/frontmatter
+        for m in LANE_TAG_RE.finditer(readme_text + " " + json.dumps(fm)):
+            tags.append(m.group(0).lower())
+    # de-dupe preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tags:
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl)
+            out.append(tl)
+    return out
+
+
+def find_lane_readme(slug: str) -> Path | None:
+    for base in (LANES_DIR, COMPLETED_DIR):
+        p = base / slug / "README.md"
+        if p.exists():
+            return p
+    return None
+
+
+def basename_of(path_str: str) -> str:
+    return Path(path_str).name
+
+
+def _topic_slug(basename: str) -> str:
+    """Best-effort topic slug from a MainFrame filename stem."""
+    stem = Path(basename).stem
+    # YYYY-MM-DD__domain__type__slug  OR  YYYY-MM-DD__source-literature-run__slug
+    parts = stem.split("__")
+    if len(parts) >= 4:
+        return parts[-1].lower().replace("_", "-")
+    if len(parts) == 3:
+        return parts[-1].lower().replace("_", "-")
+    return stem.lower().replace("_", "-")
+
+
+def resolve_knowledge_candidate(basename: str, domain: str | None) -> Path | None:
+    """Find basename under 10_knowledge, preferring domain.
+
+    Also fuzzy-matches when ingest rewrote type (raw run-note → note) or
+    inserted a domain segment (source-literature-run__X → domain__note__source-literature-run--X).
+    """
+    if domain:
+        preferred = KNOWLEDGE / domain / basename
+        if preferred.exists():
+            return preferred
+        preferred_raw = KNOWLEDGE / domain / "raw" / basename
+        if preferred_raw.exists():
+            return preferred_raw
+    matches = list(KNOWLEDGE.rglob(basename))
+    if matches:
+        return matches[0]
+
+    # Fuzzy: topic slug contained in any knowledge filename under domain (or all)
+    topic = _topic_slug(basename)
+    if len(topic) < 8:
+        return None
+    search_roots = [KNOWLEDGE / domain] if domain and (KNOWLEDGE / domain).exists() else [KNOWLEDGE]
+    fuzzy: list[Path] = []
+    for root in search_roots:
+        for p in root.rglob("*.md"):
+            name = p.name.lower().replace("_", "-")
+            if topic in name or topic.replace("-", "") in name.replace("-", ""):
+                fuzzy.append(p)
+    if not fuzzy:
+        return None
+    # Prefer same domain; prefer shorter path
+    fuzzy.sort(key=lambda p: (0 if domain and f"/{domain}/" in str(p) else 1, len(str(p))))
+    return fuzzy[0]
+
+
+def scan_stale_inbox_refs(readme_text: str, domain: str | None) -> list[StaleRef]:
+    refs: list[StaleRef] = []
+    seen: set[str] = set()
+    for m in INBOX_PATH_RE.finditer(readme_text):
+        tracker_path = m.group(1)
+        if tracker_path in seen:
+            continue
+        seen.add(tracker_path)
+        base = basename_of(tracker_path)
+        in_inbox = (INBOX / base).exists() or (ROOT / tracker_path).exists()
+        know = resolve_knowledge_candidate(base, domain)
+        # Stale = listed as inbox but already in knowledge (or gone from inbox)
+        if know is not None or not in_inbox:
+            refs.append(
+                StaleRef(
+                    tracker_path=tracker_path,
+                    basename=base,
+                    knowledge_path=str(know.relative_to(ROOT)) if know else None,
+                    still_in_inbox=in_inbox,
+                )
+            )
+    return refs
+
+
+def find_inbox_stubs_for_lane(tags: list[str], slug: str, lane_id: str) -> list[str]:
+    if not INBOX.exists():
+        return []
+    needles = {t.lower() for t in tags}
+    for t in list(needles):
+        if t.startswith("lane-"):
+            needles.add(t[5:])
+        elif t and t not in {"research-lane", "needs-audit", "high", "medium", "low"}:
+            needles.add(f"lane-{t}")
+    needles.add(slug.lower())
+    if lane_id:
+        needles.add(lane_id.lower())
+        needles.add(f"lane-{lane_id.lower()}")
+        # lane-mh01 style
+        compact = re.sub(r"[^a-z0-9]", "", lane_id.lower())
+        if compact:
+            needles.add(f"lane-{compact}")
+    hits: list[str] = []
+    for p in sorted(INBOX.glob("*.md")):
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")[:8000].lower()
+        except OSError:
+            continue
+        name = p.name.lower()
+        if any(n in name or n in text for n in needles if len(n) >= 3):
+            # require at least a lane tag or slug signal for short ids
+            hits.append(str(p.relative_to(ROOT)))
+    return hits
+
+
+def _classify_knowledge_path(path: Path, head: str) -> str | None:
+    """Return 'raw' or 'note' or None."""
+    name = path.name
+    if "source-literature-run" in name:
+        return "raw"
+    if "__raw__" in name:
+        return "raw"
+    if "__note__" in name or "note__" in name:
+        return "note"
+    if "type: raw" in head or 'type: "raw"' in head:
+        return "raw"
+    if "type: note" in head or 'type: "note"' in head:
+        return "note"
+    return None
+
+
+def paths_from_capture_index(readme_text: str) -> list[str]:
+    """Extract 10_knowledge paths listed in a lane capture-index table."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in KNOWLEDGE_PATH_RE.finditer(readme_text):
+        p = m.group(1)
+        if p not in seen:
+            seen.add(p)
+            found.append(p)
+    # file:///…/10_knowledge/… links in capture tables
+    for m in re.finditer(r"10_knowledge/[A-Za-z0-9_./-]+\.md", readme_text):
+        p = m.group(0)
+        if p not in seen:
+            seen.add(p)
+            found.append(p)
+    return found
+
+
+def find_knowledge_files_for_lane(
+    domain: str,
+    tags: list[str],
+    slug: str,
+    *,
+    readme_text: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Inventory knowledge files for a lane.
+
+    Match strategy (any hit counts):
+    1. Paths already listed in the lane capture index
+    2. Domain files whose head/name match lane-* tags, slug, or other capture_tags
+    """
+    raws: list[str] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+
+    def add_path(rel: str, head: str = "", path: Path | None = None) -> None:
+        if rel in seen:
+            return
+        p = path or (ROOT / rel)
+        if not p.exists():
+            return
+        if not head:
+            try:
+                head = p.read_text(encoding="utf-8", errors="ignore")[:4000].lower()
+            except OSError:
+                return
+        kind = _classify_knowledge_path(p, head)
+        if kind == "raw":
+            raws.append(rel)
+            seen.add(rel)
+        elif kind == "note":
+            notes.append(rel)
+            seen.add(rel)
+
+    # 1) Capture index is ground truth when present
+    if readme_text:
+        for rel in paths_from_capture_index(readme_text):
+            add_path(rel)
+
+    if not domain:
+        return raws, notes
+    domain_dir = KNOWLEDGE / domain
+    if not domain_dir.exists():
+        return raws, notes
+
+    # 2) Broader tag/slug matching (not only lane-* — older captures often omit it)
+    needles: list[str] = []
+    for t in tags:
+        tl = t.lower().strip()
+        if tl and tl not in {"research-lane", "needs-audit", "high", "medium", "low"}:
+            needles.append(tl)
+            if tl.startswith("lane-"):
+                needles.append(tl[5:])
+            else:
+                needles.append(f"lane-{tl}")
+    if slug:
+        needles.append(slug.lower().replace("_", "-"))
+        needles.append(slug.lower())
+    # de-dupe
+    needles = list(dict.fromkeys(n for n in needles if len(n) >= 3))
+
+    for p in sorted(domain_dir.rglob("*.md")):
+        if p.name == "index.md":
+            continue
+        rel = str(p.relative_to(ROOT))
+        if rel in seen:
+            continue
+        try:
+            head = p.read_text(encoding="utf-8", errors="ignore")[:4000].lower()
+        except OSError:
+            continue
+        name = p.name.lower()
+        if not any(n in head or n in name for n in needles):
+            continue
+        add_path(rel, head=head, path=p)
+    return raws, notes
+
+
+def classify_resume(
+    inbox_stubs: list[str],
+    knowledge_raws: list[str],
+    knowledge_notes: list[str],
+    stale_refs: list[StaleRef],
+) -> tuple[str, str]:
+    """Return (class, reason). Classes A/B/C/D per research-lane-loop workflow."""
+    if stale_refs and any(s.knowledge_path for s in stale_refs):
+        # D can combine with others; surface D first if index lies
+        if not inbox_stubs and knowledge_raws:
+            return (
+                "D",
+                "Capture index still lists 00_inbox/ paths that already exist under 10_knowledge/",
+            )
+        if not inbox_stubs and not knowledge_raws:
+            return (
+                "D",
+                "Capture index lists 00_inbox/ paths that are missing from inbox (stale or moved)",
+            )
+
+    if inbox_stubs:
+        return ("B", f"{len(inbox_stubs)} inbox stub(s) match this lane — ingest before new search")
+
+    if len(knowledge_raws) >= 3 and not knowledge_notes:
+        return (
+            "C",
+            f"{len(knowledge_raws)} knowledge raws and no lane synthesis note — write synthesis",
+        )
+
+    if len(knowledge_raws) >= 3 and knowledge_notes:
+        # may still need another phase
+        return (
+            "C",
+            f"{len(knowledge_raws)} raws + {len(knowledge_notes)} note(s) present — check stop condition / next phase before new search",
+        )
+
+    if knowledge_raws and not knowledge_notes:
+        return (
+            "C",
+            f"{len(knowledge_raws)} knowledge raw(s) without synthesis — synthesise, or "
+            f"review coverage for unanswered sub-questions",
+        )
+
+    if knowledge_raws or knowledge_notes:
+        return (
+            "C",
+            f"{len(knowledge_raws)} raw(s) + {len(knowledge_notes)} note(s) — review coverage "
+            f"or check stop condition",
+        )
+
+    if stale_refs:
+        return ("D", "Stale capture-index inbox paths present")
+
+    return ("A", "No inbox stubs and no knowledge raws/notes for this lane — run source-literature")
+
+
+def recommended_step(
+    resume_class: str,
+    domain: str,
+    *,
+    has_notes: bool = False,
+    raw_count: int = 0,
+    note_count: int = 0,
+) -> tuple[str, list[str]]:
+    if resume_class == "A":
+        return (
+            "Step 1–3: brief + preflight + source-literature "
+            "(capture what exists — no target count)",
+            [
+                'bin/mindgraph query "LANE QUESTION" --db ~/.mindgraph/mainframe.sqlite --json --top-k 6',
+                'bin/mindgraph query "LANE QUESTION" --db ~/.mindgraph/mainframe-projects.sqlite --json --top-k 6',
+                "# then source-literature skill → 00_inbox/",
+                NO_QUOTA_NOTICE,
+            ],
+        )
+    if resume_class == "B":
+        return (
+            "Step 4: ingest pipeline (skip new search)",
+            [
+                "bin/ingest-minion run --dry-run",
+                "bin/ingest-minion run --apply",
+                f"bin/post-route-enrich --subset {domain or 'DOMAIN'}",
+            ],
+        )
+    if resume_class == "C":
+        if has_notes and note_count >= 1 and raw_count >= 3:
+            return (
+                "Step 7: stop-condition check — synthesis already present; next phase, archive, or handoff",
+                [
+                    "# read lane stop condition + latest note",
+                    "bin/lane-intake archive SLUG --apply   # only if lane stop condition met",
+                    "# else: set next phase and re-run doctor",
+                ],
+            )
+        if raw_count < COVERAGE_REVIEW_THRESHOLD:
+            return (
+                "Step 1–3: coverage check — which of this lane's sub-questions are "
+                "still unanswered, and does real literature exist for them?",
+                [
+                    'bin/mindgraph query "LANE QUESTION" --db ~/.mindgraph/mainframe.sqlite --json --top-k 6',
+                    "# source-literature skill — capture only sources you actually retrieved",
+                    "# if a sub-question has no findable literature, record the gap in the "
+                    "lane README and proceed to synthesis. A documented gap is a result.",
+                    NO_QUOTA_NOTICE,
+                ],
+            )
+        return (
+            "Step 5: knowledge synthesis + mindgraph-refresh",
+            [
+                f"# write 10_knowledge/{domain or 'DOMAIN'}/YYYY-MM-DD__…__note__….md",
+                "bin/mindgraph-refresh",
+            ],
+        )
+    # D
+    return (
+        "Step 6: repair capture index paths (00_inbox → 10_knowledge), then re-preflight",
+        [
+            "bin/research-lane-loop audit-indexes --status active  # dry-run",
+            "bin/research-lane-loop audit-indexes --status active --repair-index",
+            "bin/research-lane-loop preflight --slug SLUG",
+        ],
+    )
+
+
+
+def parse_phase_status(readme_text: str) -> dict[str, str]:
+    """Parse phase tables from lane README (G2).
+
+    Only rows under a Phase status heading (or a `| Phase | Status |` header)
+    are considered — capture-index tables (`| Date | Path |`) are ignored.
+    """
+    out: dict[str, str] = {}
+    in_phase_table = False
+    for line in readme_text.splitlines():
+        stripped = line.strip()
+        # Enter phase table via heading or header row
+        if re.search(r"^##+\s*phase\s+status", stripped, re.I):
+            in_phase_table = True
+            continue
+        if re.search(r"^##+\s+", stripped) and not re.search(r"phase\s+status", stripped, re.I):
+            # left the phase section
+            if in_phase_table:
+                in_phase_table = False
+            continue
+        if not stripped.startswith("|"):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        phase, status = cells[0], cells[1]
+        header_l = phase.lower()
+        if header_l in {"phase", "--------", "---"} or set(phase) <= {"-"}:
+            # detect explicit Phase|Status header even without heading
+            if header_l == "phase" and "status" in status.lower():
+                in_phase_table = True
+            continue
+        if "status" in header_l:
+            continue
+        # Skip capture-index style tables
+        if header_l in {"date", "path", "type"} or phase.startswith("20"):
+            in_phase_table = False
+            continue
+        if not in_phase_table:
+            # only accept known phase names outside an explicit table
+            if phase.lower() not in {
+                "foundation",
+                "taxonomy",
+                "specialization",
+                "application",
+            }:
+                continue
+        # normalize status tokens
+        st = status.lower()
+        if "✅" in status or "done" in st or "complete" in st or "met" in st:
+            norm = "done"
+        elif "next" in st or "⏳" in status or "todo" in st or "open" in st:
+            norm = "next"
+        elif "active" in st or "wip" in st or "progress" in st:
+            norm = "active"
+        elif "skip" in st or "n/a" in st or "defer" in st:
+            norm = "skipped"
+        else:
+            norm = status.strip() or "unknown"
+        out[phase] = norm
+    return out
+
+
+def infer_next_phase(phase_status: dict[str, str]) -> str:
+    order = [
+        "Foundation",
+        "Taxonomy",
+        "Specialization",
+        "Application",
+        "foundation",
+        "taxonomy",
+        "specialization",
+        "application",
+    ]
+    # prefer explicit next
+    for name, st in phase_status.items():
+        if st == "next":
+            return name
+    # first not done in preferred order
+    lower_map = {k.lower(): (k, v) for k, v in phase_status.items()}
+    for key in ("foundation", "taxonomy", "specialization", "application"):
+        if key in lower_map:
+            name, st = lower_map[key]
+            if st not in {"done", "skipped"}:
+                return name
+    for name, st in phase_status.items():
+        if st not in {"done", "skipped"}:
+            return name
+    return "archive_or_handoff" if phase_status else ""
+
+
+def infer_blocker(
+    resume_class: str,
+    next_phase: str,
+    handoff: str,
+    *,
+    raw_count: int,
+    note_count: int,
+) -> str:
+    """literature | project | operator | none"""
+    np = next_phase.lower()
+    if resume_class == "B":
+        return "literature"  # inbox awaiting ingest (still research pipeline)
+    if resume_class == "A":
+        return "literature"
+    if resume_class == "D":
+        return "literature"
+    if resume_class == "C":
+        if note_count == 0 and raw_count >= 1:
+            return "literature"
+        if "application" in np or "specialization" in np:
+            if handoff and ("30_projects" in handoff or "project" in handoff.lower()):
+                return "project"
+            return "project"
+        if "archive" in np or "handoff" in np:
+            return "operator" if not handoff else "project"
+        if raw_count < 3:
+            return "literature"
+        return "none"
+    return "none"
+
+
+def build_suggested_command(
+    slug: str,
+    resume_class: str,
+    blocker: str,
+    next_phase: str,
+    handoff: str,
+) -> str:
+    if resume_class == "B":
+        return "bin/ingest-minion run --dry-run && bin/ingest-minion run --apply"
+    if resume_class == "D":
+        return f"bin/research-lane-loop audit-indexes --status active --repair-index"
+    if resume_class == "A" or (blocker == "literature" and resume_class != "C"):
+        return f"# source-literature for {slug} (capture what exists; no target count)"
+    if blocker == "literature" and resume_class == "C":
+        return f"# coverage check or synthesis for {slug}; then update tracker"
+    if blocker == "project":
+        target = ""
+        # first 30_projects path token in handoff
+        m = re.search(r"30_projects/([a-z0-9_-]+)", handoff or "")
+        if m:
+            target = m.group(1)
+            note = f"advance to {next_phase or 'application'}"
+            return (
+                f"bin/research-lane-loop handoff-project --slug {slug} "
+                f"--to {target} --note {note!r}"
+            )
+        return f"# application work for {slug} (set project next_action)"
+    if blocker == "operator":
+        return f"# operator decision: archive or continue {slug}"
+    if next_phase and "archive" in next_phase.lower():
+        return f"bin/lane-intake archive {slug} --apply  # only if stop condition met"
+    return f"bin/research-lane-loop preflight --slug {slug}"
+
+
+def preflight_slug(slug: str) -> PreflightReport:
+    readme = find_lane_readme(slug)
+    if not readme:
+        raise SystemExit(f"Lane not found: {slug}")
+    text = readme.read_text(encoding="utf-8", errors="ignore")
+    fm = parse_frontmatter(readme)
+    domain = fm.get("knowledge_domain", "")
+    tags = parse_capture_tags(fm, text)
+    lane_id = fm.get("lane_id", "")
+    inbox = find_inbox_stubs_for_lane(tags, slug, lane_id)
+    raws, notes = find_knowledge_files_for_lane(
+        domain, tags, slug, readme_text=text
+    )
+    stale = scan_stale_inbox_refs(text, domain)
+    rclass, reason = classify_resume(inbox, raws, notes, stale)
+    # If D and B both true, prefer B (ingest) but warn about D
+    warnings: list[str] = []
+    if rclass == "B" and stale:
+        warnings.append(
+            "Also has stale capture-index inbox paths — repair after ingest (class D)"
+        )
+    if rclass == "C" and stale:
+        warnings.append("Capture index still lists old 00_inbox/ paths — repair at step 6")
+        # upgrade emphasis: still C for synthesis but flag D repair needed
+    step, card = recommended_step(
+        rclass,
+        domain,
+        has_notes=bool(notes),
+        raw_count=len(raws),
+        note_count=len(notes),
+    )
+    card = [c.replace("SLUG", slug) for c in card]
+
+    phase_status = parse_phase_status(text)
+    next_phase = infer_next_phase(phase_status)
+    handoff = fm.get("handoff", "")
+    blocker = infer_blocker(
+        rclass,
+        next_phase,
+        handoff,
+        raw_count=len(raws),
+        note_count=len(notes),
+    )
+    # When class C with notes and application next, prefer project blocker
+    if rclass == "C" and notes and not next_phase:
+        # read "Phase status" prose fallback
+        if re.search(r"application\s*[|:]\s*(next|todo|open)", text, re.I):
+            next_phase = "Application"
+            blocker = infer_blocker(rclass, next_phase, handoff, raw_count=len(raws), note_count=len(notes))
+    suggested = build_suggested_command(slug, rclass, blocker, next_phase, handoff)
+    # enrich command card with suggested
+    if suggested and suggested not in card:
+        card = [suggested] + card
+
+    return PreflightReport(
+        slug=slug,
+        lane_id=lane_id,
+        priority=fm.get("priority", ""),
+        status=fm.get("status", ""),
+        knowledge_domain=domain,
+        capture_tags=tags,
+        resume_class=rclass,
+        resume_reason=reason,
+        inbox_stubs=inbox,
+        knowledge_raws=raws,
+        knowledge_notes=notes,
+        stale_index_refs=[asdict(s) for s in stale],
+        recommended_step=step,
+        command_card=card,
+        warnings=warnings,
+        phase_status=phase_status,
+        next_phase=next_phase,
+        blocker=blocker,
+        suggested_command=suggested,
+        handoff=handoff,
+    )
+
+
+def pick_top_lane(priority: str, status: str) -> str | None:
+    rows = lane_intake.list_lanes(status_filter=status, priority_filter=priority)
+    # prefer main lanes/ over completed
+    main = [r for r in rows if r.get("location") == "lanes"]
+    pool = main or rows
+    if not pool:
+        return None
+    return pool[0]["slug"]
+
+
+def format_preflight(report: PreflightReport) -> str:
+    lines = [
+        f"# Research-lane-loop preflight — {report.lane_id or '?'} / {report.slug}",
+        "",
+        f"- **priority:** {report.priority}",
+        f"- **status:** {report.status}",
+        f"- **domain:** {report.knowledge_domain}",
+        f"- **capture_tags:** {', '.join(report.capture_tags) or '(none)'}",
+        f"- **resume_class:** **{report.resume_class}** — {report.resume_reason}",
+        f"- **recommended:** {report.recommended_step}",
+        f"- **next_phase:** {report.next_phase or '(unknown)'}",
+        f"- **blocker:** {report.blocker}",
+        f"- **suggested_command:** `{report.suggested_command}`" if report.suggested_command else "- **suggested_command:** (none)",
+        f"- **handoff:** {report.handoff or '(none)'}",
+        "",
+        f"## Inventory",
+        f"- inbox stubs: {len(report.inbox_stubs)}",
+        f"- knowledge raws (tag match): {len(report.knowledge_raws)}",
+        f"- knowledge notes (tag match): {len(report.knowledge_notes)}",
+        f"- stale index refs: {len(report.stale_index_refs)}",
+    ]
+    if report.phase_status:
+        lines.append("")
+        lines.append("## Phase status")
+        for ph, st in report.phase_status.items():
+            lines.append(f"- {ph}: {st}")
+    if report.warnings:
+        lines.append("")
+        lines.append("## Warnings")
+        for w in report.warnings:
+            lines.append(f"- {w}")
+    if report.inbox_stubs:
+        lines.append("")
+        lines.append("## Inbox stubs")
+        for p in report.inbox_stubs:
+            lines.append(f"- `{p}`")
+    if report.stale_index_refs:
+        lines.append("")
+        lines.append("## Stale capture-index paths")
+        for s in report.stale_index_refs:
+            kp = s.get("knowledge_path") or "(not found in 10_knowledge/)"
+            lines.append(f"- `{s['tracker_path']}` → `{kp}`")
+    if report.knowledge_raws:
+        lines.append("")
+        lines.append("## Knowledge raws (sample)")
+        for p in report.knowledge_raws[:12]:
+            lines.append(f"- `{p}`")
+        if len(report.knowledge_raws) > 12:
+            lines.append(f"- … +{len(report.knowledge_raws) - 12} more")
+    if report.knowledge_notes:
+        lines.append("")
+        lines.append("## Knowledge notes")
+        for p in report.knowledge_notes[:8]:
+            lines.append(f"- `{p}`")
+    lines.append("")
+    lines.append("## Command card")
+    lines.append("```bash")
+    lines.extend(report.command_card)
+    lines.append("```")
+    lines.append("")
+    lines.append(f"Workflow: `{WORKFLOW.relative_to(ROOT)}`")
+    return "\n".join(lines)
+
+
+def cmd_handoff_project(
+    slug: str,
+    to_project: str,
+    note: str,
+    dry_run: bool,
+    *,
+    kind: str = "application",
+    evidence: str | None = None,
+    urgency: str | None = None,
+) -> int:
+    """Outbound research → project handoff (typed).
+
+    Kinds: see `.context/workflows/research-project-handoff.md`
+    """
+    from datetime import date as _date
+
+    kinds = {
+        "gate",
+        "application",
+        "opportunity",
+        "constraint",
+        "experiment",
+        "craft",
+        "knowledge",
+        "split",
+        "close",
+    }
+    kind = (kind or "application").lower().strip()
+    if kind not in kinds:
+        print(f"kind must be one of {sorted(kinds)}", file=sys.stderr)
+        return 2
+
+    readme = find_lane_readme(slug)
+    if not readme:
+        print(f"Lane not found: {slug}", file=sys.stderr)
+        return 1
+
+    proj = ROOT / "30_projects" / to_project
+    if kind != "split" and not proj.is_dir():
+        print(f"Project not found: {proj}", file=sys.stderr)
+        return 1
+
+    today = _date.today().isoformat()
+    default_urgency = {
+        "gate": "high",
+        "application": "high",
+        "opportunity": "low",
+        "constraint": "medium",
+        "experiment": "medium",
+        "craft": "medium",
+        "knowledge": "low",
+        "split": "medium",
+        "close": "high",
+    }
+    urg = (urgency or default_urgency[kind]).lower()
+    evidence = (evidence or "").strip()
+    note = (note or "").strip() or "see lane README / synthesis"
+
+    next_loop = {
+        "gate": "implement",
+        "application": "implement",
+        "opportunity": "none",
+        "constraint": "none",
+        "experiment": "experiment",
+        "craft": "craft",
+        "knowledge": "none",
+        "split": "intake",
+        "close": "archive",
+    }[kind]
+
+    does_not = {
+        "gate": "not optional flavor text — a decision depends on this",
+        "application": "not a new literature search; implement or craft the application phase",
+        "opportunity": "not a forced WIP steal; consider when capacity allows",
+        "constraint": "not a full product redesign — a bound on existing plans",
+        "experiment": "not a craft smoke; open a measured eval_run_id",
+        "craft": "not registry metrics by default; one craft question",
+        "knowledge": "not project labor — consume the durable note",
+        "split": "not this project's next_action — candidate for research-lane-intake",
+        "close": "not a phase pause — lane stop / archive path",
+    }[kind]
+
+    handoff_msg = (
+        f"[{kind}/{urg}] lane `{slug}` → `{to_project}`: {note}"
+        + (f" | evidence: {evidence}" if evidence else "")
+    )
+
+    def _set_na(path: Path, value: str) -> None:
+        raw = path.read_text(encoding="utf-8")
+        if raw.startswith("---"):
+            parts = raw.split("---", 2)
+            if len(parts) >= 3:
+                head, body = parts[1], parts[2]
+                if re.search(r"^next_action:\s*", head, re.M):
+                    head = re.sub(
+                        r"^next_action:\s*.*$",
+                        f'next_action: "{value}"',
+                        head,
+                        count=1,
+                        flags=re.M,
+                    )
+                else:
+                    head = head.rstrip() + f'\nnext_action: "{value}"\n'
+                if re.search(r"^updated:\s*", head, re.M):
+                    head = re.sub(
+                        r"^updated:\s*.*$",
+                        f'updated: "{today}"',
+                        head,
+                        count=1,
+                        flags=re.M,
+                    )
+                path.write_text(f"---{head}---{body}", encoding="utf-8")
+                return
+        path.write_text(raw + f"\n\nnext_action: {value}\n", encoding="utf-8")
+
+    def _append_log(path: Path, title: str, body: str) -> None:
+        entry = f"\n## {today} | {title}\n\n{body}\n"
+        if path.exists():
+            path.write_text(path.read_text(encoding="utf-8") + entry, encoding="utf-8")
+        else:
+            path.write_text("# Log\n" + entry, encoding="utf-8")
+
+    if kind == "close":
+        lane_next = (
+            f"Lane stop / close path — handoff to consumers done; "
+            f"run bin/lane-intake archive {slug} when operator accepts."
+        )
+    elif kind == "split":
+        lane_next = (
+            f"Split candidate emitted toward research intake "
+            f"(related project signal: {to_project})."
+        )
+    elif kind in {"application", "gate"}:
+        lane_next = (
+            f"{kind}: with `{to_project}` — literature stop for this signal; "
+            f"re-enter research-lane-loop only for a new phase/question."
+        )
+    else:
+        lane_next = (
+            f"Handoff ({kind}) filed to `{to_project}`; "
+            f"lane may continue other phases or wait on consumer."
+        )
+
+    proj_na: str | None = None
+    steal_next = kind in {"gate", "application", "experiment", "craft"}
+    if kind == "experiment":
+        proj_na = (
+            f"From lane `{slug}` [{kind}]: {note}. "
+            f"Next: bin/project-experiment-loop scaffold --project {to_project} "
+            f'--study-type exploratory --title "from-{slug}" '
+            f'--decision "{note[:80]}"'
+        )
+    elif kind == "craft":
+        proj_na = (
+            f"From lane `{slug}` [{kind}]: {note}. "
+            f"Next: bin/craft-research-loop scaffold --project {to_project} "
+            f'--question "{note[:100]}" '
+            f'--decision "If yes, adopt; if no, iterate."'
+        )
+    elif kind in {"gate", "application"}:
+        proj_na = f"From lane `{slug}` [{kind}/{urg}]: {note}"
+        if evidence:
+            proj_na += f" Evidence: {evidence}"
+
+    if dry_run:
+        print(f"dry-run kind={kind} urgency={urg} next_loop={next_loop}")
+        print(f"  lane next_action → {lane_next}")
+        if steal_next and proj_na:
+            print(f"  project next_action REPLACE → {proj_na[:200]}")
+        elif kind == "opportunity":
+            print("  project: append CONSIDER to log only (no next_action steal)")
+        elif kind == "constraint":
+            print("  project: append decisions/risk log (no automatic next_action steal)")
+        elif kind == "knowledge":
+            print("  project: cite evidence in log only")
+        elif kind == "split":
+            print("  project: no next_action change; emit lane candidate")
+        print(f"  does_not_mean: {does_not}")
+        return 0
+
+    lane_log = readme.parent / "log.md"
+    _append_log(
+        lane_log,
+        f"handoff-project [{kind}] → `{to_project}`",
+        f"- {handoff_msg}\n"
+        f"- next_loop: {next_loop}\n"
+        f"- does_not_mean: {does_not}\n"
+        f"- lane next_action: {lane_next}\n",
+    )
+    _set_na(readme, lane_next)
+
+    if kind == "split":
+        if proj.is_dir() and (proj / "README.md").exists():
+            _append_log(
+                proj / "log.md",
+                f"research split signal from `{slug}`",
+                f"- {handoff_msg}\n- Action: consider research-lane-intake, not implement.\n",
+            )
+        print(f"Handed off [{kind}] lane `{slug}` (split — intake, not implement)")
+        print(f"  does_not_mean: {does_not}")
+        return 0
+
+    proj_readme = proj / "README.md"
+    if not proj_readme.exists():
+        print(f"Missing {proj_readme}", file=sys.stderr)
+        return 1
+
+    pfm = parse_frontmatter(proj_readme)
+    prev = pfm.get("next_action", "")
+
+    if steal_next and proj_na:
+        _set_na(proj_readme, proj_na[:500])
+        action_note = f"next_action replaced (prior kept in log): {prev[:120]}"
+    elif kind == "opportunity":
+        action_note = "CONSIDER only — primary next_action unchanged"
+    elif kind == "constraint":
+        action_note = "constraint logged — review decisions.md / risks"
+        if not prev.strip():
+            _set_na(
+                proj_readme,
+                f"From lane `{slug}` [constraint]: review bound — {note}",
+            )
+            action_note += " (set next_action because project was idle)"
+    elif kind == "knowledge":
+        action_note = "knowledge cite only"
+    elif kind == "close":
+        action_note = "lane close notify — no forced implement"
+    else:
+        action_note = "logged"
+
+    receipt_dir = proj / "outputs"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt_path = receipt_dir / f"{today}-handoff-{kind}-{slug}.md"
+    receipt = f"""---
+title: "Research handoff — {kind} — {slug} → {to_project}"
+domain: "knowledge-systems"
+type: "project"
+status: "active"
+handoff_kind: "{kind}"
+from_lane: "{slug}"
+to_project: "{to_project}"
+urgency: "{urg}"
+next_loop: "{next_loop}"
+updated: "{today}"
+source: "bin/research-lane-loop handoff-project"
+tags: ["research-handoff", "handoff", "{kind}"]
+---
+
+# Research handoff — {kind}
+
+## Decision or signal
+
+{note}
+
+## Kind
+
+| Field | Value |
+|-------|-------|
+| kind | {kind} |
+| urgency | {urg} |
+| next_loop | {next_loop} |
+| from_lane | {slug} |
+| to_project | {to_project} |
+
+## Evidence
+
+- {evidence or "(none provided — add paths)"}
+
+## Does not mean
+
+- {does_not}
+
+## Routing applied
+
+- {action_note}
+- prior project next_action: {prev[:200] if prev else "(empty)"}
+"""
+    receipt_path.write_text(receipt, encoding="utf-8")
+
+    log_body = (
+        f"- {handoff_msg}\n"
+        f"- next_loop: **{next_loop}**\n"
+        f"- does_not_mean: {does_not}\n"
+        f"- routing: {action_note}\n"
+        f"- receipt: `{receipt_path.relative_to(ROOT)}`\n"
+    )
+    if kind == "opportunity":
+        log_body = f"### CONSIDER\n\n{log_body}"
+    if kind == "constraint":
+        log_body = f"### CONSTRAINT\n\n{log_body}"
+    _append_log(proj / "log.md", f"research handoff [{kind}] from `{slug}`", log_body)
+
+    if kind == "constraint":
+        dec = proj / "decisions.md"
+        block = (
+            f"\n## {today} — constraint from lane `{slug}`\n\n"
+            f"**Signal:** {note}\n\n"
+            f"**Evidence:** {evidence or 'see handoff receipt'}\n\n"
+            f"**Receipt:** `{receipt_path.relative_to(ROOT)}`\n"
+        )
+        if dec.exists():
+            dec.write_text(dec.read_text(encoding="utf-8") + block, encoding="utf-8")
+        else:
+            dec.write_text("# Decisions\n" + block, encoding="utf-8")
+
+    print(f"Handed off [{kind}/{urg}] lane `{slug}` → project `{to_project}`")
+    print(f"  next_loop: {next_loop}")
+    print(f"  receipt: {receipt_path.relative_to(ROOT)}")
+    print(f"  routing: {action_note}")
+    print(f"  does_not_mean: {does_not}")
+    return 0
+
+
+def audit_indexes(status: str | None, repair: bool) -> dict[str, Any]:
+    rows = lane_intake.list_lanes(status_filter=status, priority_filter=None)
+    # only main lanes for repair by default
+    findings: list[dict[str, Any]] = []
+    repaired: list[str] = []
+    for r in rows:
+        if r.get("location") != "lanes":
+            continue
+        readme = Path(r["path"])
+        text = readme.read_text(encoding="utf-8", errors="ignore")
+        fm = parse_frontmatter(readme)
+        domain = fm.get("knowledge_domain", "")
+        stale = scan_stale_inbox_refs(text, domain)
+        fixable = [s for s in stale if s.knowledge_path]
+        if not stale:
+            continue
+        entry = {
+            "slug": r["slug"],
+            "lane_id": r.get("id"),
+            "stale_count": len(stale),
+            "fixable_count": len(fixable),
+            "stale": [asdict(s) for s in stale],
+        }
+        findings.append(entry)
+        if repair and fixable:
+            new_text = text
+            for s in fixable:
+                assert s.knowledge_path
+                # replace bare and backticked forms
+                new_text = new_text.replace(s.tracker_path, s.knowledge_path)
+            if new_text != text:
+                readme.write_text(new_text, encoding="utf-8")
+                repaired.append(r["slug"])
+    return {
+        "lanes_with_stale_refs": len(findings),
+        "repaired": repaired,
+        "repair_applied": repair,
+        "findings": findings,
+    }
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Research-lane-loop preflight and index audit")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pf = sub.add_parser("preflight", help="Classify resume class A–D for a lane")
+    pf.add_argument("--slug", help="Lane slug (directory name)")
+    pf.add_argument("--priority", default="P0", help="When --slug omitted, pick top match")
+    pf.add_argument("--status", default="active", help="Status filter for auto-pick")
+    pf.add_argument("--json", action="store_true")
+
+    doc = sub.add_parser(
+        "doctor",
+        help="Preflight top P0 active lane, or --all-active portfolio table (G8)",
+    )
+    doc.add_argument("--json", action="store_true")
+    doc.add_argument(
+        "--all-active",
+        action="store_true",
+        help="Table of all active lanes: class, phase, blocker, suggested command",
+    )
+    doc.add_argument(
+        "--status",
+        default="active",
+        help="With --all-active, lane status filter (default active)",
+    )
+
+    au = sub.add_parser("audit-indexes", help="Find stale 00_inbox paths in lane trackers")
+    au.add_argument("--status", default="active")
+    au.add_argument("--json", action="store_true")
+    au.add_argument(
+        "--repair-index",
+        action="store_true",
+        help="Rewrite fixable 00_inbox → 10_knowledge paths in trackers",
+    )
+
+    ho = sub.add_parser(
+        "handoff-project",
+        help="Typed research→project handoff (see research-project-handoff.md)",
+    )
+    ho.add_argument("--slug", required=True, help="Lane slug")
+    ho.add_argument("--to", required=True, dest="to_project", help="30_projects/<slug>")
+    ho.add_argument(
+        "--kind",
+        default="application",
+        choices=[
+            "gate",
+            "application",
+            "opportunity",
+            "constraint",
+            "experiment",
+            "craft",
+            "knowledge",
+            "split",
+            "close",
+        ],
+        help="Handoff kind (default application)",
+    )
+    ho.add_argument("--note", default="", help="One-sentence decision or signal")
+    ho.add_argument("--evidence", default=None, help="Knowledge path(s) supporting the handoff")
+    ho.add_argument(
+        "--urgency",
+        default=None,
+        choices=["high", "medium", "low"],
+        help="Override default urgency for kind",
+    )
+    ho.add_argument("--dry-run", action="store_true")
+
+    args = p.parse_args()
+
+    if args.cmd in {"preflight", "doctor"}:
+        if args.cmd == "doctor" and getattr(args, "all_active", False):
+            rows = lane_intake.list_lanes(
+                status_filter=getattr(args, "status", "active"),
+                priority_filter=None,
+            )
+            main = [r for r in rows if r.get("location") == "lanes"]
+            reports = []
+            for r in main:
+                try:
+                    reports.append(preflight_slug(r["slug"]))
+                except SystemExit:
+                    continue
+            if args.json:
+                print(json.dumps([asdict(x) for x in reports], indent=2))
+            else:
+                print(
+                    f"# Research-lane doctor — all {getattr(args, 'status', 'active')} "
+                    f"({len(reports)} lanes)"
+                )
+                print()
+                print(
+                    f"{'ID':6} {'class':5} {'blocker':10} {'next_phase':18} "
+                    f"{'slug':36} suggested"
+                )
+                print("-" * 110)
+                for rep in reports:
+                    print(
+                        f"{(rep.lane_id or '?'):6} {rep.resume_class:5} "
+                        f"{rep.blocker:10} {(rep.next_phase or '-'):18} "
+                        f"{rep.slug:36} {rep.suggested_command[:40]}"
+                    )
+                print()
+                print(
+                    "blocker=literature|project|operator|none · "
+                    "Workflow: .context/workflows/research-lane-loop.md"
+                )
+            return
+
+        slug = getattr(args, "slug", None)
+        priority = getattr(args, "priority", "P0")
+        status = getattr(args, "status", "active")
+        if args.cmd == "doctor":
+            slug = None
+            priority = "P0"
+            status = "active"
+        if not slug:
+            slug = pick_top_lane(priority, status)
+            if not slug:
+                print(
+                    f"No lanes match --priority {priority} --status {status}. "
+                    "Try: bin/lane-intake list --status active",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        report = preflight_slug(slug)
+        if args.json:
+            print(json.dumps(asdict(report), indent=2))
+        else:
+            print(format_preflight(report))
+        return
+
+    if args.cmd == "audit-indexes":
+        result = audit_indexes(args.status, repair=args.repair_index)
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(
+                f"Lanes with stale inbox refs: {result['lanes_with_stale_refs']} "
+                f"(status={args.status})"
+            )
+            for f in result["findings"]:
+                print(
+                    f"- {f.get('lane_id') or '?'} {f['slug']}: "
+                    f"{f['stale_count']} stale, {f['fixable_count']} fixable"
+                )
+                for s in f["stale"][:5]:
+                    print(f"    {s['tracker_path']} → {s.get('knowledge_path') or '?'}")
+            if args.repair_index:
+                print(f"\nRepaired: {', '.join(result['repaired']) or '(none)'}")
+            else:
+                print("\nDry-run only. Re-run with --repair-index to rewrite fixable paths.")
+        return
+
+    if args.cmd == "handoff-project":
+        raise SystemExit(
+            cmd_handoff_project(
+                args.slug,
+                args.to_project,
+                args.note,
+                args.dry_run,
+                kind=getattr(args, "kind", "application"),
+                evidence=getattr(args, "evidence", None),
+                urgency=getattr(args, "urgency", None),
+            )
+        )
+
+    p.error(f"unknown command {args.cmd}")
+
+
+if __name__ == "__main__":
+    main()

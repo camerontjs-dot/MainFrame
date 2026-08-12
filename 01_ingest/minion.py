@@ -7,6 +7,7 @@ import argparse
 import ast
 import re
 import shutil
+import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -87,8 +88,10 @@ class ParsedFrontmatter:
 
 def strip_quotes(value: str) -> str:
     value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"', '`'}:
+        value = value[1:-1].strip()
+    if value.startswith("`") and value.endswith("`") and len(value) >= 2:
+        value = value[1:-1].strip()
     return value
 
 
@@ -189,6 +192,37 @@ def read_frontmatter(path: Path) -> ParsedFrontmatter:
     )
 
 
+def check_provenance(path: Path) -> list[str]:
+    """G3 gate — reject captures carrying unearned citations.
+
+    Delegates to `bin/capture-validate` so there is exactly one definition of
+    "fabricated identifier" in the repo. Loaded lazily: the gate must never be
+    the reason ingest cannot run, so if the validator is missing or broken the
+    ingest proceeds and says so rather than blocking everything.
+    """
+    try:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+
+        loader = SourceFileLoader("_capval", str(ROOT / "bin" / "capture-validate"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None or spec.loader is None:
+            return []
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # noqa: BLE001 — never block ingest on a broken gate
+        print(f"warning: provenance gate unavailable ({exc}) — routing unchecked",
+              file=sys.stderr)
+        return []
+
+    return [
+        f"{f.rule} {f.message}"
+        for f in mod.validate(path)
+        if f.severity == "error"
+    ]
+
+
 def validate_strict(metadata: dict[str, Any]) -> None:
     """Raise ``FrontmatterError`` if metadata fails the strict v1 schema check."""
     missing = [key for key in REQUIRED_KEYS if key not in metadata]
@@ -201,6 +235,12 @@ def validate_strict(metadata: dict[str, Any]) -> None:
             continue
         if not isinstance(value, str) or not value.strip():
             raise FrontmatterError(f"{key} must be a non-empty string")
+
+    tags = metadata["tags"]
+    if not isinstance(tags, list) or not tags:
+        raise FrontmatterError("tags must be a non-empty string list")
+    if any(not isinstance(tag, str) or not tag.strip() for tag in tags):
+        raise FrontmatterError("tags must contain only non-empty strings")
 
     if metadata["type"] not in ALLOWED_TYPES:
         raise FrontmatterError(f"unsupported type: {metadata['type']}")
@@ -443,7 +483,12 @@ def _decode_pdf_literal(raw: bytes) -> str:
                 if index < len(value) and 48 <= value[index] <= 55:
                     digits += bytes([value[index]])
                     index += 1
-            out.append(int(digits, 8))
+            octal_value = int(digits, 8)
+            if octal_value > 0xFF:
+                # A PDF literal represents bytes. Treat an out-of-range octal
+                # escape as malformed metadata instead of aborting ingestion.
+                return ""
+            out.append(octal_value)
         elif escaped in b"\r\n":
             while index < len(value) and value[index] in b"\r\n":
                 index += 1
@@ -635,13 +680,31 @@ class IngestMinion:
             self._append_log(result)
         return result
 
+    # Operational files are not captures. Without this, the scanner treats
+    # presence in a directory as intent to ingest, so a contract file placed in
+    # `00_inbox/` to govern that folder gets normalized and moved into
+    # `01_ingest/ready/` — the contract migrates out of the folder it governs,
+    # silently and on the first apply. Verified by dry-run on 2026-08-10:
+    #
+    #     OK normalize: 00_inbox/AGENTS.md -> 01_ingest/ready/AGENTS.md
+    #
+    # Matched case-insensitively: `core.ignorecase` is true in this workspace,
+    # so `agents.md` and `AGENTS.md` are the same file to git and must be the
+    # same file here.
+    RESERVED_NAMES = frozenset({
+        "agents.md", "readme.md", "index.md", "claude.md",
+        "license", "license.md", ".gitkeep",
+    })
+
     def _files_in(self, directory: Path) -> list[Path]:
         if not directory.exists():
             return []
         return [
             path
             for path in sorted(directory.iterdir(), key=lambda item: item.name)
-            if path.is_file() and not path.name.startswith(".")
+            if path.is_file()
+            and not path.name.startswith(".")
+            and path.name.lower() not in self.RESERVED_NAMES
         ]
 
     def _stage_inbox(self, result: RunResult, apply: bool, domains: set[str]) -> list[Path]:
@@ -893,6 +956,21 @@ class IngestMinion:
         target = self.knowledge / domain / source.name
         if target.exists():
             result.add("blocked", source, target, "knowledge destination already exists", "error")
+            return
+
+        # G3 — provenance gate. A capture may not enter durable knowledge wearing
+        # a citation it did not earn. See
+        # 20_live/security/2026-08-09__fabricated-source-captures-in-10-knowledge.md
+        # (103 captures with identifiers that do not exist, routed and indexed
+        # because nothing between authoring and `10_knowledge/` ever asked).
+        provenance_errors = check_provenance(source)
+        if provenance_errors:
+            self._reject(
+                source,
+                result,
+                apply,
+                "provenance gate: " + "; ".join(provenance_errors),
+            )
             return
 
         result.add("route", source, target, f"route {item_type} markdown to {domain}")

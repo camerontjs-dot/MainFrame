@@ -1,0 +1,716 @@
+#!/usr/bin/env python3
+"""Research Lane Intake — scaffold trackers from surfaced questions.
+
+This is the explicit step that turns new research questions into
+lanes/<slug>/README.md entries (tracker only).
+
+Usage examples:
+  bin/lane-intake scaffold \
+    --question "How should intent graphs drive RAG routing?" \
+    --decision "Decide on intent-graph integration in retrieval + planning." \
+    --domain "graph-memory" \
+    --trigger "mindgraph-eval multi-RAG planning 2026-06-24" \
+    --slug "intent-graph-rag" \
+    --stakes high --priority P1 --apply
+
+  bin/lane-intake scan some-plan-or-run-note.md --apply
+
+  bin/lane-intake list --status active --priority P0 --format table
+  bin/lane-intake archive dcf-valuation --apply
+  bin/lane-intake set-priority some-slug P0 --apply
+
+Priority model (P0–P4) is project-needs driven. Archive moves completed
+phases to lanes/completed/ (all research retained; see lanes/completed/README.md).
+Always performs dual MindGraph query pass when possible.
+Respects MainFrame boundaries: only writes tracker skeleton + receipt + log append.
+Durable knowledge still requires 00_inbox → ingest pipeline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from datetime import date
+from pathlib import Path
+from textwrap import dedent
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+LANES_DIR = ROOT / "30_projects" / "research-lanes-strategy" / "lanes"
+COMPLETED_DIR = LANES_DIR / "completed"
+MASTER_PLAN = ROOT / "30_projects" / "research-lanes-strategy" / "plans" / "research-lanes-master-plan.md"
+LOG = ROOT / "30_projects" / "research-lanes-strategy" / "log.md"
+RAW_MATERIALS = ROOT / "30_projects" / "research-lanes-strategy" / "raw-materials"
+TEMPLATE = LANES_DIR / "_TEMPLATE.md"
+MINDGRAPH = ROOT / "bin" / "mindgraph"
+
+TODAY = date.today().isoformat()
+
+
+def run_dual_mindgraph(query: str, top_k: int = 6) -> dict[str, Any]:
+    """Run dual queries. Returns dict with knowledge + projects results or errors."""
+    results: dict[str, Any] = {"query": query, "knowledge": [], "projects": [], "errors": []}
+    if not MINDGRAPH.exists():
+        results["errors"].append("bin/mindgraph not found")
+        return results
+
+    for label, db in [
+        ("knowledge", str(Path.home() / ".mindgraph" / "mainframe.sqlite")),
+        ("projects", str(Path.home() / ".mindgraph" / "mainframe-projects.sqlite")),
+    ]:
+        cmd = [
+            str(MINDGRAPH),
+            "query",
+            query,
+            "--db",
+            db,
+            "--json",
+            "--top-k",
+            str(top_k),
+        ]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if out.returncode == 0:
+                try:
+                    data = json.loads(out.stdout)
+                    results[label] = data if isinstance(data, list) else [data]
+                except Exception:
+                    results[label] = [{"raw": out.stdout[:2000]}]
+            else:
+                results["errors"].append(f"{label}: {out.stderr[:300]}")
+        except Exception as e:
+            results["errors"].append(f"{label}: {e}")
+    return results
+
+
+def find_lane_dir(slug: str) -> Path | None:
+    """Find lane dir in main lanes/ or completed/."""
+    for base in (LANES_DIR, COMPLETED_DIR):
+        p = base / slug
+        if p.exists() and (p / "README.md").exists():
+            return p
+    return None
+
+
+def parse_frontmatter(path: Path) -> dict[str, str]:
+    """Lightweight frontmatter parser (no PyYAML dep)."""
+    if not path.exists():
+        return {}
+    text = path.read_text()
+    if not text.startswith("---"):
+        return {}
+    m = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+    if not m:
+        return {}
+    fm = {}
+    for line in m.group(1).splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        fm[k] = v
+    return fm
+
+
+def next_lane_id(prefix: str = "C") -> str:
+    """Heuristic: scan master plan for highest ID with given prefix."""
+    if not MASTER_PLAN.exists():
+        return f"{prefix}01"
+    text = MASTER_PLAN.read_text()
+    ids = re.findall(rf"\b{prefix}(\d+)\b", text)
+    if not ids:
+        return f"{prefix}01"
+    max_n = max(int(x) for x in ids)
+    return f"{prefix}{max_n + 1:02d}"
+
+
+def slugify(text: str) -> str:
+    s = text.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return s.strip("-")[:60]
+
+
+def load_template() -> str:
+    if TEMPLATE.exists():
+        return TEMPLATE.read_text()
+    # Fallback minimal
+    return dedent("""\
+    ---
+    title: "Lane: <name>"
+    domain: "general-research"
+    type: "project"
+    status: "active"
+    lane_id: "CXX"
+    knowledge_domain: "<primary-10_knowledge-domain>"
+    capture_tags: ["research-lane", "lane-cxx", "<topic>"]
+    stakes: "high"
+    cadence: "weekly"
+    priority: "next"
+    handoff: ""
+    updated: "YYYY-MM-DD"
+    tags: ["research-lane"]
+    ---
+
+    ## Central question
+
+    (one sentence)
+
+    ## Decision this lane supports
+
+    (one sentence)
+
+    ## Knowledge routing
+
+    - **Captures:** `00_inbox/` → `bin/ingest-minion` → `10_knowledge/<knowledge_domain>/`
+    - **Synthesis:** `10_knowledge/<knowledge_domain>/` when 3+ related stubs
+    - **Routing doc:** `plans/knowledge-routing.md`
+    - **Research convention:** `plans/first-principles-research-conventions.md`
+
+    ## First-principles pass
+
+    - **Foundation question:** ...
+    - **Primitive map:** ...
+    - **Specialization path:** ...
+    - **Stop condition:** ...
+
+    ## Captured knowledge (index only)
+
+    | Date | Path | Phase | Type | Status |
+    |------|------|-------|------|--------|
+    | — | — | — | — | no captures yet |
+
+    ## Spin-out project
+
+    `30_projects/<name>` — implementation and experiments live there.
+    """)
+
+
+def render_lane_readme(meta: dict[str, str]) -> str:
+    tpl = load_template()
+    # Very lightweight substitution for the critical fields
+    replacements = {
+        "<name>": meta.get("title", meta.get("slug", "New Lane")),
+        "CXX": meta.get("lane_id", "C??"),
+        "<primary-10_knowledge-domain>": meta.get("knowledge_domain", "knowledge-systems"),
+        "lane-cxx": f"lane-{meta.get('lane_id', 'c??').lower()}",
+        "<topic>": meta.get("slug", "research"),
+        "YYYY-MM-DD": TODAY,
+    }
+    content = tpl
+    for k, v in replacements.items():
+        content = content.replace(k, v)
+
+    # Force key fields in frontmatter
+    content = re.sub(
+        r'lane_id: ".*?"',
+        f'lane_id: "{meta.get("lane_id", "C??")}"',
+        content,
+    )
+    content = re.sub(
+        r'knowledge_domain: ".*?"',
+        f'knowledge_domain: "{meta.get("knowledge_domain", "knowledge-systems")}"',
+        content,
+    )
+    content = re.sub(
+        r'priority: ".*?"',
+        f'priority: "{meta.get("priority", "P1")}"',
+        content,
+    )
+    content = re.sub(
+        r'stakes: ".*?"',
+        f'stakes: "{meta.get("stakes", "high")}"',
+        content,
+    )
+    if meta.get("project_ties"):
+        # inject or update optional project_ties line
+        if "project_ties:" in content:
+            content = re.sub(r'project_ties: ".*?"', f'project_ties: "{meta["project_ties"]}"', content)
+        else:
+            content = re.sub(
+                r'(priority: "[^"]*")',
+                r'\1\nproject_ties: "' + meta["project_ties"] + '"',
+                content,
+            )
+
+    # Inject actual question/decision after headers
+    q = meta.get("central_question", "(fill in)")
+    d = meta.get("decision", "(fill in)")
+    handoff = meta.get("handoff", "")
+
+    # Replace the placeholder sections if present
+    content = re.sub(
+        r"## Central question\n\n\(one sentence\)",
+        f"## Central question\n\n{q}",
+        content,
+    )
+    content = re.sub(
+        r"## Decision this lane supports\n\n\(one sentence\)",
+        f"## Decision this lane supports\n\n{d}",
+        content,
+    )
+    if handoff:
+        content = re.sub(
+            r"## Spin-out project\n\n`30_projects/<name>`.*",
+            f"## Spin-out project\n\n{handoff}",
+            content,
+            flags=re.DOTALL,
+        )
+
+    # Ensure capture_tags include both raw lane id and lane-<id> tag
+    lid = meta.get("lane_id", "").lower()
+    if lid:
+        lane_tag = f"lane-{lid}" if not lid.startswith("lane-") else lid
+        content = re.sub(
+            r'capture_tags: \["research-lane", "[^"]*", "[^"]*"\]',
+            f'capture_tags: ["research-lane", "{lid}", "{lane_tag}", "{meta.get("slug", "")}"]',
+            content,
+        )
+
+    # Add trigger note at end if present
+    trigger = meta.get("trigger")
+    if trigger:
+        content += f"\n\n## Intake provenance\n\n- Trigger: {trigger}\n- Created: {TODAY} via bin/lane-intake\n"
+
+    return content
+
+
+def write_receipt(meta: dict[str, str], mg_results: dict[str, Any]) -> Path:
+    RAW_MATERIALS.mkdir(parents=True, exist_ok=True)
+    slug = meta.get("slug", "new-lane")
+    path = RAW_MATERIALS / f"{TODAY}__proposed-lane-{slug}.md"
+    row = f"| {meta.get('lane_id','C??')} | `{slug}` | {meta.get('central_question','')} | {meta.get('priority','next')} | {meta.get('stakes','high')} | {meta.get('handoff','')} | proposed |"
+
+    receipt = dedent(f"""\
+        ---
+        title: "Proposed lane: {meta.get('slug')}"
+        type: "proposed-lane"
+        created: "{TODAY}"
+        trigger: "{meta.get('trigger', '')}"
+        ---
+
+        # Proposed Research Lane — {meta.get('lane_id')} {slug}
+
+        **Central question:** {meta.get('central_question')}
+
+        **Decision supported:** {meta.get('decision')}
+
+        **Knowledge domain:** {meta.get('knowledge_domain')}
+        **Stakes / Priority:** {meta.get('stakes')} / {meta.get('priority')}
+
+        ## Suggested master-plan row (copy into correct tier)
+        {row}
+
+        ## Dual MindGraph pass (nominations only)
+        ```json
+        {json.dumps(mg_results, indent=2)[:4000]}
+        ```
+
+        ## Next
+        1. Review this receipt + dual results.
+        2. `bin/lane-intake scaffold ... --apply` (if not already).
+        3. Insert row into research-lanes-master-plan.md.
+        4. Apply first-principles pass before any source batch.
+        5. Use lane README as brief for source-literature.
+        """)
+    path.write_text(receipt)
+    return path
+
+
+def append_log(meta: dict[str, str]):
+    if not LOG.exists():
+        return
+    entry = dedent(f"""
+
+        ## {TODAY} | New lane via intake — {meta.get('lane_id')} {meta.get('slug')}
+
+        - **Added** {meta.get('lane_id')} `{meta.get('slug')}` — {meta.get('central_question')}
+        - **Trigger:** {meta.get('trigger', 'operator / process')}
+        - **Trackers:** lane README created; master-plan row suggested in receipt; log updated.
+        - **MindGraph:** dual pass recorded in receipt.
+        """)
+    with LOG.open("a") as f:
+        f.write(entry)
+
+
+# Priority aliases: list --priority P0 also matches legacy "immediate", etc.
+PRIORITY_ALIASES: dict[str, set[str]] = {
+    "p0": {"p0", "immediate"},
+    "p1": {"p1", "next", "high"},
+    "p2": {"p2", "medium"},
+    "p3": {"p3", "later", "low"},
+    "p4": {"p4", "monitor", "alongside", "deferred", "curiosity"},
+}
+
+
+def _priority_matches(prio: str, priority_filter: str) -> bool:
+    """Match P0–P4 filters against both Pn labels and legacy vocabulary."""
+    p = (prio or "").strip().lower()
+    f = priority_filter.strip().lower()
+    if not f:
+        return True
+    if p == f or p.startswith(f):
+        return True
+    # Normalize "P0 critical" → p0
+    token = p.split()[0] if p else ""
+    aliases = PRIORITY_ALIASES.get(f, {f})
+    return token in aliases or p in aliases
+
+
+def _status_matches(status: str, status_filter: str) -> bool:
+    """Prefix match so 'active — specialization pass done' matches --status active."""
+    s = (status or "").strip().lower()
+    f = status_filter.strip().lower()
+    if not f:
+        return True
+    return s == f or s.startswith(f) or s.startswith(f + " ") or s.startswith(f + "—") or s.startswith(f + "-")
+
+
+def list_lanes(status_filter: str | None = None, priority_filter: str | None = None, fmt: str = "table") -> list[dict[str, str]]:
+    """Scan lanes/ and lanes/completed/ and return filtered list."""
+    results = []
+    for base, loc in [(LANES_DIR, "lanes"), (COMPLETED_DIR, "completed")]:
+        if not base.exists():
+            continue
+        for d in sorted(base.iterdir()):
+            if not d.is_dir() or d.name.startswith(".") or d.name == "completed":
+                continue
+            readme = d / "README.md"
+            if not readme.exists():
+                continue
+            fm = parse_frontmatter(readme)
+            if not fm:
+                continue
+            st = fm.get("status", "unknown")
+            prio = fm.get("priority", "P?")
+            lid = fm.get("lane_id", "")
+            if status_filter and not _status_matches(st, status_filter):
+                continue
+            if priority_filter and not _priority_matches(prio, priority_filter):
+                continue
+            results.append({
+                "id": lid,
+                "slug": d.name,
+                "status": st,
+                "priority": prio,
+                "domain": fm.get("knowledge_domain", ""),
+                "location": loc,
+                "path": str(readme),
+            })
+    # sort by priority rough (P0 first), then id
+    prio_order = {"P0": 0, "P1": 1, "immediate": 0, "P2": 2, "P3": 3, "P4": 4, "next": 1, "later": 3, "high": 1, "monitor": 4}
+    results.sort(key=lambda r: (prio_order.get(r["priority"].split()[0] if r["priority"] else "P9", 9), r.get("id", "")))
+    return results
+
+
+def format_list(results: list[dict[str, str]], fmt: str = "table") -> str:
+    if fmt == "json":
+        return json.dumps(results, indent=2)
+    if not results:
+        return "No matching lanes."
+    lines = ["ID\tPriority\tStatus\tLocation\tSlug"]
+    for r in results:
+        lines.append(f"{r['id']}\t{r['priority']}\t{r['status']}\t{r['location']}\t{r['slug']}")
+    return "\n".join(lines)
+
+
+def archive_lane(slug: str, apply: bool = False) -> dict[str, Any]:
+    """Move a lane from lanes/ to lanes/completed/. Updates frontmatter status."""
+    src = LANES_DIR / slug
+    dst_dir = COMPLETED_DIR / slug
+    readme = src / "README.md"
+    result = {"slug": slug, "moved": False, "updated": False, "error": None}
+
+    if not src.exists() or not readme.exists():
+        # maybe already archived?
+        if (COMPLETED_DIR / slug).exists():
+            result["error"] = "already in completed/"
+            return result
+        result["error"] = "lane not found in lanes/"
+        return result
+
+    fm = parse_frontmatter(readme)
+    content = readme.read_text()
+
+    if apply:
+        COMPLETED_DIR.mkdir(parents=True, exist_ok=True)
+        # update frontmatter status to complete if not already
+        if fm.get("status") != "complete":
+            content = re.sub(r'(?m)^status:\s*".*?"', 'status: "complete"', content)
+            content = re.sub(r'(?m)^status:\s*\S+', 'status: "complete"', content)
+            readme.write_text(content)  # write before move
+            result["updated"] = True
+
+        # move
+        dst_dir.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst_dir)
+        result["moved"] = True
+
+        # log
+        append_log({"lane_id": fm.get("lane_id", ""), "slug": slug, "central_question": "(archived)", "trigger": "bin/lane-intake archive"})
+        # best-effort master plan + lanes/README update (status column)
+        _update_master_plan_status(slug, "complete")
+        _update_lanes_readme_status(slug, "complete")
+
+    result["dst"] = str(dst_dir)
+    return result
+
+
+def _update_master_plan_status(slug: str, new_status: str):
+    if not MASTER_PLAN.exists():
+        return
+    text = MASTER_PLAN.read_text()
+    # crude but effective: target the row containing the slug
+    pattern = rf"(\| .*?`?{re.escape(slug)}`? .*?\| )(parked|active|complete|\*\*complete\*\*|\*\*active\*\*)(\s*\|)"
+    def repl(m):
+        return m.group(1) + new_status + m.group(3)
+    new_text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    if new_text != text:
+        MASTER_PLAN.write_text(new_text)
+
+
+def _update_lanes_readme_status(slug: str, new_status: str):
+    lr = LANES_DIR / "README.md"
+    if not lr.exists():
+        return
+    text = lr.read_text()
+    # look for the table row with the slug folder
+    pattern = rf"(\| .*?`?{re.escape(slug)}/?`? .*?\| )(parked|active|complete|\*\*.*?\*\*)(\s*\|)"
+    def repl(m):
+        return m.group(1) + new_status + m.group(3)
+    new_text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    if new_text != text:
+        lr.write_text(new_text)
+
+
+def set_priority(slug: str, new_priority: str, apply: bool = False) -> dict[str, Any]:
+    """Update priority in a lane's frontmatter (works for main or completed)."""
+    lane_dir = find_lane_dir(slug)
+    result = {"slug": slug, "priority": new_priority, "updated": False, "error": None}
+    if not lane_dir:
+        result["error"] = "lane not found"
+        return result
+    readme = lane_dir / "README.md"
+    content = readme.read_text()
+    fm = parse_frontmatter(readme)
+
+    if apply:
+        # replace priority line
+        content = re.sub(r'(?m)^priority:\s*".*?"', f'priority: "{new_priority}"', content)
+        content = re.sub(r'(?m)^priority:\s*\S+', f'priority: "{new_priority}"', content)
+        readme.write_text(content)
+        result["updated"] = True
+        # optional: touch updated date
+        content2 = readme.read_text()
+        content2 = re.sub(r'(?m)^updated:\s*".*?"', f'updated: "{TODAY}"', content2)
+        readme.write_text(content2)
+
+        # best effort update tables
+        _update_master_plan_priority(slug, new_priority)
+        _update_lanes_readme_priority(slug, new_priority)
+
+    result["path"] = str(readme)
+    return result
+
+
+def _update_master_plan_priority(slug: str, new_prio: str):
+    if not MASTER_PLAN.exists():
+        return
+    text = MASTER_PLAN.read_text()
+    pattern = rf"(\| .*?`?{re.escape(slug)}`? .*?\| )(P[0-9]|immediate|next|later|monitor|high|medium|low|.*?)( \|)"
+    def repl(m):
+        return m.group(1) + new_prio + m.group(3)
+    new_text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    if new_text != text:
+        MASTER_PLAN.write_text(new_text)
+
+
+def _update_lanes_readme_priority(slug: str, new_prio: str):
+    lr = LANES_DIR / "README.md"
+    if not lr.exists():
+        return
+    # lanes/README currently doesn't have priority column in main table; skip or extend later
+    pass
+
+
+def scaffold(meta: dict[str, str], apply: bool = False) -> dict[str, Any]:
+    slug = meta.get("slug") or slugify(meta.get("central_question", "new-research-lane"))
+    meta["slug"] = slug
+
+    if not meta.get("lane_id"):
+        # choose prefix from domain or default C
+        prefix = "C"
+        if "fn" in meta.get("knowledge_domain", "").lower() or "finance" in meta.get("knowledge_domain", "").lower():
+            prefix = "FN"
+        elif "data" in meta.get("knowledge_domain", "").lower():
+            prefix = "DATA"
+        meta["lane_id"] = next_lane_id(prefix)
+
+    lane_dir = LANES_DIR / slug
+    readme_path = lane_dir / "README.md"
+
+    result = {
+        "slug": slug,
+        "lane_id": meta["lane_id"],
+        "lane_dir": str(lane_dir),
+        "readme": str(readme_path),
+        "created": False,
+        "receipt": None,
+        "log_appended": False,
+    }
+
+    mg = run_dual_mindgraph(meta.get("central_question", slug))
+    receipt_path = write_receipt(meta, mg)
+    result["receipt"] = str(receipt_path)
+
+    if lane_dir.exists() and readme_path.exists():
+        result["error"] = "lane already exists"
+        return result
+
+    if apply:
+        lane_dir.mkdir(parents=True, exist_ok=True)
+        content = render_lane_readme(meta)
+        readme_path.write_text(content)
+        result["created"] = True
+        append_log(meta)
+        result["log_appended"] = True
+
+    return result
+
+
+def parse_candidate_block(text: str) -> dict[str, str] | None:
+    """Very simple parser for the ## Research Lane Candidate block."""
+    m = re.search(r"## Research Lane Candidate\s*(.*?)(?=\n## |\Z)", text, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return None
+    block = m.group(1)
+    meta = {}
+    aliases = {
+        "question": "central_question",
+        "central question": "central_question",
+        "lane": "lane_id",
+        "id": "lane_id",
+        "dom": "knowledge_domain",
+        "domain": "knowledge_domain",
+    }
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip().strip("*").strip("-").lstrip("-").strip().lower().replace(" ", "_")
+        v = v.strip().strip('"').strip("'")
+        k = aliases.get(k, k)
+        if k in {"lane_id", "slug", "central_question", "decision", "knowledge_domain", "stakes", "priority", "trigger", "handoff", "project_ties"}:
+            meta[k] = v
+    # convenience: if only "central_question" provided as "question" shorthand
+    if "central_question" not in meta and "question" in meta:
+        meta["central_question"] = meta.pop("question")
+    return meta or None
+
+
+def scan(path: Path, apply: bool = False) -> list[dict[str, Any]]:
+    text = path.read_text()
+    candidates = []
+    # support one or more blocks
+    for m in re.finditer(r"## Research Lane Candidate\s*(.*?)(?=\n## |\Z)", text, re.DOTALL | re.IGNORECASE):
+        block = m.group(0)
+        meta = parse_candidate_block(block) or {}
+        if "central_question" not in meta:
+            continue
+        res = scaffold(meta, apply=apply)
+        candidates.append(res)
+    return candidates
+
+
+def main():
+    p = argparse.ArgumentParser(description="Research Lane Intake tool")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sc = sub.add_parser("scaffold", help="Create a lane from explicit fields")
+    sc.add_argument("--question", required=True)
+    sc.add_argument("--decision", required=True)
+    sc.add_argument("--domain", required=True, dest="knowledge_domain")
+    sc.add_argument("--trigger", default="manual")
+    sc.add_argument("--slug")
+    sc.add_argument("--lane-id", dest="lane_id")
+    sc.add_argument("--stakes", default="high")
+    sc.add_argument("--priority", default="P1")
+    sc.add_argument("--handoff", default="")
+    sc.add_argument("--project-ties", dest="project_ties", default="")
+    sc.add_argument("--apply", action="store_true")
+
+    sn = sub.add_parser("scan", help="Parse Research Lane Candidate blocks from a file and scaffold")
+    sn.add_argument("path")
+    sn.add_argument("--apply", action="store_true")
+
+    lst = sub.add_parser("list", help="List lanes (main + completed) filtered by status/priority. Supports researching everything with priority sequencing.")
+    lst.add_argument("--status", help="Filter e.g. active, complete, parked")
+    lst.add_argument(
+        "--priority",
+        help="Filter e.g. P0, P1 (aliases: P0=immediate, P1=next|high, P4=monitor|alongside|deferred)",
+    )
+    lst.add_argument("--format", choices=["table", "json"], default="table")
+    lst.add_argument("--all", action="store_true", help="Include completed by default; use --status complete to focus")
+
+    arc = sub.add_parser("archive", help="Move lane to lanes/completed/ (for complete phases). Updates status in key docs.")
+    arc.add_argument("slug")
+    arc.add_argument("--apply", action="store_true")
+
+    sp = sub.add_parser("set-priority", help="Update priority on a lane (main or completed) based on current project needs. Example: P0 for active project handoffs.")
+    sp.add_argument("slug")
+    sp.add_argument("priority")
+    sp.add_argument("--apply", action="store_true")
+
+    args = p.parse_args()
+
+    if args.cmd == "scaffold":
+        meta = {
+            "central_question": args.question,
+            "decision": args.decision,
+            "knowledge_domain": args.knowledge_domain,
+            "trigger": args.trigger,
+            "slug": args.slug,
+            "lane_id": args.lane_id,
+            "stakes": args.stakes,
+            "priority": args.priority,
+            "handoff": args.handoff,
+            "project_ties": args.project_ties,
+        }
+        res = scaffold(meta, apply=args.apply)
+        print(json.dumps(res, indent=2))
+        if not args.apply:
+            print("\nDry run. Re-run with --apply to write files.")
+
+    elif args.cmd == "scan":
+        pth = Path(args.path)
+        if not pth.exists():
+            print(f"File not found: {pth}")
+            sys.exit(1)
+        results = scan(pth, apply=args.apply)
+        print(json.dumps(results, indent=2))
+        if not args.apply:
+            print("\nDry run. Re-run with --apply to write files.")
+
+    elif args.cmd == "list":
+        res = list_lanes(status_filter=args.status, priority_filter=args.priority, fmt=args.format)
+        print(format_list(res, args.format))
+        print(f"\nTotal matching: {len(res)} (use --status / --priority to focus; all research retained under priority model)")
+
+    elif args.cmd == "archive":
+        res = archive_lane(args.slug, apply=args.apply)
+        print(json.dumps(res, indent=2))
+        if not args.apply:
+            print("\nDry run. Re-run with --apply to move to lanes/completed/ and update trackers.")
+
+    elif args.cmd == "set-priority":
+        res = set_priority(args.slug, args.priority, apply=args.apply)
+        print(json.dumps(res, indent=2))
+        if not args.apply:
+            print("\nDry run. Re-run with --apply to update priority (reflects project needs).")
+
+
+if __name__ == "__main__":
+    main()

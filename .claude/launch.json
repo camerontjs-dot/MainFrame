@@ -1,0 +1,33 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "workstation",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["workstation/server.mjs"],
+      "port": 5177,
+      "autoPort": true
+    },
+    {
+      "name": "workstation-live",
+      "runtimeExecutable": "zsh",
+      "runtimeArgs": ["-lc", "WORKSTATION_LIVE_DISPATCH=1 exec node workstation/server.mjs"],
+      "port": 5177,
+      "autoPort": true
+    },
+    {
+      "name": "local-agent",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["30_projects/local-agent/workbench/server.mjs"],
+      "port": 5178,
+      "autoPort": true
+    },
+    {
+      "name": "biotech-demo",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8088", "--directory", "30_projects/biotech-rag-assistant/workbench/docs"],
+      "port": 8088,
+      "autoPort": true
+    }
+  ]
+}

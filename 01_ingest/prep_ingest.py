@@ -59,7 +59,7 @@ class PrepIngest:
             if path.is_dir() and not path.name.startswith(".")
         }
 
-    def run(self, apply: bool = False) -> "RunResult":
+    def run(self, apply: bool = False, skip_invalid: bool = False) -> "RunResult":
         result = RunResult()
 
         if apply:
@@ -72,7 +72,7 @@ class PrepIngest:
         for source in sorted(self.ready.iterdir(), key=lambda item: item.name):
             if not source.is_file() or source.name.startswith("."):
                 continue
-            self._process_file(source, domains, result, apply)
+            self._process_file(source, domains, result, apply, skip_invalid)
 
         if apply:
             self._append_log(result)
@@ -84,14 +84,17 @@ class PrepIngest:
         domains: set[str],
         result: "RunResult",
         apply: bool,
+        skip_invalid: bool = False,
     ) -> None:
+        err_severity = "warning" if skip_invalid else "error"
+
         if source.suffix.lower() != ".md":
             result.add(
                 "blocked",
                 source,
                 None,
                 f"unsupported file type for prep-ingest: {source.suffix or '(none)'}",
-                "error",
+                err_severity,
             )
             return
 
@@ -103,7 +106,7 @@ class PrepIngest:
                 source,
                 None,
                 f"frontmatter not ready for queue: {exc}",
-                "error",
+                err_severity,
             )
             return
 
@@ -114,7 +117,7 @@ class PrepIngest:
                 source,
                 None,
                 f"status must be '{ROUTING_READY_STATUS}' before prep-ingest; got '{status}'",
-                "error",
+                err_severity,
             )
             return
 
@@ -125,14 +128,14 @@ class PrepIngest:
                 source,
                 None,
                 "filename must match YYYY-MM-DD__domain__type__slug.md",
-                "error",
+                err_severity,
             )
             return
 
         fname_domain = match.group("domain")
         fname_type = match.group("type")
-        domain = metadata["domain"]
-        item_type = metadata["type"]
+        domain = metadata.get("domain", "")
+        item_type = metadata.get("type", "")
 
         if fname_domain != domain:
             result.add(
@@ -140,7 +143,7 @@ class PrepIngest:
                 source,
                 None,
                 f"filename domain '{fname_domain}' does not match frontmatter domain '{domain}'",
-                "error",
+                err_severity,
             )
             return
         if fname_type != item_type:
@@ -149,7 +152,7 @@ class PrepIngest:
                 source,
                 None,
                 f"filename type '{fname_type}' does not match frontmatter type '{item_type}'",
-                "error",
+                err_severity,
             )
             return
 
@@ -159,7 +162,7 @@ class PrepIngest:
                 source,
                 None,
                 f"unknown knowledge domain: {domain}",
-                "error",
+                err_severity,
             )
             return
 
@@ -170,7 +173,7 @@ class PrepIngest:
                 source,
                 target,
                 "queue destination already exists",
-                "error",
+                err_severity,
             )
             return
 
@@ -228,9 +231,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--root", default=str(ROOT), help=argparse.SUPPRESS)
-
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run", help="process 01_ingest/ready/")
+    run.add_argument("--skip-invalid", action="store_true", help="demote validation errors for legacy/un-extracted files to non-blocking warnings")
     mode = run.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="show planned moves without writing")
     mode.add_argument("--apply", action="store_true", help="move files from ready/ to queue/")
@@ -241,10 +244,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     apply = bool(args.apply)
-    prep = PrepIngest(Path(args.root))
+    skip_invalid = bool(getattr(args, "skip_invalid", False))
+    root_path = Path(getattr(args, "root", str(ROOT)))
+    prep = PrepIngest(root_path)
 
     if args.command == "run":
-        result = prep.run(apply=apply)
+        result = prep.run(apply=apply, skip_invalid=skip_invalid)
         print_result(result, prep, apply)
         return 0 if result.ok else 1
 

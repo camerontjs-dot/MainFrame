@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -28,7 +28,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/knowledge-write-guard",
             "timeout": 5
           }
         ]
@@ -40,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -52,7 +62,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/papercut auto",
             "timeout": 5
           }
         ]
@@ -63,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -74,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -85,7 +105,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -96,7 +116,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -107,7 +127,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/session-close --check --feed --hook-stdin",
             "timeout": 5
           }
         ]
@@ -118,7 +143,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -130,7 +155,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -142,7 +167,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -153,7 +178,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]
@@ -164,7 +189,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/session-close --checkpoint --hook-stdin",
             "timeout": 5
           }
         ]
@@ -175,7 +205,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${MAINFRAME_ROOT}/bin/workflow-event --client antigravity",
+            "command": "${CLAUDE_PROJECT_DIR}/bin/workflow-event --client claude --pixel main-claude-pixel",
             "timeout": 5
           }
         ]

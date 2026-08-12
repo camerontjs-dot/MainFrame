@@ -3,8 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 import importlib.util
 import json
+import multiprocessing
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from io import StringIO
@@ -440,6 +445,148 @@ class WriteEventTests(unittest.TestCase):
         self.assertEqual(record["input_summary"]["command_head"], "python3")
         self.assertIsNotNone(record["input_summary"]["command_hash"])
 
+    def test_concurrent_local_appends_preserve_one_linear_hash_chain(self) -> None:
+        worker_count = 16
+        ctx = multiprocessing.get_context("fork")
+        start = ctx.Event()
+        ready = ctx.Queue()
+        results = ctx.Queue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "2026-07-19.jsonl"
+
+            def append_worker(index: int) -> None:
+                event = {
+                    "as_of": "2026-07-19",
+                    "event": "PreToolUse",
+                    "logged_at": "2026-07-19T12:00:00-04:00",
+                    "sequence": index,
+                }
+                ready.put(index)
+                start.wait()
+                results.put(
+                    workflow_event.post_or_append_event(
+                        event,
+                        log_path,
+                        allow_post=False,
+                    )
+                )
+
+            workers = [
+                ctx.Process(target=append_worker, args=(index,))
+                for index in range(worker_count)
+            ]
+            for worker in workers:
+                worker.start()
+            for _ in workers:
+                ready.get(timeout=5)
+            start.set()
+            for worker in workers:
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive(), "concurrent writer did not finish")
+                self.assertEqual(worker.exitcode, 0)
+
+            self.assertTrue(all(results.get(timeout=1) for _ in workers))
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(len(records), worker_count)
+        self.assertEqual({record["sequence"] for record in records}, set(range(worker_count)))
+        previous = "genesis-seed"
+        for record in records:
+            stored = record.pop("hash_chain")
+            self.assertEqual(stored, workflow_event.compute_hash(record, previous))
+            previous = stored
+
+    def test_local_append_does_not_chain_past_a_corrupt_tail(self) -> None:
+        event = {"as_of": "2026-07-19", "event": "PreToolUse"}
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "2026-07-19.jsonl"
+            corrupt = b'{"event":"broken"\n'
+            log_path.write_bytes(corrupt)
+            with mock.patch.object(sys, "stderr", StringIO()):
+                success = workflow_event.post_or_append_event(
+                    event,
+                    log_path,
+                    allow_post=False,
+                )
+            self.assertFalse(success)
+            self.assertEqual(log_path.read_bytes(), corrupt)
+
+    def test_local_append_rejects_an_oversized_record(self) -> None:
+        event = {
+            "as_of": "2026-07-19",
+            "event": "PreToolUse",
+            "unexpected": "x" * workflow_event.MAX_EVENT_LINE_BYTES,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "2026-07-19.jsonl"
+            with mock.patch.object(sys, "stderr", StringIO()):
+                success = workflow_event.post_or_append_event(
+                    event,
+                    log_path,
+                    allow_post=False,
+                )
+            self.assertFalse(success)
+            self.assertEqual(log_path.read_bytes(), b"")
+
+    def test_oversized_hook_payload_is_skipped_without_creating_a_log(self) -> None:
+        payload = "x" * (workflow_event.MAX_HOOK_PAYLOAD_CHARS + 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics = Path(tmp) / "metrics"
+            with (
+                mock.patch.dict(
+                    "os.environ",
+                    {"WORKFLOW_METRICS_DIR": str(metrics)},
+                    clear=False,
+                ),
+                mock.patch.object(sys, "stdin", StringIO(payload)),
+                mock.patch.object(sys, "stderr", StringIO()),
+            ):
+                rc = workflow_event.main()
+            self.assertEqual(rc, 0, "telemetry rejection must not block the client")
+            self.assertFalse(metrics.exists())
+
+    def test_permission_request_is_nonblocking_telemetry_only(self) -> None:
+        payload = {
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "session_id": "permission-session",
+            "cwd": str(ROOT),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_root = Path(tmp)
+            copied = temp_root / "bin" / "workflow-event"
+            copied.parent.mkdir(parents=True)
+            shutil.copy2(EVENT_PATH, copied)
+            metrics = temp_root / "metrics"
+            env = os.environ.copy()
+            env["WORKFLOW_METRICS_DIR"] = str(metrics)
+            env.pop("PYTEST_CURRENT_TEST", None)
+            started = time.perf_counter()
+            proc = subprocess.run(
+                [sys.executable, str(copied), "--client", "codex"],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=2,
+                env=env,
+                check=False,
+            )
+            elapsed = time.perf_counter() - started
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertLess(elapsed, 1.0)
+            self.assertFalse(
+                (temp_root / "20_live" / "workflow-metrics" / "approvals").exists()
+            )
+            record = json.loads(next(metrics.glob("*.jsonl")).read_text())
+        self.assertEqual(record["event"], "PermissionRequest")
+        self.assertEqual(record["notification_kind"], "permission")
+
     def test_antigravity_agent_env_override(self) -> None:
         payload = {
             "hook_event_name": "PreToolUse",
@@ -544,43 +691,23 @@ class HooksConfigurationTests(unittest.TestCase):
             all("--client grok --pixel main-grok-build" in command for command in commands)
         )
 
-    def test_antigravity_hooks_valid_json(self) -> None:
-        hooks_path = ROOT / ".antigravity" / "hooks.json"
+    def test_tracked_claude_hooks_are_valid_and_nonblocking(self) -> None:
+        hooks_path = ROOT / ".claude" / "settings.json"
         self.assertTrue(hooks_path.exists())
         with hooks_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
         self.assertIn("hooks", data)
         self.assertIn("SessionEnd", data["hooks"])
-        # Verify at least one hook is configured to run workflow-event with --client antigravity
-        found = False
-        for hook_name, hook_list in data["hooks"].items():
-            for group in hook_list:
-                for hook in group.get("hooks", []):
-                    if "--client antigravity" in hook.get("command", ""):
-                        found = True
-        self.assertTrue(found, "Did not find '--client antigravity' in any hook command")
-
-    def test_codex_hooks_valid_json(self) -> None:
-        hooks_path = ROOT / ".codex" / "hooks.json"
-        self.assertTrue(hooks_path.exists())
-        with hooks_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.assertIn("hooks", data)
-        self.assertIn("SessionEnd", data["hooks"])
-        found = False
-        for hook_name, hook_list in data["hooks"].items():
-            for group in hook_list:
-                for hook in group.get("hooks", []):
-                    if "--client codex" in hook.get("command", ""):
-                        found = True
-        self.assertTrue(found, "Did not find '--client codex' in any hook command")
-
-    def test_antigravity_settings_valid_json(self) -> None:
-        settings_path = ROOT / ".antigravity" / "settings.json"
-        self.assertTrue(settings_path.exists())
-        with settings_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.assertIn("hooks", data)
+        permission_hooks = [
+            hook
+            for group in data["hooks"]["PermissionRequest"]
+            for hook in group.get("hooks", [])
+        ]
+        self.assertTrue(permission_hooks)
+        self.assertTrue(
+            all("--client claude" in hook.get("command", "") for hook in permission_hooks)
+        )
+        self.assertTrue(all(hook.get("timeout", 0) <= 5 for hook in permission_hooks))
 
 
 class DetectLoopTests(unittest.TestCase):

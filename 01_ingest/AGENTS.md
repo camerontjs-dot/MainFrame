@@ -19,6 +19,7 @@
 - `processing/` — reserved for future per-file work-in-progress; not currently used.
 - `rejected/` — dead-letter for files that fail the strict `queue/ → 10_knowledge/` gate or are truly unprocessable after review. First-pass inbox problems should surface as suggestions, not automatic dead letters.
 - `renamed/` — reserved for future filename-only-change staging; not currently used.
+- `audit-receipts/` — optional ignored JSON/Markdown receipts from the read-only graph-link audit; these are action queues, not routing gates.
 
 ## Procedure
 

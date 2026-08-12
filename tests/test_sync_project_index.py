@@ -28,7 +28,7 @@ project_state: "{state}"
 goal: "Do the thing"
 next_action: "{next_action}"
 updated: "2026-06-01"
----
+{wip_class_line}---
 
 # {title}
 """
@@ -43,17 +43,29 @@ class ValidateProjectsTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def add_project(self, name: str, state: str = "active",
-                    next_action: str = "Do the next step",
-                    age_days: float = 0.0,
-                    frontmatter: bool = True) -> Path:
+    def add_project(
+        self,
+        name: str,
+        state: str = "active",
+        next_action: str = "Do the next step",
+        age_days: float = 0.0,
+        frontmatter: bool = True,
+        wip_class: str | None = None,
+    ) -> Path:
         project = self.projects / name
         project.mkdir()
         readme = project / "README.md"
         if frontmatter:
-            readme.write_text(README_TEMPLATE.format(
-                title=name, state=state, next_action=next_action),
-                encoding="utf-8")
+            wip_line = f'wip_class: "{wip_class}"\n' if wip_class else ""
+            readme.write_text(
+                README_TEMPLATE.format(
+                    title=name,
+                    state=state,
+                    next_action=next_action,
+                    wip_class_line=wip_line,
+                ),
+                encoding="utf-8",
+            )
         else:
             readme.write_text(f"# {name}\n\nNo frontmatter here.\n",
                               encoding="utf-8")
@@ -120,18 +132,56 @@ class ValidateProjectsTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("aimless: active without next_action", problems[0])
 
-    def test_wip_cap_breach(self) -> None:
+    def test_product_wip_cap_breach(self) -> None:
         for i in range(6):
-            self.add_project(f"proj-{i}")
+            self.add_project(f"proj-{i}", wip_class="product")
         problems = self.problems()
         self.assertEqual(len(problems), 1)
-        self.assertIn("WIP cap breach: 6 active projects (cap 5)", problems[0])
+        self.assertIn("product WIP cap breach: 6 active product projects (cap 5)", problems[0])
         for i in range(6):
             self.assertIn(f"proj-{i}", problems[0])
 
-    def test_wip_cap_boundary_passes(self) -> None:
+    def test_product_wip_cap_boundary_passes(self) -> None:
         for i in range(5):
-            self.add_project(f"proj-{i}")
+            self.add_project(f"proj-{i}", wip_class="product")
+        self.assertEqual(self.problems(), [])
+
+    def test_eval_actives_do_not_consume_product_seats(self) -> None:
+        for i in range(5):
+            self.add_project(f"product-{i}", wip_class="product")
+        for i in range(5):
+            self.add_project(f"metric-{i}-eval")  # suffix heuristic → eval
+        self.assertEqual(self.problems(), [])
+
+    def test_total_active_cap_breach(self) -> None:
+        for i in range(5):
+            self.add_project(f"product-{i}", wip_class="product")
+        for i in range(6):
+            self.add_project(f"suite-{i}-eval")
+        problems = self.problems()
+        self.assertTrue(any("total active cap breach: 11" in p for p in problems), problems)
+
+    def test_default_eval_slug_set(self) -> None:
+        for i in range(5):
+            self.add_project(f"product-{i}", wip_class="product")
+        # claim-audit-lab is in DEFAULT_EVAL_SLUGS (no -eval suffix)
+        self.add_project("claim-audit-lab")
+        self.assertEqual(self.problems(), [])
+
+    def test_explicit_wip_class_overrides_suffix(self) -> None:
+        # Force a *-eval slug into product pool — counts toward product cap.
+        for i in range(5):
+            self.add_project(f"other-{i}", wip_class="product")
+        self.add_project("forced-eval", wip_class="product")
+        problems = self.problems()
+        self.assertTrue(any("product WIP cap breach" in p for p in problems), problems)
+
+    def test_anchor_does_not_consume_product_or_total_seats(self) -> None:
+        for i in range(5):
+            self.add_project(f"product-{i}", wip_class="product")
+        for i in range(5):
+            self.add_project(f"suite-{i}-eval")
+        self.add_project("income-engine")  # default anchor
         self.assertEqual(self.problems(), [])
 
     def test_non_active_states_have_no_evidence_rule(self) -> None:
@@ -139,6 +189,24 @@ class ValidateProjectsTests(unittest.TestCase):
         self.add_project("old-planned", state="planned", age_days=90)
         self.add_project("old-suspended", state="suspended", age_days=90)
         self.assertEqual(self.problems(), [])
+
+    def test_only_scopes_to_single_project(self) -> None:
+        self.add_project("healthy", state="shipped")
+        self.add_project("broken", frontmatter=False)
+        self.assertEqual(self.problems(only="healthy"), [])
+        problems = self.problems(only="broken")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("broken: missing project_state frontmatter", problems[0])
+
+    def test_only_missing_directory_is_a_problem(self) -> None:
+        problems = self.problems(only="no-such-project")
+        self.assertEqual(
+            problems, ["no-such-project: project directory does not exist"])
+
+    def test_only_skips_wip_cap(self) -> None:
+        for i in range(6):
+            self.add_project(f"proj-{i}")
+        self.assertEqual(self.problems(only="proj-0"), [])
 
 
 class RenderTests(unittest.TestCase):
@@ -153,9 +221,15 @@ class RenderTests(unittest.TestCase):
     def test_render_includes_evidence_column(self) -> None:
         project = self.projects / "alpha"
         project.mkdir()
-        (project / "README.md").write_text(README_TEMPLATE.format(
-            title="Alpha", state="active", next_action="Next"),
-            encoding="utf-8")
+        (project / "README.md").write_text(
+            README_TEMPLATE.format(
+                title="Alpha",
+                state="active",
+                next_action="Next",
+                wip_class_line="",
+            ),
+            encoding="utf-8",
+        )
         output = mod.render(self.projects)
         self.assertIn("| Project | State | Goal | Next action | Updated | Evidence |",
                       output)

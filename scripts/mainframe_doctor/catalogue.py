@@ -71,6 +71,13 @@ def validate_catalogue(
         provider = check.get("provider")
         if not provider:
             errors.append(f"{cid}: provider required")
+        timeout_seconds = check.get("timeout_seconds")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, int)
+            or timeout_seconds <= 0
+        ):
+            errors.append(f"{cid}: timeout_seconds must be a positive integer")
         # Reporter-as-check guard: providers named *report* without threshold forbidden
         if isinstance(provider, str) and provider.endswith("_report") and not check.get("threshold"):
             errors.append(f"{cid}: reporter provider requires threshold adapter")

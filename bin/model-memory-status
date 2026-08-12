@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""model-memory-status — unified-memory pressure + dual-stack watch.
+
+Companion to bin/model-disk-status.
+Exit codes:
+  0  OK (no dual stack; memory gate OK or idle)
+  1  WATCH (memory tight — do not start second stack)
+  2  SOFT BLOCK (free more memory before another load)
+  3  HARD BLOCK (critically low free memory)
+  4  DUAL STACK (Ollama model loaded AND mlx_lm.server up)
+
+Policy: 30_projects/agent-harness-eval/plans/model-disk-budget-policy.md
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def _run(cmd: list[str], timeout: float = 5.0) -> str:
+    try:
+        return subprocess.check_output(cmd, text=True, timeout=timeout, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+def mem_total_gb() -> float:
+    out = _run(["sysctl", "-n", "hw.memsize"]).strip()
+    try:
+        return int(out) / 1e9
+    except ValueError:
+        return 0.0
+
+
+def vm_stats() -> dict[str, float]:
+    """Return selected vm_stat quantities in GB."""
+    out = _run(["vm_stat"])
+    page = 4096
+    m = re.search(r"page size of (\d+)", out)
+    if m:
+        page = int(m.group(1))
+    pages: dict[str, int] = {}
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        v = v.strip().rstrip(".").replace(",", "")
+        if v.isdigit():
+            pages[k.strip()] = int(v)
+
+    def gb(key: str) -> float:
+        return pages.get(key, 0) * page / 1e9
+
+    compressor = 0.0
+    for k, n in pages.items():
+        if "compressor" in k.lower() and "occupied" in k.lower():
+            compressor = n * page / 1e9
+            break
+
+    free = gb("Pages free") + gb("Pages speculative")
+    inactive = gb("Pages inactive")
+    purgeable = gb("Pages purgeable")
+    return {
+        "free_spec": free,
+        "inactive": inactive,
+        "active": gb("Pages active"),
+        "wired": gb("Pages wired down"),
+        "compressor": compressor,
+        "purgeable": purgeable,
+        "avail_ish": free + inactive + purgeable,
+    }
+
+
+def http_json(url: str, timeout: float = 2.0) -> dict | list | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+
+def ollama_loaded() -> list[dict]:
+    data = http_json("http://127.0.0.1:11434/api/ps")
+    if not isinstance(data, dict):
+        return []
+    return list(data.get("models") or [])
+
+
+def mlx_server_up() -> tuple[bool, list[str], float | None]:
+    """Return (up, model_ids, rss_gb)."""
+    data = http_json("http://127.0.0.1:8080/v1/models")
+    ids: list[str] = []
+    if isinstance(data, dict):
+        ids = [str(x.get("id", "")) for x in (data.get("data") or [])]
+    # pgrep process RSS (KB on macOS ps -o rss)
+    rss_gb = None
+    ps = _run(["ps", "-axo", "rss,command"])
+    for line in ps.splitlines():
+        if "mlx_lm.server" in line and "rg" not in line:
+            parts = line.strip().split(None, 1)
+            if parts and parts[0].isdigit():
+                rss_gb = int(parts[0]) / 1024 / 1024
+            break
+    up = data is not None or rss_gb is not None
+    return up, ids, rss_gb
+
+
+def pgrep_running(pattern: str) -> bool:
+    # Use pgrep if available
+    out = _run(["pgrep", "-f", pattern])
+    return bool(out.strip())
+
+
+def main() -> int:
+    print("=== Model memory status ===\n")
+
+    total = mem_total_gb()
+    st = vm_stats()
+    print(f"hw.memsize:     {total:.1f} GB")
+    print(f"free+spec:      {st['free_spec']:.1f} GB")
+    print(f"inactive:       {st['inactive']:.1f} GB")
+    print(f"active:         {st['active']:.1f} GB")
+    print(f"wired:          {st['wired']:.1f} GB")
+    print(f"compressor:     {st['compressor']:.1f} GB")
+    print(f"purgeable:      {st['purgeable']:.1f} GB")
+    print(
+        f"avail-ish*:     {st['avail_ish']:.1f} GB  "
+        "(*free+inactive+purgeable; watch metric, not exact API)"
+    )
+
+    avail = st["avail_ish"]
+    if avail >= 8:
+        mem_gate, mem_code = "OK", 0
+    elif avail >= 4:
+        mem_gate, mem_code = "WATCH — avoid starting a second heavy model stack", 1
+    elif avail >= 2:
+        mem_gate, mem_code = "SOFT BLOCK — unload something before another load", 2
+    else:
+        mem_gate, mem_code = "HARD BLOCK — free memory before evals", 3
+    print(f"\nMemory gate: {mem_gate}")
+    print(f"(memory exit would be {mem_code}: 0=OK 1=WATCH 2=SOFT 3=HARD)\n")
+
+    print("=== Loaded inference stacks ===")
+    ollama = ollama_loaded()
+    if ollama:
+        print("Ollama LOADED:")
+        for m in ollama:
+            size = m.get("size_vram") or m.get("size") or 0
+            print(f"  - {m.get('name')}  ~{float(size)/1e9:.1f} GB")
+    else:
+        # distinguish unreachable vs idle
+        probe = http_json("http://127.0.0.1:11434/api/tags")
+        if probe is None:
+            print("Ollama: not reachable on :11434")
+        else:
+            print("Ollama: idle (no models loaded)")
+
+    mlx_up, mlx_ids, mlx_rss = mlx_server_up()
+    if mlx_up:
+        print("MLX server: UP on :8080")
+        prefer = [
+            i
+            for i in mlx_ids
+            if any(k in i.lower() for k in ("gemma", "mistral", "llama", "qwen", "phi"))
+        ]
+        show = (prefer or mlx_ids)[:8]
+        if show:
+            print("  models (sample):", ", ".join(show))
+        if mlx_rss is not None:
+            print(f"  mlx_lm.server RSS ≈ {mlx_rss:.1f} GB")
+    else:
+        print("MLX server: down (no response on :8080)")
+
+    if pgrep_running("agent_harness_eval.coding_backend"):
+        print("coding_backend: RUNNING")
+    if pgrep_running("aider --model") or pgrep_running("/aider"):
+        print("aider: RUNNING")
+
+    print("\n=== Dual-stack rule ===")
+    dual = bool(ollama) and mlx_up
+    if dual:
+        print("FAIL: Ollama model loaded AND mlx_lm.server up — dual stack.")
+        print("  Unload Ollama example:")
+        name = (ollama[0].get("name") if ollama else "MODEL") or "MODEL"
+        print(
+            "    curl -s http://127.0.0.1:11434/api/generate "
+            f"-d '{{\"model\":\"{name}\",\"prompt\":\"\",\"keep_alive\":0}}'"
+        )
+        print("  Stop MLX:  pkill -f mlx_lm.server")
+        print("\nRule: never leave Ollama + mlx_lm.server both holding multi-GB models.")
+        print("Fair H1: Ollama half → keep_alive=0 → MLX half → stop server.")
+        return 4
+
+    if ollama:
+        print("OK: Ollama-only load")
+    elif mlx_up:
+        print("OK: MLX-server-only load")
+    else:
+        print("OK: no heavy stacks detected")
+
+    print("\nRule: never leave Ollama + mlx_lm.server both holding multi-GB models.")
+    print("Fair H1: Ollama half → keep_alive=0 → MLX half → stop server.")
+    print("Disk: bin/model-disk-status")
+
+    # Prefer dual-stack code if both; else memory gate
+    return mem_code if not dual else 4
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        raise SystemExit(0)

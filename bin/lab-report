@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Scaffold and check researcher-style lab reports for project experiments.
+
+Universal notebook layer for measured tests. Complements:
+  - project-experiment-loop (eval-registry harvest)
+  - craft-research-loop (keep|kill|iterate product trials)
+
+Commands:
+  scaffold  --project <slug> --title ... --question ... --decision ...
+  check     --project <slug> --id <lab_report_id>
+  list      --project <slug> [--open]
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROJECTS = ROOT / "30_projects"
+TEMPLATE = ROOT / ".context" / "templates" / "lab-report.md"
+WORKFLOW = ROOT / ".context" / "workflows" / "lab-report.md"
+
+REQUIRED_HEADINGS = [
+    "## 1. Question",
+    "## 2. Decision this report supports",
+    "## 3. Hypothesis",
+    "## 5. Materials and methods",
+    "## 6. Results",
+    "## 7. Irregularities and anomalies",
+    "## 9. Limitations",
+    "## 10. Disposition and next experiment",
+]
+
+FRONTMATTER_KEYS = [
+    "lab_report_id",
+    "study_type",
+    "decision_sentence",
+    "disposition",
+]
+
+
+def slugify(title: str) -> str:
+    s = re.sub(r"[^a-z0-9-]+", "-", title.lower()).strip("-")
+    return s[:48] or "experiment"
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    meta: dict[str, str] = {}
+    for line in parts[1].splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        meta[k.strip()] = v.strip().strip('"').strip("'")
+    return meta
+
+
+def report_paths(project: str) -> tuple[Path, Path, Path]:
+    proj = PROJECTS / project
+    lab_dir = proj / "outputs" / "lab-reports"
+    raw_root = proj / "raw-materials"
+    return proj, lab_dir, raw_root
+
+
+def cmd_scaffold(args: argparse.Namespace) -> int:
+    proj, lab_dir, raw_root = report_paths(args.project)
+    if not proj.is_dir():
+        print(f"Project not found: {proj}", file=sys.stderr)
+        return 1
+
+    today = date.today().isoformat()
+    slug = slugify(args.title)
+    report_id = f"{today}-{slug}"
+    lab_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = raw_root / report_id
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    protocol = args.protocol_ref or f"30_projects/{args.project}/methodology-approach.md"
+    study = args.study_type
+    question = args.question.strip()
+    decision = args.decision.strip().replace('"', "'")
+    hypothesis = (args.hypothesis or "Descriptive measurement — no directional hypothesis.").replace(
+        '"', "'"
+    )
+    metric = args.primary_metric or "TBD"
+    unit = args.unit_of_analysis or "TBD"
+
+    body = f"""---
+title: "Lab report — {args.title}"
+domain: "agent-operations"
+type: "lab-report"
+status: "running"
+lab_report_id: "{report_id}"
+eval_run_id: "{report_id}"
+project: "{args.project}"
+study_type: "{study}"
+protocol_ref: "{protocol}"
+decision_sentence: "{decision}"
+hypothesis: "{hypothesis}"
+primary_metric: "{metric}"
+unit_of_analysis: "{unit}"
+disposition: "open"
+privacy: "private-local"
+tags: ["lab-report", "experiment"]
+updated: "{today}"
+source: "bin/lab-report scaffold"
+---
+
+# Lab report — {args.title}
+
+**ID:** `{report_id}`
+**Project:** `{args.project}`
+**Study type:** {study}
+**Disposition:** `open`
+
+---
+
+## 1. Question
+
+{question}
+
+## 2. Decision this report supports
+
+{decision}
+
+## 3. Hypothesis
+
+{hypothesis}
+
+## 4. Background / prior art (optional)
+
+-
+
+## 5. Materials and methods
+
+### 5.1 System under test
+
+| Field | Value |
+|-------|-------|
+| Stack / models | |
+| Harness / tools | |
+| Code / config pin | `{protocol}` |
+| Hardware / host constraints | |
+
+### 5.2 Design
+
+| Field | Value |
+|-------|-------|
+| study_type | {study} |
+| unit_of_analysis | {unit} |
+| primary metric | {metric} |
+| secondary metrics | |
+| n / replicates | |
+| factors (independent) | |
+| controlled / held fixed | |
+| randomization / seeds | |
+| blinding / sealing | |
+
+### 5.3 Procedure
+
+1. Preflight
+2. Execute
+3. Score
+4. Fill this report; store raw under `raw-materials/{report_id}/`
+
+```bash
+# Commands:
+
+```
+
+## 6. Results
+
+| Cell / condition | n | Primary metric | Secondary | Notes |
+|------------------|---:|---------------:|----------:|-------|
+
+### Raw artifacts
+
+| Kind | Path |
+|------|------|
+| receipts / logs | `raw-materials/{report_id}/` |
+
+## 7. Irregularities and anomalies
+
+| id | severity | category | observation | artifact_ref | resolved |
+|----|----------|----------|-------------|--------------|----------|
+
+None observed: **no** (fill rows) / **yes** (delete table and write "None observed.")
+
+## 8. Interpretation
+
+| Statement | Type | Confidence |
+|-----------|------|------------|
+| | observation / inference / hypothesis | |
+
+## 9. Limitations / what this does **not** prove
+
+-
+
+## 10. Disposition and next experiment
+
+| Field | Value |
+|-------|-------|
+| disposition | open |
+| why | |
+| next_experiment | |
+| registry harvest? | {"yes if decision-bearing" if study != "observational" else "optional"} |
+
+## 11. Metric extract (eval-registry)
+
+```yaml
+registry:
+  project: {args.project}
+  run_id: {report_id}
+  study_type: {study}
+  protocol_ref: {protocol}
+  date: {today}
+  decision_sentence: "{decision}"
+  artifact_path: outputs/lab-reports/{report_id}.md
+  raw_path: raw-materials/{report_id}/
+  decision_use: {"exploratory_only" if study in {"exploratory", "observational"} else "regression_only"}
+metrics:
+  - name: {metric if metric != "TBD" else "placeholder_metric"}
+    slice: all
+    value: 0
+    n: 0
+    unit: count
+irregularities:
+  - id: scaffold-placeholder
+    severity: info
+    category: protocol
+    observation: "Scaffold only — replace after real run"
+    context: "{report_id}"
+    resolved: false
+```
+
+## 12. Provenance
+
+| Field | Value |
+|-------|-------|
+| operator / agent | |
+| started | {today} |
+| finished | |
+| git_sha | |
+| privacy | private-local |
+| related reports | |
+"""
+
+    out_path = lab_dir / f"{report_id}.md"
+    if out_path.exists():
+        print(f"Refusing overwrite: {out_path}", file=sys.stderr)
+        return 1
+    out_path.write_text(body, encoding="utf-8")
+    print(f"Wrote {out_path.relative_to(ROOT)}")
+    print(f"Raw dir {raw_dir.relative_to(ROOT)}")
+    print(f"lab_report_id={report_id}")
+    print("Convention: .context/workflows/lab-report.md")
+    print("Next: run experiment, fill results/disposition, then:")
+    print(f"  bin/lab-report check --project {args.project} --id {report_id}")
+    if args.project.endswith("-eval") or args.project in {
+        "scaffold-claims-study",
+        "skill-eval-workshop",
+        "verified-done",
+        "agent-harness-eval",
+    }:
+        print(f"  bin/project-experiment-loop close --project {args.project}")
+    return 0
+
+
+def find_report(project: str, report_id: str) -> Path | None:
+    _, lab_dir, _ = report_paths(project)
+    candidates = [
+        lab_dir / f"{report_id}.md",
+        PROJECTS / project / "outputs" / f"{report_id}.md",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    # fuzzy: suffix match
+    if lab_dir.is_dir():
+        for p in lab_dir.glob("*.md"):
+            if report_id in p.stem:
+                return p
+    out = PROJECTS / project / "outputs"
+    if out.is_dir():
+        for p in out.glob("*.md"):
+            if report_id in p.stem:
+                return p
+    return None
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    path = find_report(args.project, args.id)
+    if not path:
+        print(f"Report not found for id={args.id} under {args.project}", file=sys.stderr)
+        return 1
+    text = path.read_text(encoding="utf-8")
+    meta = parse_frontmatter(text)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for k in FRONTMATTER_KEYS:
+        if k == "lab_report_id" and not meta.get(k) and not meta.get("eval_run_id"):
+            errors.append("missing lab_report_id or eval_run_id")
+        elif k != "lab_report_id" and not meta.get(k):
+            errors.append(f"missing frontmatter: {k}")
+
+    for h in REQUIRED_HEADINGS:
+        if h not in text:
+            # allow short "Limitations" without full string
+            if h.startswith("## 9.") and "## 9." in text:
+                continue
+            errors.append(f"missing section: {h}")
+
+    if "None observed" not in text and "irregularities:" not in text.lower():
+        if "| id | severity |" not in text and "Irregularities" in text:
+            warnings.append("irregularities table empty — state 'None observed' if truly none")
+
+    disp = meta.get("disposition", "open")
+    if disp == "open" and "<!--" not in text:
+        if re.search(r"\|[^|]+\|[^|]+\|", text) and "TBD" not in meta.get("primary_metric", ""):
+            warnings.append("disposition still open — set accept/reject/hold/iterate when done")
+
+    if "does **not** prove" not in text and "does not prove" not in text.lower():
+        warnings.append("add explicit does-not-prove / limitations language")
+
+    print(f"check: {path.relative_to(ROOT)}")
+    print(f"  disposition={disp} study_type={meta.get('study_type')}")
+    for e in errors:
+        print(f"  ERROR: {e}")
+    for w in warnings:
+        print(f"  WARN: {w}")
+    if errors:
+        return 1
+    print("  OK (minimum bar)")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    proj, lab_dir, _ = report_paths(args.project)
+    if not proj.is_dir():
+        print(f"Project not found: {proj}", file=sys.stderr)
+        return 1
+    paths: list[Path] = []
+    if lab_dir.is_dir():
+        paths.extend(sorted(x for x in lab_dir.glob("*.md") if x.name != "README.md"))
+    # Also list root outputs that explicitly declare lab_report_id (not all study_type docs)
+    out = proj / "outputs"
+    if out.is_dir():
+        for p in sorted(out.glob("*.md")):
+            if p.parent.name == "lab-reports":
+                continue
+            t = p.read_text(encoding="utf-8", errors="replace")[:800]
+            if "lab_report_id:" in t or (
+                "type: \"lab-report\"" in t or "type: lab-report" in t
+            ):
+                paths.append(p)
+    if not paths:
+        print("(no lab reports found)")
+        return 0
+    for p in paths:
+        meta = parse_frontmatter(p.read_text(encoding="utf-8", errors="replace"))
+        disp = meta.get("disposition") or meta.get("status") or "?"
+        if args.open and disp not in {"open", "running", "active"}:
+            continue
+        rid = meta.get("lab_report_id") or meta.get("eval_run_id") or p.stem
+        print(f"{rid}\t{disp}\t{p.relative_to(ROOT)}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sc = sub.add_parser("scaffold", help="Create outputs/lab-reports/<id>.md + raw dir")
+    sc.add_argument("--project", required=True)
+    sc.add_argument("--title", required=True)
+    sc.add_argument("--question", required=True)
+    sc.add_argument("--decision", required=True)
+    sc.add_argument(
+        "--study-type",
+        default="exploratory",
+        choices=["exploratory", "confirmatory", "regression", "observational", "calibration"],
+    )
+    sc.add_argument("--hypothesis", default=None)
+    sc.add_argument("--protocol-ref", default=None)
+    sc.add_argument("--primary-metric", default=None)
+    sc.add_argument("--unit-of-analysis", default=None)
+
+    ch = sub.add_parser("check", help="Minimum-bar completeness check")
+    ch.add_argument("--project", required=True)
+    ch.add_argument("--id", required=True, help="lab_report_id")
+
+    ls = sub.add_parser("list", help="List lab reports for a project")
+    ls.add_argument("--project", required=True)
+    ls.add_argument("--open", action="store_true", help="Only open/running dispositions")
+
+    args = ap.parse_args()
+    if args.cmd == "scaffold":
+        return cmd_scaffold(args)
+    if args.cmd == "check":
+        return cmd_check(args)
+    if args.cmd == "list":
+        return cmd_list(args)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

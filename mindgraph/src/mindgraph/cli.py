@@ -1,15 +1,16 @@
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
 
 import typer
 
-from mindgraph import db, embedders, mcp_server, parser
+from mindgraph import daemon, db, embedders, idle_lifecycle, mcp_proxy, mcp_server, parser
 from mindgraph import query as query_mod
-from mindgraph.exceptions import IngestionError, MindgraphError
+from mindgraph.exceptions import EmbeddingError, IngestionError, MindgraphError
 from mindgraph import intent as intent_mod
 from mindgraph import routing as routing_mod
 
@@ -51,17 +52,30 @@ def _configure_logging(verbose: bool) -> None:
 def _load_embedder(embedder: str | None = None):
     spec = embedders.resolve_embedder(embedder)
     logger.info("Loading embedding model (%s)...", spec.model_id)
-    return embedders.load_sentence_embedder(spec)
+    try:
+        return embedders.load_sentence_embedder(spec)
+    except EmbeddingError:
+        raise
+    except Exception as exc:
+        raise EmbeddingError(
+            f"Failed to load embedding model {spec.model_id!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _encode_without_progress(embedder, texts):
     """Encode text while suppressing sentence-transformers progress output."""
     try:
-        return embedder.encode(
-            texts, convert_to_numpy=True, show_progress_bar=False
-        )
-    except TypeError:
-        return embedder.encode(texts, convert_to_numpy=True)
+        try:
+            return embedder.encode(
+                texts, convert_to_numpy=True, show_progress_bar=False
+            )
+        except TypeError:
+            return embedder.encode(texts, convert_to_numpy=True)
+    except Exception as exc:
+        raise EmbeddingError(
+            f"Embedding model failed to encode input: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -158,8 +172,10 @@ def _ingest_scopes(
     stats["total"] = len(md_files)
 
     if not md_files:
-        logger.warning("No markdown files found in ingest scope(s)")
-        return stats
+        logger.warning(
+            "No markdown files found in authoritative ingest scope(s); "
+            "pruning stale indexed documents"
+        )
 
     spec = embedders.resolve_embedder(embedder)
     template = embedders.resolve_embed_template(embed_template)
@@ -799,7 +815,7 @@ def query(
     """
     _configure_logging(verbose)
     try:
-        conn = db.get_db(db_path)
+        conn = db.get_db(db_path, read_only=True)
         # MH01: fail fast on stub/incomplete DBs instead of soft FTS degradation.
         db.validate_query_schema(conn, db_path)
     except MindgraphError as e:
@@ -938,7 +954,7 @@ def neighbors(
     """List outbound edges from a document. Preserves dangling edges."""
     _configure_logging(verbose)
     try:
-        conn = db.get_db(db_path)
+        conn = db.get_db(db_path, read_only=True)
     except MindgraphError as e:
         logger.error(str(e))
         raise typer.Exit(code=1)
@@ -1010,6 +1026,171 @@ def serve_mcp(
     finally:
         if conn is not None:
             conn.close()
+
+
+SCOPE_SPEC_HELP = (
+    "Serve an arbitrary named scope: NAME=PATH or NAME:TRUST_PROFILE=PATH. "
+    "Repeatable. Trust profile defaults to NAME. When any --scope is given it "
+    "replaces the default knowledge/projects pair."
+)
+
+
+def parse_scope_specs(values: list[str] | None) -> dict[str, tuple[str, str]]:
+    """Parse `NAME=PATH` / `NAME:TRUST=PATH` specs into {name: (path, trust)}.
+
+    Split on the first `=` only, so database paths may contain any character.
+    """
+    scopes: dict[str, tuple[str, str]] = {}
+    for raw in values or []:
+        name_part, sep, db_path = raw.partition("=")
+        if not sep or not name_part.strip() or not db_path.strip():
+            raise MindgraphError(
+                f"invalid --scope {raw!r}; expected NAME=PATH or NAME:TRUST_PROFILE=PATH"
+            )
+        name, _, trust = name_part.partition(":")
+        name, trust = name.strip(), trust.strip()
+        if not name:
+            raise MindgraphError(f"invalid --scope {raw!r}; scope name is empty")
+        if name in scopes:
+            raise MindgraphError(f"duplicate --scope name: {name}")
+        scopes[name] = (db_path.strip(), trust or name)
+    return scopes
+
+
+@app.command("serve-daemon")
+def serve_daemon(
+    knowledge_db: str = typer.Option("~/.mindgraph/mainframe.sqlite", "--knowledge-db"),
+    projects_db: str = typer.Option("~/.mindgraph/mainframe-projects.sqlite", "--projects-db"),
+    scope: list[str] = typer.Option(None, "--scope", help=SCOPE_SPEC_HELP),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    path: str = typer.Option("/mcp", "--path"),
+    embedder: str | None = typer.Option(None, "--embedder"),
+    idle_seconds: float | None = typer.Option(None, "--idle-seconds", min=60.0),
+    lease_ttl: float = typer.Option(90.0, "--lease-ttl", min=30.0),
+):
+    """Run the explicit-scope shared MCP server in the foreground."""
+    conns = []
+    try:
+        requested = parse_scope_specs(scope) or {
+            "knowledge": (knowledge_db, "durable_knowledge"),
+            "projects": (projects_db, "project_status"),
+        }
+        scopes = {}
+        for name, (db_path, trust_profile) in requested.items():
+            conn = mcp_server.open_database_readonly(db_path)
+            conns.append(conn)
+            scopes[name] = (conn, trust_profile)
+        spec = embedders.resolve_embedder(embedder)
+        lifecycle = (
+            idle_lifecycle.IdleLifecycle(idle_seconds, lease_ttl=lease_ttl)
+            if idle_seconds is not None else None
+        )
+        server = mcp_server.create_shared_server(
+            scopes,
+            _load_embedder(spec.key), host=host, port=port, path=path,
+            embedder_spec=spec, lifecycle=lifecycle,
+        )
+        if lifecycle:
+            lifecycle.start()
+        try:
+            mcp_server.run_streamable_http(server)
+        finally:
+            if lifecycle:
+                lifecycle.stop()
+    except MindgraphError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+    finally:
+        for conn in conns:
+            conn.close()
+
+
+@app.command("mcp-proxy")
+def mcp_proxy_command(
+    url: str = typer.Option("http://127.0.0.1:8000/mcp", "--url"),
+    lease: bool = typer.Option(False, "--lease"),
+    auto_start: bool | None = typer.Option(None, "--auto-start/--no-auto-start"),
+    state_dir: Path = typer.Option(Path("~/.mindgraph/run").expanduser(), "--state-dir"),
+    idle_seconds: float = typer.Option(900.0, "--idle-seconds", min=60.0),
+):
+    """Proxy stdio MCP to an already-running shared daemon."""
+    try:
+        activated_grace = daemon.idle_opt_in(state_dir)
+        if auto_start is None:
+            auto_start = activated_grace is not None
+        if activated_grace is not None and idle_seconds == 900.0:
+            idle_seconds = activated_grace
+        if auto_start:
+            health_url = daemon.health_url_for_mcp(url)
+            daemon_host, daemon_port, daemon_path = daemon.daemon_endpoint_args(url)
+            command = [
+                sys.executable, "-m", "mindgraph.cli", "serve-daemon",
+                "--idle-seconds", str(idle_seconds),
+                "--host", daemon_host, "--port", str(daemon_port),
+                "--path", daemon_path,
+            ]
+            result = daemon.start(state_dir, command, health_url=health_url)
+            if result["status"] == "start_failed":
+                raise MindgraphError(f"shared daemon failed to start: {result}")
+        mcp_proxy.run_proxy_sync(url, lease=lease or auto_start)
+    except Exception as exc:
+        typer.echo(f"MCP proxy failed: {exc}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command("daemon-start")
+def daemon_start(
+    state_dir: Path = typer.Option(Path("~/.mindgraph/run").expanduser(), "--state-dir"),
+    knowledge_db: str = typer.Option("~/.mindgraph/mainframe.sqlite", "--knowledge-db"),
+    projects_db: str = typer.Option("~/.mindgraph/mainframe-projects.sqlite", "--projects-db"),
+    scope: list[str] = typer.Option(None, "--scope", help=SCOPE_SPEC_HELP),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    path: str = typer.Option("/mcp", "--path"),
+    idle_seconds: float | None = typer.Option(None, "--idle-seconds", min=60.0),
+):
+    try:
+        parse_scope_specs(scope)
+    except MindgraphError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1)
+    command = [sys.executable, "-m", "mindgraph.cli", "serve-daemon",
+               "--host", host, "--port", str(port), "--path", path]
+    if scope:
+        for spec in scope:
+            command.extend(["--scope", spec])
+    else:
+        command.extend(["--knowledge-db", knowledge_db,
+                        "--projects-db", projects_db])
+    if idle_seconds is not None:
+        command.extend(["--idle-seconds", str(idle_seconds)])
+    health_endpoint = daemon.health_url(host, port)
+    typer.echo(json.dumps(daemon.start(state_dir, command, health_url=health_endpoint)))
+
+
+@app.command("daemon-status")
+def daemon_status(
+    state_dir: Path = typer.Option(Path("~/.mindgraph/run").expanduser(), "--state-dir"),
+    url: str = typer.Option("http://127.0.0.1:8000/health", "--url"),
+):
+    typer.echo(json.dumps(daemon.status(state_dir, url)))
+
+
+@app.command("daemon-health")
+def daemon_health(url: str = typer.Option("http://127.0.0.1:8000/health", "--url")):
+    result = daemon.health(url)
+    typer.echo(json.dumps(result))
+    if result.get("status") != "ok":
+        raise typer.Exit(1)
+
+
+@app.command("daemon-stop")
+def daemon_stop(
+    state_dir: Path = typer.Option(Path("~/.mindgraph/run").expanduser(), "--state-dir"),
+    url: str = typer.Option("http://127.0.0.1:8000/health", "--url"),
+):
+    typer.echo(json.dumps(daemon.stop(state_dir, health_url=url)))
 
 
 if __name__ == "__main__":

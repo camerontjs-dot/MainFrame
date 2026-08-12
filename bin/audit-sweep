@@ -3,6 +3,19 @@
 for the epistemic auditor. Deterministic discovery + manifest; delegates LLM
 judgment to the epistemic-research-system orchestrator.
 
+PROVENANCE AUDIT (added after the 2026-08-09 fabricated-citation finding, which
+this sweep could not have caught: it discovers items by tag and freshness, and
+never asks whether a cited source exists). Three companion tools do that, and
+should be run on the same cadence as this one:
+
+    bin/citation-resolvability-sweep --run    # do the identifiers resolve?
+    bin/title-existence-check --from-list ... # do the papers exist?
+    bin/capture-validate --knowledge          # is any citation unearned?
+
+All three run positive AND negative controls in-batch and report BROKEN rather
+than clean when a control fails. See
+20_live/security/2026-08-09__fabricated-source-captures-in-10-knowledge.md.
+
 Follows the style and guardrails of other MainFrame minions (dry-run first,
 no shared library, structured reporting, respect for volatility in 20_live/).
 
@@ -97,7 +110,7 @@ def collect_candidates(subset: str | None, max_days: int = 365) -> list[dict[str
         age_days = max((today - mtime).days, 0)
 
         # Include if it has the explicit signal, or if it is recent and looks routed (convention name or raw tag)
-        is_recent = age_days <= 14
+        is_recent = age_days <= max_days
         looks_routed = "__" in path.name and ("raw" in path.name or any("raw" in t or "routed" in t for t in tags))
 
         if has_needs_audit or (is_recent and looks_routed):
@@ -115,6 +128,14 @@ def collect_candidates(subset: str | None, max_days: int = 365) -> list[dict[str
     # Sort: explicit needs-audit first, then by age asc (newest first among recent)
     candidates.sort(key=lambda c: (not c["has_needs_audit"], c["age_days"]))
     return candidates
+
+
+def nonnegative_int(value: str) -> int:
+    """Parse a zero-or-greater integer for age-window arguments."""
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
 
 
 def write_manifest(candidates: list[dict[str, Any]], run_date: str) -> Path:
@@ -183,7 +204,12 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="Write the sweep manifest and trigger auditor handoff.")
     parser.add_argument("--json", action="store_true", help="Output machine-readable summary.")
     parser.add_argument("--subset", help="Limit scan to one 10_knowledge/<domain> (e.g. agents, finance).")
-    parser.add_argument("--max-days", type=int, default=365, help="Include items up to this age for sampling.")
+    parser.add_argument(
+        "--max-days",
+        type=nonnegative_int,
+        default=365,
+        help="Include routed sample items up to this age; explicit audit signals are always included.",
+    )
     args = parser.parse_args()
 
     if not args.dry_run and not args.apply:

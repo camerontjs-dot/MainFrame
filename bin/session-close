@@ -423,6 +423,60 @@ def check_feed_record(result: SessionCloseResult, hook: dict | None,
     }
 
 
+def papercut_action(root: Path) -> "CloseAction":
+    """Ask for friction diagnosis at the one moment the agent is already reflecting.
+
+    `bin/papercut` records what broke and why the next agent will hit it too.
+    Nothing makes an agent call it: the moment of friction is mid-task, with a
+    workaround already in mind, which is exactly when nobody stops to write a
+    note. That is the observation the tool was built from.
+
+    So the prompt lives here instead. Session close is when the handoff gets
+    written anyway, and `20_live/workflow-metrics/` has already recorded every
+    tool failure automatically. This turns recall into recognition: the agent is
+    handed the list rather than asked to remember it.
+
+    Deliberately a `manual` action, never `warn`. Most tool failures deserve no
+    papercut (typos, missing paths, deliberate probes), and demanding one per
+    failure would flood the log and make `bin/papercut harvest` useless. Reading
+    two files keeps this inside the 5s hook budget.
+    """
+    day = date.today().isoformat()
+    events = root / "20_live" / "workflow-metrics" / "events" / f"{day}.jsonl"
+    fails = 0
+    if events.exists():
+        try:
+            fails = sum(
+                1 for ln in events.read_text(encoding="utf-8", errors="replace").splitlines()
+                if "PostToolUseFailure" in ln
+            )
+        except OSError:
+            fails = 0
+
+    cuts = root / "20_live" / "papercuts" / f"{day[:7]}.jsonl"
+    written = 0
+    if cuts.exists():
+        try:
+            written = sum(
+                1 for ln in cuts.read_text(encoding="utf-8", errors="replace").splitlines()
+                if ln.strip() and day in ln
+            )
+        except OSError:
+            written = 0
+
+    if fails and not written:
+        return CloseAction(
+            name="papercut", kind="manual", needed=True,
+            reason=(f"{fails} tool failure(s) today and no papercut written — "
+                    "run `bin/papercut prompt` and record any the next agent would hit"),
+        )
+    return CloseAction(
+        name="papercut", kind="manual", needed=False,
+        reason=(f"{written} papercut(s) written today ({fails} tool failure(s) logged)"
+                if written else "no tool failures today"),
+    )
+
+
 def check_session(root: Path, project: str | None = None,
                   run_command: RunCommand = default_run_command,
                   apply: bool = False) -> SessionCloseResult:
@@ -473,6 +527,8 @@ def check_session(root: Path, project: str | None = None,
             name="sync-project-index", kind="auto", needed=False,
             reason="project index is current",
         ))
+
+    result.actions.append(papercut_action(root))
 
     knowledge_changed = any(f.startswith("10_knowledge/") for f in changed)
     if knowledge_changed:

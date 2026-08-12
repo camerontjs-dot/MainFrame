@@ -86,3 +86,20 @@ Research question
 ```
 
 For a **full research-lane pass** (source-literature through synthesis, loopable by phase), use `.context/workflows/research-lane-loop.md` and `.agents/skills/research-lane-loop/SKILL.md`. This workflow remains the discovery step only.
+## Claim discipline
+
+Source discovery feeds the capture pipeline, so credibility tiers govern **what to
+retrieve** and GRADE certainty governs **what confidence to assign afterwards**.
+Both are defined in `EPISTEMIC_STANCE.md`; procedure in
+[epistemic-standard.md](epistemic-standard.md).
+
+- Never record a source you did not fetch. A `retrieved_at` an agent writes about
+  itself is worth nothing; captures claiming it were citing hard 404s.
+- Verify identifiers, not bylines. The identifier-shape check found all 107
+  fabricated captures in the 2026-08-09 finding; the non-human-author heuristic
+  caught 6 and missed 76.
+- **Escape:** finding one real source and recording the gap beats finding three
+  that resolve to nothing. There is no target count and never should be.
+
+**Stop state.** If a search returns nothing usable, close the pass with the gap
+named. Do not lower the tier bar to fill a lane.

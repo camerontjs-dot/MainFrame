@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# model-disk-status — free-space gates + large model cache summary
+# Policy: 30_projects/agent-harness-eval/plans/model-disk-budget-policy.md
+set -euo pipefail
+
+DATA_VOL="/System/Volumes/Data"
+INVENTORY="${MAINFRAME_ROOT:-$HOME/Desktop/MainFrame}/30_projects/agent-harness-eval/outputs/MODEL_DISK_INVENTORY.md"
+POLICY="${MAINFRAME_ROOT:-$HOME/Desktop/MainFrame}/30_projects/agent-harness-eval/plans/model-disk-budget-policy.md"
+
+echo "=== Model disk status ==="
+echo "Policy: $POLICY"
+echo "Inventory: $INVENTORY"
+echo
+
+# Free space on Data volume (GB available)
+if df -g "$DATA_VOL" >/dev/null 2>&1; then
+  # macOS df -g: size used avail in GiB
+  read -r _ size used avail _ < <(df -g "$DATA_VOL" | tail -1 | awk '{print $1,$2,$3,$4}')
+  # Prefer 1024-block parse for free bytes
+  avail_kb=$(df -k "$DATA_VOL" | tail -1 | awk '{print $4}')
+  avail_gb=$(python3 -c "print(round($avail_kb/1024/1024, 1))")
+  used_pct=$(df -h "$DATA_VOL" | tail -1 | awk '{print $5}')
+else
+  avail_gb="?"
+  used_pct="?"
+fi
+
+echo "Data volume free: ${avail_gb} GB  (capacity used ${used_pct})"
+echo
+
+# Gate
+gate="OK"
+if python3 -c "import sys; sys.exit(0 if float('${avail_gb}')>=40 else 1)" 2>/dev/null; then
+  gate="OK (≥40 GB free)"
+elif python3 -c "import sys; sys.exit(0 if float('${avail_gb}')>=25 else 1)" 2>/dev/null; then
+  gate="WATCH (25–40 GB) — no speculative multi-GB pulls"
+elif python3 -c "import sys; sys.exit(0 if float('${avail_gb}')>=15 else 1)" 2>/dev/null; then
+  gate="SOFT BLOCK (15–25 GB) — no multi-GB pulls without free-up"
+elif python3 -c "import sys; sys.exit(0 if float('${avail_gb}')>=5 else 1)" 2>/dev/null; then
+  gate="HARD BLOCK (5–15 GB) — stop downloads; incompletes only"
+else
+  gate="EMERGENCY (<5 GB) — free space before evals/downloads"
+fi
+echo "Gate: $gate"
+echo
+
+echo "=== Large caches ==="
+for p in \
+  "$HOME/.ollama" \
+  "$HOME/.cache/huggingface" \
+  "$HOME/Desktop/image-generation-lab/comfyui/models"
+do
+  if [ -e "$p" ]; then
+    du -sh "$p" 2>/dev/null || true
+  else
+    echo "missing  $p"
+  fi
+done
+echo
+
+echo "=== Ollama models ==="
+if command -v ollama >/dev/null 2>&1; then
+  ollama list 2>/dev/null || true
+else
+  echo "ollama not installed"
+fi
+echo
+
+echo "=== HF hub top entries ==="
+if [ -d "$HOME/.cache/huggingface/hub" ]; then
+  du -sh "$HOME/.cache/huggingface/hub"/models--* 2>/dev/null | sort -hr | head -15
+else
+  echo "no HF hub cache"
+fi
+echo
+
+# Incomplete blobs (safe prune anytime)
+inc=$(find "$HOME/.cache/huggingface/hub" -name '*.incomplete' 2>/dev/null | wc -l | tr -d ' ')
+echo "HF incomplete blobs: $inc (safe to delete anytime; not evidence)"
+echo
+
+echo "=== Reminder ==="
+echo "Benchmark first → update MODEL_DISK_INVENTORY.md → drop_candidate only after phase evidence."
+echo "Do not dual-load Ollama + heavy MLX server when free < 25 GB."

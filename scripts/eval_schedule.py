@@ -30,11 +30,25 @@ MINDGRAPH_GRAPH_HEALTH = (
 MINDGRAPH_PROJECT = ROOT / "mindgraph"
 DEFAULT_DB = Path.home() / ".mindgraph" / "mainframe.sqlite"
 DEFAULT_INTENT_DB = Path.home() / ".mindgraph" / "mainframe-intent.sqlite"
+EVAL_SNAPSHOT_DIR = ROOT / "30_projects" / "mindgraph-eval" / "snapshots"
+EVAL_SNAPSHOT_PATHS = (
+    EVAL_SNAPSHOT_DIR / "frozen-mainframe.sqlite",
+    EVAL_SNAPSHOT_DIR / "frozen-mainframe-projects.sqlite",
+    EVAL_SNAPSHOT_DIR / "frozen-mainframe-intent.sqlite",
+)
 LOG_DIR = REGISTRY_DIR / "logs"
+# launchd stderr/stdout outside Desktop/Documents — those trees need Full Disk Access.
+LAUNCHD_LOG_DIR = Path.home() / "Library" / "Logs" / "MainFrame" / "eval-schedule"
 DAEMON_LABEL_DAILY = "com.mainframe.eval-schedule.daily"
 DAEMON_LABEL_WEEKLY = "com.mainframe.eval-schedule.weekly"
 SCHEDULED_PROBE_QUERY_IDS = (
     "q04_memory_cite_forget,q07_ai_detection,q11_negative_live_state,q12_negative_inbox"
+)
+# macOS TCC blocks background agents from Desktop/Documents/Downloads without FDA.
+_TCC_PROTECTED_SEGMENTS = frozenset({"Desktop", "Documents", "Downloads"})
+_TCC_ERR_MARKERS = (
+    "Operation not permitted",
+    "getcwd: cannot access parent directories",
 )
 STEP_PROCESS_IDS = {
     "ingest_minion_dry_run": ["cli-ingest-minion", "workflow-ingest-minion"],
@@ -64,6 +78,7 @@ class StepResult:
     stderr_tail: str = ""
     skipped: bool = False
     skip_reason: str | None = None
+    operator_gated: bool = False
 
 
 @dataclass
@@ -174,7 +189,7 @@ def run_step(name: str, command: list[str], *, cwd: Path, timeout: int | None = 
         )
 
 
-def skipped_step(name: str, reason: str) -> StepResult:
+def skipped_step(name: str, reason: str, *, operator_gated: bool = False) -> StepResult:
     return StepResult(
         name=name,
         command=[],
@@ -183,7 +198,18 @@ def skipped_step(name: str, reason: str) -> StepResult:
         process_ids=STEP_PROCESS_IDS.get(name, []),
         skipped=True,
         skip_reason=reason,
+        operator_gated=operator_gated,
     )
+
+
+def missing_eval_snapshots() -> list[Path]:
+    """Return frozen evaluation inputs absent from the local snapshot set.
+
+    Refreshing a snapshot deliberately rebases evaluation evidence, so a
+    missing snapshot remains an explicit operator gate rather than falling
+    back to the installed indexes.
+    """
+    return [path for path in EVAL_SNAPSHOT_PATHS if not path.is_file()]
 
 
 def parse_harvest_stats(stdout: str) -> dict[str, int]:
@@ -273,9 +299,10 @@ def steps_for_cadence(
             reason = "probe script or MindGraph DB missing"
             out.append(("mindgraph_retrieval_probe", None, reason))
 
-        # Post-install / weekly ritual: score live envelope against installed intent graph.
-        # Requires mindgraph project env (PyYAML) — not bare host Python.
-        if MINDGRAPH_LIVE_ENVELOPE.exists() and DEFAULT_INTENT_DB.exists():
+        # Weekly envelope check reads frozen evaluation inputs only. Refreshing
+        # those snapshots is an operator-gated rebase, never a live fallback.
+        missing_snapshots = missing_eval_snapshots()
+        if MINDGRAPH_LIVE_ENVELOPE.exists() and not missing_snapshots:
             env_run_id = f"{run_id}-live-envelope"
             live_cmd = mindgraph_uv_python_cmd(
                 MINDGRAPH_LIVE_ENVELOPE, "--run-id", env_run_id
@@ -291,11 +318,15 @@ def steps_for_cadence(
                     )
                 )
         else:
+            missing_names = ", ".join(path.name for path in missing_snapshots)
+            if not missing_names:
+                missing_names = "live envelope script"
             out.append(
                 (
                     "mindgraph_live_envelope",
                     None,
-                    "live envelope script or intent DB missing",
+                    "OPERATOR GATE: frozen evaluation snapshot missing "
+                    f"({missing_names}); approve refresh_eval_snapshots.py before rerunning",
                 )
             )
 
@@ -338,7 +369,14 @@ def execute_suite(
         run_id=run_id,
     ):
         if command is None:
-            steps.append(skipped_step(name, skip_reason or "skipped"))
+            reason = skip_reason or "skipped"
+            steps.append(
+                skipped_step(
+                    name,
+                    reason,
+                    operator_gated=reason.startswith("OPERATOR GATE:"),
+                )
+            )
             continue
         if name == "unittest_suite":
             timeout = 1800
@@ -349,7 +387,11 @@ def execute_suite(
         steps.append(run_step(name, command, cwd=root, timeout=timeout))
 
     finished_at = datetime.now(timezone.utc).isoformat()
-    all_passed = all(s.exit_code == 0 for s in steps if not s.skipped)
+    all_passed = all(
+        s.exit_code == 0 and not s.operator_gated
+        for s in steps
+        if not s.skipped or s.operator_gated
+    )
     return ScheduleRun(
         run_id=run_id,
         cadence=cadence,
@@ -386,10 +428,30 @@ def write_process_eval_output(run: ScheduleRun, *, dry_run: bool) -> Path | None
 
     PROCESS_EVAL_OUTPUTS.mkdir(parents=True, exist_ok=True)
     out_path = PROCESS_EVAL_OUTPUTS / f"{run.run_id}.md"
-    failed = [s.name for s in run.steps if not s.skipped and s.exit_code != 0]
-    skipped = [s.name for s in run.steps if s.skipped]
-    passed_count = sum(1 for s in run.steps if not s.skipped and s.exit_code == 0)
-    step_total = sum(1 for s in run.steps if not s.skipped)
+    # Portfolio triage may exit 2 when severity is high but the card was written;
+    # that is allowed for all_passed and must not be labeled a suite failure.
+    def _step_failed(s: StepResult) -> bool:
+        if s.skipped or s.operator_gated:
+            return False
+        if s.name == "eval_portfolio_triage" and s.exit_code == 2:
+            return False
+        return s.exit_code != 0
+
+    failed = [s.name for s in run.steps if _step_failed(s)]
+    triage_sev = [
+        s.name
+        for s in run.steps
+        if s.name == "eval_portfolio_triage" and s.exit_code == 2 and not s.skipped
+    ]
+    skipped = [s.name for s in run.steps if s.skipped and not s.operator_gated]
+    gated = [s.name for s in run.steps if s.operator_gated]
+    passed_count = sum(
+        1
+        for s in run.steps
+        if not s.skipped
+        and (s.exit_code == 0 or (s.name == "eval_portfolio_triage" and s.exit_code == 2))
+    )
+    step_total = sum(1 for s in run.steps if not s.skipped or s.operator_gated)
 
     answer = (
         f"Scheduled {run.cadence} suite {'passed' if run.all_passed else 'failed'}: "
@@ -397,8 +459,12 @@ def write_process_eval_output(run: ScheduleRun, *, dry_run: bool) -> Path | None
     )
     if failed:
         answer += f" Failed: {', '.join(failed)}."
+    if triage_sev:
+        answer += " Triage exit 2 (severity signal only; card written)."
     if skipped:
         answer += f" Skipped: {', '.join(skipped)}."
+    if gated:
+        answer += f" Operator-gated: {', '.join(gated)}."
 
     metrics = [
         {
@@ -419,7 +485,18 @@ def write_process_eval_output(run: ScheduleRun, *, dry_run: bool) -> Path | None
 
     irregularities: list[dict[str, Any]] = []
     for step in run.steps:
-        if step.skipped:
+        if step.operator_gated:
+            irregularities.append(
+                {
+                    "id": f"operator-gated-{step.name}",
+                    "severity": "medium",
+                    "category": "operator_gate",
+                    "observation": step.skip_reason or "operator decision required",
+                    "context": run.run_id,
+                    "resolved": False,
+                }
+            )
+        elif step.skipped:
             irregularities.append(
                 {
                     "id": f"skipped-{step.name}",
@@ -431,16 +508,31 @@ def write_process_eval_output(run: ScheduleRun, *, dry_run: bool) -> Path | None
                 }
             )
         elif step.exit_code != 0:
-            irregularities.append(
-                {
-                    "id": f"failed-{step.name}",
-                    "severity": "medium" if run.cadence == "weekly" else "high",
-                    "category": "step_failure",
-                    "observation": f"{step.name} exit_code={step.exit_code}",
-                    "context": step.stderr_tail or step.stdout_tail or "",
-                    "resolved": False,
-                }
-            )
+            if step.name == "eval_portfolio_triage" and step.exit_code == 2:
+                irregularities.append(
+                    {
+                        "id": f"triage-severity-{step.name}",
+                        "severity": "info",
+                        "category": "triage_severity",
+                        "observation": (
+                            f"{step.name} exit_code=2 (portfolio severity high; "
+                            "action card written; not a suite failure)"
+                        ),
+                        "context": step.stderr_tail or step.stdout_tail or "",
+                        "resolved": True,
+                    }
+                )
+            else:
+                irregularities.append(
+                    {
+                        "id": f"failed-{step.name}",
+                        "severity": "medium" if run.cadence == "weekly" else "high",
+                        "category": "step_failure",
+                        "observation": f"{step.name} exit_code={step.exit_code}",
+                        "context": step.stderr_tail or step.stdout_tail or "",
+                        "resolved": False,
+                    }
+                )
         elif step.name == "eval_registry_harvest":
             stats = parse_harvest_stats(step.stdout_tail)
             if stats["errors"]:
@@ -475,7 +567,7 @@ def write_process_eval_output(run: ScheduleRun, *, dry_run: bool) -> Path | None
         yaml_irreg = "  []"
 
     step_rows = "\n".join(
-        f"| {s.name} | {'skip' if s.skipped else s.exit_code} | {s.duration_seconds} | {', '.join(s.process_ids) or 'none'} |"
+        f"| {s.name} | {'gate' if s.operator_gated else ('skip' if s.skipped else s.exit_code)} | {s.duration_seconds} | {', '.join(s.process_ids) or 'none'} |"
         for s in run.steps
     )
 
@@ -538,7 +630,9 @@ def print_run_summary(run: ScheduleRun) -> None:
         f"all_passed={run.all_passed} trigger={run.trigger}"
     )
     for step in run.steps:
-        if step.skipped:
+        if step.operator_gated:
+            print(f"  - {step.name}: OPERATOR GATE ({step.skip_reason})")
+        elif step.skipped:
             print(f"  - {step.name}: SKIP ({step.skip_reason})")
         else:
             print(f"  - {step.name}: exit={step.exit_code} duration={step.duration_seconds}s")
@@ -548,10 +642,58 @@ def plist_path(label: str) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
+def python_for_launchd() -> str:
+    """Absolute interpreter for LaunchAgents (avoid /usr/bin/env + bash wrappers)."""
+    return sys.executable
+
+
+def root_needs_full_disk_access(root: Path) -> bool:
+    """True when root sits under a macOS TCC-protected user folder."""
+    try:
+        parts = set(root.expanduser().resolve().parts)
+    except OSError:
+        parts = set(root.parts)
+    return bool(parts & _TCC_PROTECTED_SEGMENTS)
+
+
+def detect_launchd_tcc_blocks(*, log_dirs: list[Path] | None = None) -> list[str]:
+    """Scan launchd err logs for Desktop/TCC denials.
+
+    Default: only ~/Library/Logs/MainFrame/eval-schedule (post-2026-07-23 plists).
+    Legacy Desktop-tree logs are ignored so historical denials do not forever-red
+    the check after the agent is fixed.
+    """
+    dirs = log_dirs if log_dirs is not None else [LAUNCHD_LOG_DIR]
+    hits: list[str] = []
+    for directory in dirs:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.err")):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            # Prefer the tail — recent failures matter more than ancient noise.
+            tail = "\n".join(text.splitlines()[-40:])
+            if any(marker in tail for marker in _TCC_ERR_MARKERS):
+                hits.append(str(path))
+    return hits
+
+
 def build_plist(label: str, cadence: str, root: Path) -> str:
-    log_out = LOG_DIR / f"{cadence}.log"
-    log_err = LOG_DIR / f"{cadence}.err"
-    script = root / "bin" / "eval-schedule"
+    """Build a LaunchAgent plist that minimizes Desktop TCC friction.
+
+    - Invoke python + scripts/eval_schedule.py directly (no bash wrapper).
+    - WorkingDirectory = $HOME (not the Desktop tree).
+    - Logs under ~/Library/Logs/MainFrame/eval-schedule/.
+    - Still requires Full Disk Access when root is under Desktop.
+    """
+    LAUNCHD_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_out = LAUNCHD_LOG_DIR / f"{cadence}.log"
+    log_err = LAUNCHD_LOG_DIR / f"{cadence}.err"
+    python = python_for_launchd()
+    module = (root / "scripts" / "eval_schedule.py").resolve()
+    home = str(Path.home())
     if cadence == "daily":
         calendar = """
     <key>StartCalendarInterval</key>
@@ -581,13 +723,14 @@ def build_plist(label: str, cadence: str, root: Path) -> str:
     <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{script}</string>
+        <string>{python}</string>
+        <string>{module}</string>
         <string>run</string>
         <string>--cadence</string>
         <string>{cadence}</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>{root}</string>{calendar}
+    <string>{home}</string>{calendar}
     <key>StandardOutPath</key>
     <string>{log_out}</string>
     <key>StandardErrorPath</key>
@@ -595,9 +738,15 @@ def build_plist(label: str, cadence: str, root: Path) -> str:
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>MAINFRAME_EVAL_TRIGGER</key>
         <string>launchd</string>
+        <key>MAINFRAME_ROOT</key>
+        <string>{root.resolve()}</string>
+        <key>PYTHONPATH</key>
+        <string>{(root / "scripts").resolve()}</string>
+        <key>HOME</key>
+        <string>{home}</string>
     </dict>
 </dict>
 </plist>
@@ -668,6 +817,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_install(args: argparse.Namespace) -> int:
     root = repo_root()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LAUNCHD_LOG_DIR.mkdir(parents=True, exist_ok=True)
     REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
     ensure_operator_card()
     plist_dir = Path.home() / "Library" / "LaunchAgents"
@@ -688,6 +838,29 @@ def cmd_install(args: argparse.Namespace) -> int:
         else:
             print(f"install warning ({label}): {msg}", file=sys.stderr)
             return 1
+
+    py = python_for_launchd()
+    print(f"launchd python: {py}")
+    print(f"launchd logs:   {LAUNCHD_LOG_DIR}")
+    if root_needs_full_disk_access(root):
+        print(
+            "\nNote: MainFrame is under Desktop/Documents/Downloads (TCC-protected).\n"
+            "  Agents invoke Python directly (not bash). If kickstart fails with\n"
+            f"  Operation not permitted, grant Full Disk Access to:\n  • {py}\n"
+            "  Prove: launchctl kickstart -k gui/$(id -u)/com.mainframe.eval-schedule.weekly\n"
+            "  Longer-term option: keep the repo outside Desktop (e.g. ~/MainFrame).\n",
+            file=sys.stderr,
+        )
+    tcc_hits = detect_launchd_tcc_blocks()
+    if tcc_hits:
+        print(
+            "Recent launchd TCC denials still present in:\n  - "
+            + "\n  - ".join(tcc_hits[:4]),
+            file=sys.stderr,
+        )
+    print(
+        "Prove service: launchctl kickstart -k gui/$(id -u)/com.mainframe.eval-schedule.weekly"
+    )
     return 0
 
 
@@ -735,6 +908,20 @@ def last_run_for_cadence(runs: list[dict[str, Any]], cadence: str) -> dict[str, 
     return max(matches, key=lambda r: r.get("finished_at") or r.get("started_at") or "")
 
 
+def failed_step_summary(run: dict[str, Any] | None) -> str:
+    """Summarize failed or operator-gated child steps from a schedule receipt."""
+    if not run:
+        return ""
+    labels: list[str] = []
+    for step in run.get("steps") or []:
+        name = step.get("name") or "unnamed"
+        if step.get("operator_gated"):
+            labels.append(f"{name} (operator gate)")
+        elif not step.get("skipped") and step.get("exit_code") not in (0, None):
+            labels.append(f"{name} (exit {step.get('exit_code')})")
+    return ", ".join(labels)
+
+
 def assess_schedule_health(*, now: datetime | None = None) -> ScheduleHealth:
     now = now or datetime.now(timezone.utc)
     runs = load_schedule_runs()
@@ -757,6 +944,34 @@ def assess_schedule_health(*, now: datetime | None = None) -> ScheduleHealth:
         problems.append("launchd weekly agent not installed — run: bin/eval-schedule install --cadence both")
     if not launchd_daily:
         problems.append("launchd daily agent not installed — run: bin/eval-schedule install --cadence both")
+
+    # TCC / Full Disk Access — hard-fail only on concrete denial evidence in
+    # current launchd logs. A recent launchd-triggered weekly proves the agent
+    # can read the tree (bash-wrapper denials are historical).
+    tcc_logs = detect_launchd_tcc_blocks()
+    if tcc_logs:
+        problems.append(
+            "launchd blocked by macOS TCC (Operation not permitted on Desktop path) — "
+            f"grant Full Disk Access to {python_for_launchd()}, then: "
+            "bin/eval-schedule install --cadence both && "
+            "launchctl kickstart -k gui/$(id -u)/com.mainframe.eval-schedule.weekly "
+            f"(see {tcc_logs[0]})"
+        )
+    elif (
+        root_needs_full_disk_access(ROOT)
+        and (launchd_weekly or launchd_daily)
+        and not (
+            last_weekly
+            and last_weekly.get("trigger") == "launchd"
+            and weekly_age is not None
+            and weekly_age <= WEEKLY_STALE_DAYS
+        )
+    ):
+        degraded.append(
+            "MainFrame is under Desktop/Documents/Downloads; if launchd fails with "
+            f"Operation not permitted, grant Full Disk Access to {python_for_launchd()}"
+        )
+
     if last_weekly is None:
         problems.append("no weekly eval run logged — run: bin/eval-schedule run --cadence weekly")
     elif weekly_age is not None and weekly_age > WEEKLY_STALE_DAYS:
@@ -764,8 +979,10 @@ def assess_schedule_health(*, now: datetime | None = None) -> ScheduleHealth:
             f"weekly eval stale ({weekly_age:.1f}d) — run: bin/eval-schedule run --cadence weekly"
         )
     elif last_weekly and not last_weekly.get("all_passed"):
+        details = failed_step_summary(last_weekly)
+        suffix = f"; failed steps: {details}" if details else ""
         problems.append(
-            f"last weekly eval failed ({last_weekly.get('run_id')}) — inspect 20_live/eval-registry/logs/"
+            f"last weekly eval failed ({last_weekly.get('run_id')}){suffix} — inspect 20_live/eval-registry/logs/"
         )
     if daily_age is not None and daily_age > DAILY_STALE_DAYS:
         problems.append(f"daily eval stale ({daily_age:.1f}d) — check launchd logs")

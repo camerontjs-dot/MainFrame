@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  :
+else
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+
+PYTHON="${MAINFRAME_PYTHON:-}"
+if [[ -z "$PYTHON" && -x "$ROOT/mindgraph/.venv/bin/python" ]]; then
+  PYTHON="$ROOT/mindgraph/.venv/bin/python"
+fi
+if [[ -z "$PYTHON" && -x "$ROOT/30_projects/mindgraph/workbench/.venv/bin/python" ]]; then
+  PYTHON="$ROOT/30_projects/mindgraph/workbench/.venv/bin/python"
+fi
+PYTHON="${PYTHON:-python3}"
+
+exec "$PYTHON" "$ROOT/scripts/mindgraph_link_audit.py" --root "$ROOT" "$@"

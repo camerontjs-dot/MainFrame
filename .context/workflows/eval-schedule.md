@@ -56,12 +56,14 @@ Manifest: `20_live/eval-registry/schedule-runs.jsonl`
 2. `bin/eval-registry status` — new metrics/irregularities?
 3. Read the latest `scheduled-weekly` output in `mainframe-process-eval/outputs/`.
 4. Pick **one** improvement slice; rerun the same cadence after the fix.
+5. Run `bin/mindgraph-audit-links --dry-run --scope 10_knowledge --output-dir 01_ingest/audit-receipts` when graph hygiene is in scope. Review its JSON/Markdown action queue as an advisory observation; do not turn findings into a weekly green score or blocking gate until a false-positive baseline has been measured.
 
 ## Guardrails
 
 - Scheduled runs are **regression signal**, not promotion by themselves.
 - MindGraph probe is skipped when `~/.mindgraph/mainframe.sqlite` is missing.
 - Default weekly probe runs four fused regression queries (`q04_memory…`, `q07_ai_detection`, `q11/q12` scope negatives, ~25s). Use `--full-probe` for the complete matrix.
+- Raw evidence leaves (informational) are retained as counts and classification queue items; they never fail the weekly health check. Curated-note zero-outbound, dangling/ambiguous links, freshness, and retrieval regressions remain separate signals.
 - `evaluation-feedback.md` files are excluded from harvest (not eval runs).
 - Do not schedule behavioral `skill-eval` cases until receipt automation exists (EV02).
 - Failed steps exit non-zero so launchd logs surface breakage.

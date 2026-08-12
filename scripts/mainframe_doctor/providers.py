@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -11,11 +13,16 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from mainframe_doctor.schema import CheckResult, CheckStatus, Severity, redact_secret_shaped, utc_now_rfc3339
 
 
 ProviderFn = Callable[[dict[str, Any], dict[str, Any]], CheckResult]
+
+
+class ProviderTimeoutError(TimeoutError):
+    """Raised when a doctor provider exceeds its catalogue time budget."""
 
 
 def _result(
@@ -105,7 +112,7 @@ def provider_auth_focus(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResu
     try:
         from focus_authority import load_focus
 
-        loaded = load_focus(root)
+        loaded = load_focus(root, now=ctx.get("now"))
     except Exception as exc:  # noqa: BLE001
         return _result(
             check,
@@ -392,6 +399,27 @@ def provider_eval_registry_strict(check: dict[str, Any], ctx: dict[str, Any]) ->
     )
 
 
+def _open_sqlite_read_only(path: Path) -> sqlite3.Connection:
+    """Open a SQLite snapshot without requiring write access to its directory."""
+    resolved = path.expanduser().resolve()
+    base_uri = f"file:{quote(str(resolved), safe='/')}?mode=ro"
+    last_error: Exception | None = None
+    for immutable in (False, True):
+        con: sqlite3.Connection | None = None
+        uri = f"{base_uri}&immutable=1" if immutable else base_uri
+        try:
+            con = sqlite3.connect(uri, uri=True)
+            con.execute("PRAGMA query_only = ON")
+            con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            return con
+        except sqlite3.Error as exc:
+            last_error = exc
+            if con is not None:
+                con.close()
+    assert last_error is not None
+    raise last_error
+
+
 def provider_mg_db_presence(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResult:
     home = Path.home() / ".mindgraph"
     knowledge = home / "mainframe.sqlite"
@@ -405,27 +433,43 @@ def provider_mg_db_presence(check: dict[str, Any], ctx: dict[str, Any]) -> Check
             message="installed MindGraph DBs not healthy by size/presence",
             severity="high",
         )
-    # schema sniff read-only
-    try:
-        con = sqlite3.connect(f"file:{knowledge}?mode=ro", uri=True)
-        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        con.close()
-        need = {"documents", "chunks"}
-        if not need.issubset(tables):
+    # Schema-sniff both canonical stores. Presence of one healthy DB must not
+    # make the pair look green.
+    need = {"documents", "documents_fts", "chunks", "vec_chunks", "edges"}
+    for label, path in (("knowledge", knowledge), ("projects", projects)):
+        try:
+            con = _open_sqlite_read_only(path)
+            try:
+                tables = {
+                    r[0]
+                    for r in con.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type IN ('table', 'virtual table')"
+                    )
+                }
+            finally:
+                con.close()
+        except Exception as exc:  # noqa: BLE001
+            return _result(
+                check,
+                "unknown",
+                observed=f"{label} open failed: {type(exc).__name__}",
+                message=f"could not inspect {label} DB",
+            )
+        missing_tables = sorted(need - tables)
+        if missing_tables:
             return _result(
                 check,
                 "fail",
-                observed=f"knowledge tables missing {sorted(need - tables)}",
-                message="schema incomplete",
+                observed=f"{label} tables missing {missing_tables}",
+                message=f"{label} schema incomplete",
                 severity="high",
             )
-    except Exception as exc:  # noqa: BLE001
-        return _result(check, "unknown", observed=type(exc).__name__, message="could not open knowledge DB")
     return _result(
         check,
         "pass",
-        observed="~/.mindgraph mainframe + projects DBs present with basic tables",
-        message="DB presence/schema sniff ok (not freshness/coverage)",
+        observed="~/.mindgraph mainframe + projects DB schemas valid",
+        message="both DB presence/schema sniffs ok (not freshness/coverage)",
     )
 
 
@@ -467,7 +511,64 @@ def provider_mg_manifest_coverage(check: dict[str, Any], ctx: dict[str, Any]) ->
             severity="high",
             evidence_refs=["30_projects/mindgraph-projects.json"],
         )
-    return _result(check, "pass", observed=f"manifest covers all {len(real)} projects", message="coverage ok")
+
+    installed = Path.home() / ".mindgraph" / "mainframe-projects.sqlite"
+    if not installed.exists():
+        return _result(
+            check,
+            "fail",
+            observed="installed projects DB missing",
+            message="manifest is complete but installed project index is absent",
+            severity="high",
+            evidence_refs=["30_projects/mindgraph-projects.json"],
+        )
+    try:
+        con = _open_sqlite_read_only(installed)
+        try:
+            installed_namespaces = {
+                str(row[0])
+                for row in con.execute(
+                    "SELECT DISTINCT namespace FROM documents "
+                    "WHERE namespace IS NOT NULL AND namespace != ''"
+                )
+            }
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        return _result(
+            check,
+            "unknown",
+            observed=f"installed projects DB unreadable: {type(exc).__name__}",
+            message="could not verify installed project namespaces",
+            severity="high",
+            evidence_refs=["~/.mindgraph/mainframe-projects.sqlite"],
+        )
+
+    expected_namespaces = set(names)
+    missing_namespaces = sorted(expected_namespaces - installed_namespaces)
+    extra_namespaces = sorted(installed_namespaces - expected_namespaces)
+    if missing_namespaces or extra_namespaces:
+        return _result(
+            check,
+            "fail",
+            observed=(
+                f"manifest_namespaces={len(expected_namespaces)} "
+                f"installed_namespaces={len(installed_namespaces)} "
+                f"missing={missing_namespaces} extra={extra_namespaces}"
+            ),
+            message="installed project MindGraph namespaces are stale",
+            severity="high",
+            evidence_refs=[
+                "30_projects/mindgraph-projects.json",
+                "~/.mindgraph/mainframe-projects.sqlite",
+            ],
+        )
+    return _result(
+        check,
+        "pass",
+        observed=f"manifest and installed DB cover all {len(real)} project namespaces",
+        message="manifest and installed namespace coverage ok",
+    )
 
 
 def provider_cli_mutation_help_safety(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResult:
@@ -598,6 +699,296 @@ def _has_table(con: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _parse_readme_frontmatter(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}
+    meta: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        meta[key.strip()] = value.strip().strip("\"'")
+    return meta
+
+
+_VALID_PROJECT_STATES = {
+    "active",
+    "paused",
+    "planned",
+    "blocked",
+    "suspended",
+    "shipped",
+    "trashed",
+}
+
+
+def provider_session_phase_alignment(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResult:
+    """SESSION-002: selected project state and re-entry pointer agree."""
+    root: Path = ctx["root"]
+    project: str | None = None
+    source = "none"
+    try:
+        from focus_authority import load_focus
+
+        loaded = load_focus(root)
+        if loaded.ok and loaded.primary_project:
+            project = loaded.primary_project
+            source = "focus"
+    except Exception:
+        loaded = None  # type: ignore[assignment]
+
+    if not project:
+        project = _detect_project_from_state(root / "STATE.md")
+        source = "STATE.md" if project else source
+
+    if not project:
+        return _result(
+            check,
+            "fail",
+            observed="no focus primary or STATE Active Project",
+            message="session project selection missing for phase alignment",
+            severity="high",
+        )
+
+    if " + " in project or "(" in project:
+        return _result(
+            check,
+            "fail",
+            observed=f"compound project label from {source}",
+            message="phase alignment cannot use compound focus labels",
+            severity="high",
+            evidence_refs=["STATE.md"],
+        )
+
+    readme = root / "30_projects" / project / "README.md"
+    if not readme.exists():
+        return _result(
+            check,
+            "fail",
+            observed=f"30_projects/{project}/README.md missing",
+            message="selected project path does not exist for phase alignment",
+            severity="critical",
+            evidence_refs=[f"30_projects/{project}/"],
+        )
+
+    meta = _parse_readme_frontmatter(readme)
+    state = (meta.get("project_state") or meta.get("status") or "").strip()
+    next_action = (meta.get("next_action") or "").strip()
+    if not state:
+        return _result(
+            check,
+            "fail",
+            observed=f"{project}: missing project_state",
+            message="selected project lacks lifecycle state",
+            severity="high",
+            evidence_refs=[f"30_projects/{project}/README.md"],
+        )
+    if state not in _VALID_PROJECT_STATES:
+        return _result(
+            check,
+            "fail",
+            observed=f"{project}: invalid project_state={state!r}",
+            message="selected project state not in ADR-041 vocabulary",
+            severity="high",
+            evidence_refs=[f"30_projects/{project}/README.md"],
+        )
+
+    needs_reentry = state in ("active", "paused", "blocked", "suspended")
+    if needs_reentry and not next_action:
+        return _result(
+            check,
+            "fail",
+            observed=f"{project}: state={state} without next_action",
+            message="active/paused/blocked/suspended project missing re-entry pointer",
+            severity="high",
+            evidence_refs=[f"30_projects/{project}/README.md"],
+        )
+
+    return _result(
+        check,
+        "pass",
+        observed=f"source={source} project={project} state={state} next_action={'set' if next_action else 'n/a'}",
+        message="selected project state and re-entry pointer agree",
+        evidence_refs=[f"30_projects/{project}/README.md"],
+    )
+
+
+def provider_structure_bounds(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResult:
+    """STRUCT-001: required structural contracts and private/public bounds present."""
+    root: Path = ctx["root"]
+    required = [
+        "AGENTS.md",
+        "HARNESS.md",
+        "DECISIONS.md",
+        "EPISTEMIC_STANCE.md",
+        "20_live/AGENTS.md",
+        "30_projects/AGENTS.md",
+        ".context/primitives.md",
+    ]
+    missing = [rel for rel in required if not (root / rel).exists()]
+    if missing:
+        return _result(
+            check,
+            "fail",
+            observed=f"missing={missing[:6]}",
+            message="required structural contracts missing",
+            severity="high",
+            evidence_refs=missing[:4],
+        )
+
+    # Private live zone must not be a symlink out of tree into a public export root.
+    live = root / "20_live"
+    issues: list[str] = []
+    if live.is_symlink():
+        issues.append("20_live is symlink")
+    public = root / "30_projects" / "mainframe-public-portfolio"
+    if public.exists():
+        # flag only direct 20_live path embeds in public README (not deep scan)
+        pub_readme = public / "README.md"
+        if pub_readme.exists():
+            blob = pub_readme.read_text(encoding="utf-8", errors="replace")
+            if re.search(r"(?m)20_live/|/Users/.*/20_live", blob):
+                issues.append("public portfolio README references 20_live paths")
+
+    if issues:
+        return _result(
+            check,
+            "fail",
+            observed="; ".join(issues),
+            message="private/public structural boundary issues",
+            severity="high",
+            evidence_refs=["20_live/", "30_projects/mainframe-public-portfolio/README.md"],
+        )
+
+    return _result(
+        check,
+        "pass",
+        observed=f"structural contracts present n={len(required)}; private bounds ok",
+        message="structural links and private/public boundaries valid (contract presence)",
+        evidence_refs=["AGENTS.md", "20_live/AGENTS.md"],
+    )
+
+
+def _telemetry_compute_hash(event_data: dict[str, Any], prev_hash: str) -> str:
+    event_str = json.dumps(event_data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256((event_str + prev_hash).encode("utf-8")).hexdigest()[:16]
+
+
+def provider_tel_hash_integrity(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResult:
+    """TEL-001: recent event store parses and intra-file hash chains hold."""
+    root: Path = ctx["root"]
+    events_dir = root / "20_live" / "workflow-metrics" / "events"
+    if not events_dir.is_dir():
+        return _result(
+            check,
+            "fail",
+            observed="20_live/workflow-metrics/events missing",
+            message="telemetry event store absent",
+            severity="high",
+            evidence_refs=["20_live/workflow-metrics/events"],
+        )
+
+    files = sorted(events_dir.glob("*.jsonl"))
+    if not files:
+        return _result(
+            check,
+            "fail",
+            observed="no event jsonl files",
+            message="telemetry event store empty",
+            severity="high",
+        )
+
+    # Operational health: verify the newest day file fully (bounded), not all history.
+    newest = files[-1]
+    parsed = 0
+    chain_ok = 0
+    chain_bad = 0
+    parse_errors = 0
+    prev_hash: str | None = None
+    try:
+        for line in newest.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                parse_errors += 1
+                prev_hash = None
+                continue
+            if not isinstance(event, dict):
+                parse_errors += 1
+                prev_hash = None
+                continue
+            parsed += 1
+            h = event.get("hash_chain")
+            if not isinstance(h, str) or not h:
+                chain_bad += 1
+                prev_hash = None
+                continue
+            body = {k: v for k, v in event.items() if k != "hash_chain"}
+            if prev_hash is None:
+                # First event or post-error resync — accept as chain anchor.
+                prev_hash = h
+                continue
+            expected = _telemetry_compute_hash(body, prev_hash)
+            if expected == h:
+                chain_ok += 1
+            else:
+                chain_bad += 1
+            prev_hash = h
+    except OSError as exc:
+        return _result(
+            check,
+            "unknown",
+            observed=type(exc).__name__,
+            message="could not read telemetry event file",
+        )
+
+    observed = (
+        f"file={newest.name} parsed={parsed} chain_ok={chain_ok} "
+        f"chain_bad={chain_bad} parse_errors={parse_errors}"
+    )
+    if parse_errors:
+        return _result(
+            check,
+            "fail",
+            observed=observed,
+            message="telemetry event store has unreadable records",
+            severity="high",
+            evidence_refs=[f"20_live/workflow-metrics/events/{newest.name}"],
+        )
+    if parsed == 0:
+        return _result(
+            check,
+            "warn",
+            observed=observed,
+            message="newest telemetry day file is empty",
+            severity="low",
+        )
+    if chain_bad:
+        return _result(
+            check,
+            "fail",
+            observed=observed,
+            message="telemetry hash-chain breaks in newest day file",
+            severity="high",
+            evidence_refs=[f"20_live/workflow-metrics/events/{newest.name}"],
+        )
+    return _result(
+        check,
+        "pass",
+        observed=observed,
+        message="newest telemetry day parses with intact hash chain",
+        evidence_refs=[f"20_live/workflow-metrics/events/{newest.name}"],
+    )
+
+
 def provider_sec_secret_store(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResult:
     """Presence/mode only — never print secret values."""
     root: Path = ctx["root"]
@@ -671,6 +1062,7 @@ PROVIDERS: dict[str, ProviderFn] = {
     "unimplemented": provider_unimplemented,
     "auth_focus": provider_auth_focus,
     "session_project_path": provider_session_project_path,
+    "session_phase_alignment": provider_session_phase_alignment,
     "project_index_check": provider_project_index_check,
     "eval_registry_strict": provider_eval_registry_strict,
     "mg_db_presence": provider_mg_db_presence,
@@ -678,6 +1070,8 @@ PROVIDERS: dict[str, ProviderFn] = {
     "cli_mutation_help_safety": provider_cli_mutation_help_safety,
     "ws_db_presence": provider_ws_db_presence,
     "ws_operational_rows": provider_ws_operational_rows,
+    "structure_bounds": provider_structure_bounds,
+    "tel_hash_integrity": provider_tel_hash_integrity,
     "sec_secret_store": provider_sec_secret_store,
     "task_manifest_quarantine": provider_task_manifest_quarantine,
     "sched_service": provider_sched_service,
@@ -702,8 +1096,37 @@ def run_provider(check: dict[str, Any], ctx: dict[str, Any]) -> CheckResult:
             severity="critical",
         )
     t0 = time.perf_counter()
+    timeout_seconds = int(check.get("timeout_seconds") or 10)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def timeout_handler(_signum: int, _frame: object) -> None:
+        raise ProviderTimeoutError
+
     try:
-        result = fn(check, ctx)
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+        try:
+            result = fn(check, ctx)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            previous_delay, previous_interval = previous_timer
+            if previous_delay > 0:
+                elapsed = time.perf_counter() - t0
+                signal.setitimer(
+                    signal.ITIMER_REAL,
+                    max(previous_delay - elapsed, 0.000001),
+                    previous_interval,
+                )
+    except ProviderTimeoutError:
+        result = _result(
+            check,
+            "unknown",
+            observed=f"timeout_seconds={timeout_seconds}",
+            message=f"provider timed out after {timeout_seconds}s",
+            severity="high",
+        )
     except Exception as exc:  # noqa: BLE001 — provider fault → unknown/fail
         result = _result(
             check,

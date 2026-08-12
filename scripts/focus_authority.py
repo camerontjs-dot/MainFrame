@@ -86,6 +86,9 @@ def parse_focus_yaml(text: str) -> dict[str, Any]:
                     # keep stack pointing at item for nested keys under list map
                     stack.pop()  # remove empty dict mistaken
                     stack.append((indent, item))
+                else:
+                    # Subsequent, more-indented keys belong to this list item.
+                    stack.append((indent, item))
             else:
                 parent.append(_parse_scalar(item_raw))
             continue
@@ -116,7 +119,7 @@ def parse_focus_yaml(text: str) -> dict[str, Any]:
     return root
 
 
-def load_focus(root: Path) -> FocusLoad:
+def load_focus(root: Path, *, now: datetime | None = None) -> FocusLoad:
     focus_dir = root / "20_live" / "focus"
     errors: list[str] = []
     warnings: list[str] = []
@@ -163,7 +166,10 @@ def load_focus(root: Path) -> FocusLoad:
             rb = datetime.fromisoformat(review_by.replace("Z", "+00:00"))
             if rb.tzinfo is None:
                 rb = rb.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) > rb:
+            current_time = now or datetime.now(timezone.utc)
+            if current_time.tzinfo is None:
+                current_time = current_time.replace(tzinfo=timezone.utc)
+            if current_time > rb:
                 warnings.append("focus review_by is past; authority is stale")
         except ValueError:
             errors.append("review_by not parseable as RFC3339")

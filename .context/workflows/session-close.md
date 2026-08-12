@@ -1,5 +1,8 @@
 # Session Close Workflow
 
+Part of the **session lifecycle loop**: `.context/workflows/session-lifecycle.md`
+(open → work → close → loop decision).
+
 A session-close workflow should always update state, write a concise handoff note, record meaningful changes in a log, and identify the exact next reentry point.
 
 ## Script

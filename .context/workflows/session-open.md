@@ -1,5 +1,8 @@
 # Session Open Workflow
 
+Part of the **session lifecycle loop**: `.context/workflows/session-lifecycle.md`
+(open → work → close → loop decision).
+
 A session-open workflow should load only the minimum useful context in a fixed order. This implements progressive context disclosure and prevents the model from consuming broad ambient context that is unrelated to the immediate work.
 
 ## Script

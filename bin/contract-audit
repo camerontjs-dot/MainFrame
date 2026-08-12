@@ -1,0 +1,1274 @@
+#!/usr/bin/env python3
+"""Audit MainFrame's own conventions — by measuring state, not by reading prose.
+
+## Why this exists, and why it is built the way it is
+
+`10_knowledge/agents/prompts/2026-06-22__agents__note__mainframe-agent-architecture-audit-checklist.md`
+is a sixty-item convention audit written on 2026-06-22. Every box in it is still
+unchecked. Its item 1.5 reads:
+
+    [ ] Safety rules that need enforcement have hooks, scripts, config, permissions, or tests.
+
+and its item 10.5:
+
+    [ ] Enforcement need -> config/hook/script/test, not prose only.
+
+Seven weeks later, 107 captures citing papers that do not exist were found in
+`10_knowledge/`, because the rule that should have stopped them existed only as
+prose. **The checklist named the defect and was never run.**
+
+So the first design constraint is that this file is a program, not a document.
+A checklist that requires a human to sit down and read sixty items is a checklist
+that does not get read.
+
+## The second design constraint: an audit that reads documents would have passed
+
+This is the part that matters. Run the 2026-06-22 checklist by hand against the
+repo as it stood on 2026-08-08 — the day before the fabrications were found — and
+it very plausibly comes back clean:
+
+  * `01_ingest/AGENTS.md` says raw captures route through ingest.        tick
+  * `EPISTEMIC_STANCE.md` says LLM inferences are not truth.             tick
+  * `agents/ingest-agent.md` names guardrails, tools, and handoff shape. tick
+  * `.context/workflows/audit-sweep.md` exists and is referenced.        tick
+
+Meanwhile 449 raw captures had bypassed ingest entirely and 107 of the files
+those contracts governed carried invented DOIs. **Every document said the right
+thing. The state was wrong.** Document-reading audits measure whether you wrote
+the rule down, which is not the question.
+
+Hence three layers, and only the last two are worth anything:
+
+    Layer A  DOCUMENT   does the contract say the right thing?
+                        Cheap, and the weakest evidence there is. Reported, but
+                        never sufficient — every Layer A pass is labelled as
+                        document-level so it cannot be mistaken for a control.
+
+    Layer B  STATE      run the enforcing tool and report what it found.
+                        This is what catches the thing nobody anticipated,
+                        because it asks what is true rather than what is written.
+
+    Layer C  REPLAY     a positive control. Known past failures are replayed
+                        against the current checks. If a check does not fire on
+                        a failure it is supposed to catch, this audit reports
+                        BROKEN rather than clean.
+
+Layer C is the direct answer to "an audit would have missed the made-up sources."
+It would have. So the audit is required to prove, every run, that it still
+detects the failures we already know about. An audit that cannot fail its own
+controls is not evidence — the same rule the citation sweep runs under, where a
+probe with no negative control reports a captive portal as a clean bill of health.
+
+## What it deliberately does not do
+
+It does not grade judgement. Roughly half the checklist is unautomatable —
+"AGENTS.md is concise and current", "subagents return distilled summaries" — and
+silently dropping those items is how a checklist decays into a linter and stops
+asking the hard questions. They are carried in the register as OPEN with a review
+date, visible and explicitly not machine-checked.
+
+Usage:
+  bin/contract-audit                    # full audit, human-readable
+  bin/contract-audit --selftest         # Layer C only: are the checks alive?
+  bin/contract-audit --layer state      # only the checks that measure state
+  bin/contract-audit --register out.md  # write the contract register
+  bin/contract-audit --json out.json
+  bin/contract-audit --fail-on-broken   # CI: nonzero if a control fails
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# How long a judgement item stays fresh before it wants a human again.
+REVIEW_INTERVAL_DAYS = 90
+
+CHECKLIST = (
+    ROOT / "10_knowledge/agents/prompts"
+    / "2026-06-22__agents__note__mainframe-agent-architecture-audit-checklist.md"
+)
+
+
+# ---------------------------------------------------------------- result types
+
+
+@dataclass
+class Finding:
+    item: str  # checklist coordinate, e.g. "1.5"
+    layer: str  # document | state | judgement
+    title: str
+    status: str  # PASS | FAIL | OPEN | BROKEN | SKIP
+    detail: str = ""
+    evidence: list[str] = field(default_factory=list)
+    # Would this check have fired during the 2026-08-09 fabrication incident?
+    # "no" on a document-layer item is expected and is itself the finding.
+    caught_incident: str = "n/a"  # yes | no | n/a
+    review_by: str = ""
+
+
+RESULTS: list[Finding] = []
+
+
+def add(f: Finding) -> Finding:
+    RESULTS.append(f)
+    return f
+
+
+def review_date() -> str:
+    return (date.today() + timedelta(days=REVIEW_INTERVAL_DAYS)).isoformat()
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def run(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
+    """Run an enforcing tool. A missing tool is a FAIL, not a crash.
+
+    Deliberately does NOT set `MAINFRAME_KNOWLEDGE_WRITE=1`. An earlier version
+    did, so that any tool the audit invoked could write freely. Nothing it
+    invokes needs that: every call here is `--help`, `--check`, or a read-only
+    validation pass. What the override actually bought was a latent bypass of
+    the write guard, living inside the tool whose job is to check that guards
+    are in place. An audit must not run with privileges the thing it audits
+    would not have.
+    """
+    try:
+        p = subprocess.run(
+            cmd, cwd=ROOT, capture_output=True, text=True, timeout=timeout,
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except FileNotFoundError:
+        return 127, f"tool not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s: {' '.join(cmd)}"
+
+
+# ------------------------------------------------------- contract file discovery
+
+
+# Files that carry normative language but are deliberately NOT contracts.
+# Naming them is the point: an exclusion that is argued for is auditable, an
+# exclusion that is an oversight is a blind spot wearing the same clothes.
+NON_CONTRACT = {
+    "log.md": "append-only work log — narrates what happened, binds nothing",
+    "log_new.md": "same",
+    "STATE.md": "current focus; declared volatile by AGENTS.md",
+    "CHANGELOG.md": "history",
+    "README.md": "orientation for humans, not agent-binding",
+    "EVAL_METHODOLOGY.md": "method description; its rules live in workflows",
+}
+
+
+def contract_files() -> list[Path]:
+    """Every file that carries normative weight over agent behaviour.
+
+    The first version of this function listed AGENTS.md, HARNESS.md,
+    EPISTEMIC_STANCE.md, DECISIONS.md, workflows and agents/ — the file types
+    that came to mind. Measured against the repo, that missed **291 normative
+    clauses in 51 files**, the largest block of them inside `.agents/skills/`,
+    which is where the ingest procedure actually lives.
+
+    That is the deny-list mistake for the fourth time in this investigation, this
+    time committed by the tool built to catch it. Every previous instance had the
+    same fix and so does this one: **enumerate what a contract is, then take
+    everything that qualifies**, rather than listing the ones you remember.
+
+    A contract here is: any file under a directory whose purpose is to govern
+    agent behaviour (`.agents/`, `.context/`, `agents/`), plus the named root
+    contracts, minus an explicit, argued exclusion list.
+    """
+    out: list[Path] = []
+    for p in ROOT.rglob("AGENTS.md"):
+        if "node_modules" in p.parts or "90_archive" in p.parts:
+            continue
+        out.append(p)
+    for name in ("HARNESS.md", "EPISTEMIC_STANCE.md", "DECISIONS.md"):
+        if (ROOT / name).exists():
+            out.append(ROOT / name)
+    for base in (".context", ".agents", "agents"):
+        d = ROOT / base
+        if not d.exists():
+            continue
+        for p in d.rglob("*.md"):
+            if "node_modules" in p.parts or p.name in NON_CONTRACT:
+                continue
+            out.append(p)
+    return list(dict.fromkeys(out))
+
+
+def coverage_gap() -> tuple[int, int, list[str]]:
+    """How much normative language does this audit NOT look at?
+
+    Reported every run. An audit that does not state its own coverage invites
+    the reader to assume it is total, which is the failure mode that let a
+    checklist full of correct rules sit next to 449 files that ignored them.
+    """
+    covered = {p.resolve() for p in contract_files()}
+    missed, total = [], 0
+    seen: set[Path] = set()
+    for p in list(ROOT.glob("*.md")) + list((ROOT / ".agents").rglob("*.md")) \
+            + list((ROOT / ".context").rglob("*.md")):
+        if not p.is_file() or p.resolve() in covered or p.resolve() in seen:
+            continue
+        if "90_archive" in p.parts or "node_modules" in p.parts:
+            continue
+        seen.add(p.resolve())
+        n = sum(1 for ln in read(p).splitlines() if NORMATIVE.search(ln))
+        if n:
+            total += n
+            why = NON_CONTRACT.get(p.name, "NOT EXCLUDED — genuine blind spot")
+            missed.append(f"{n:>3} clauses  {p.relative_to(ROOT)}  ({why})")
+    return len(missed), total, missed
+
+
+NORMATIVE = re.compile(
+    r"\b(MUST(?! not)|MUST NOT|NEVER|ALWAYS|SHALL|REQUIRED|PROHIBITED"
+    r"|[Dd]o not|must not|may not|never|only|strictly)\b"
+)
+
+# A clause is "bound to a mechanism" if it names something that can run.
+MECHANISM = re.compile(
+    r"(bin/[a-z0-9._-]+"           # a tool
+    r"|\.claude/settings"          # config
+    r"|PreToolUse|PostToolUse|hook"
+    r"|pytest|test_[a-z_]+|selftest"
+    r"|--check\b|--apply\b|--dry-run\b|--fail-on"
+    r"|\.gitignore"
+    r")"
+)
+
+# Tier declarations, once contracts start carrying them.
+#
+# Tolerant of the forms contracts actually use: inside a blockquote, and with
+# the colon inside or outside the bold markers. The first version required
+# `Tier**:` exactly and reported 0/121 against files that all declared a tier
+# correctly — a checker that only recognises its author's preferred syntax
+# reports the corpus as non-compliant and is worse than no checker, because the
+# failure looks like a finding.
+TIER_RE = re.compile(r"^[>\s]*(?:\*\*)?Tier:?(?:\*\*)?:?\s*(T[0-3])\b", re.M)
+
+# The strongest promises a contract can make. Deliberately wider than NORMATIVE:
+# "immutable" and "read-only" are absolute claims even though they use no modal
+# verb, and both appear on rules that were violated in the 2026-08-09 incident.
+HARD_CLAUSE = re.compile(
+    r"\b(MUST NOT|MUST|NEVER|Never|never|PROHIBITED|prohibited|SHALL"
+    r"|may not|must not|strictly|immutable|read-only|only to|exclusive)\b"
+)
+
+
+# --------------------------------------------------------------- Layer A: docs
+
+
+def layer_a_documents() -> None:
+    root_agents = ROOT / "AGENTS.md"
+    text = read(root_agents)
+    lines = text.splitlines()
+
+    add(Finding(
+        "1.1", "document", "AGENTS.md is concise (<200 lines)",
+        "PASS" if len(lines) < 200 else "FAIL",
+        f"{len(lines)} lines", [str(root_agents.relative_to(ROOT))],
+        caught_incident="no",
+    ))
+
+    routes = {
+        "HARNESS.md": "HARNESS.md" in text,
+        "workflows": ".context/workflows" in text,
+        "skills": ".agents/skills" in text,
+        "agents/": "agents/" in text,
+        "local AGENTS.md": "local `AGENTS.md`" in text or "local AGENTS.md" in text,
+        "epistemic stance": "EPISTEMIC_STANCE" in text,
+        "MindGraph": "MindGraph" in text,
+    }
+    missing = [k for k, v in routes.items() if not v]
+    add(Finding(
+        "1.2", "document", "AGENTS.md routes to every layer",
+        "PASS" if not missing else "FAIL",
+        "all seven routes present" if not missing else f"missing: {', '.join(missing)}",
+        caught_incident="no",
+    ))
+
+    # 1.3 — durable rules only. Dated lines and status words are the smell.
+    volatile = [
+        ln.strip() for ln in lines
+        if re.search(r"\b20\d\d-\d\d-\d\d\b", ln)
+        or re.search(r"\b(currently|as of|this week|next gate|in progress)\b", ln, re.I)
+    ]
+    add(Finding(
+        "1.3", "document", "AGENTS.md holds durable rules, not live status",
+        "PASS" if not volatile else "FAIL",
+        "no dated or status-bearing lines" if not volatile
+        else f"{len(volatile)} volatile line(s)",
+        volatile[:3], caught_incident="no",
+    ))
+
+    # 3.1 — the four claim types.
+    ep = read(ROOT / "EPISTEMIC_STANCE.md")
+    types = [t for t in ("Observation", "Source-claim", "Inference", "Hypothesis")
+             if t.lower() not in ep.lower()]
+    add(Finding(
+        "3.1", "document", "EPISTEMIC_STANCE covers all four claim types",
+        "PASS" if not types else "FAIL",
+        "observation / source-claim / inference / hypothesis all present"
+        if not types else f"missing: {', '.join(types)}",
+        caught_incident="no",
+    ))
+
+    # 3.2 — claim-bearing workflows point at the standard.
+    #
+    # The threshold is stated rather than tuned in silence. A first version
+    # matched any mention of "source" and reported 30 gaps, most of which were
+    # workflows that say "source" once while archiving a project. That is the
+    # deny-list mistake in a different costume: a detector that fires on
+    # everything is as uninformative as one that fires on nothing, and it looks
+    # more diligent. Density >= 4 is the line between "produces claims" and
+    # "mentions the word".
+    CLAIM_DENSITY = 4
+    wf = sorted((ROOT / ".context/workflows").glob("*.md"))
+    claim_bearing, pointing = [], []
+    for p in wf:
+        t = read(p)
+        density = len(re.findall(r"\b(claim|evidence|synthes)\w*", t, re.I))
+        if density >= CLAIM_DENSITY:
+            claim_bearing.append(p)
+            if "epistemic-standard" in t or "EPISTEMIC_STANCE" in t:
+                pointing.append(p)
+    gap = [p.name for p in claim_bearing if p not in pointing]
+    add(Finding(
+        "3.2", "document", "Claim-bearing workflows cite the epistemic standard",
+        "PASS" if not gap else "FAIL",
+        f"{len(pointing)}/{len(claim_bearing)} workflows with claim density "
+        f">= {CLAIM_DENSITY} cite the standard",
+        gap, caught_incident="no",
+    ))
+
+    # 4.x — workflow shape.
+    no_trigger, no_command, no_stop = [], [], []
+    for p in wf:
+        t = read(p)
+        if not re.search(r"^#{1,3}\s*(when to use|trigger|use this|scope)", t, re.I | re.M) \
+           and not re.search(r"^Use (this|the) workflow", t, re.M):
+            no_trigger.append(p.name)
+        if "```bash" not in t and "bin/" not in t:
+            no_command.append(p.name)
+        # Deliberately strict. A loose version matching a bare "fail" anywhere
+        # scored 19/37, because almost every document mentions failure in
+        # passing. What the reader needs is an answer to "this went wrong, now
+        # what", and that requires a named state or a conditional instruction,
+        # not the word. The strict count is 12/37, and it is the true one.
+        if not re.search(
+            r"(stop state|blocked state|## stop|if .{0,30}fails?"
+            r"|do not proceed|abort|halt|escalate)", t, re.I
+        ):
+            no_stop.append(p.name)
+
+    add(Finding(
+        "4.1", "document", "Every workflow names a trigger",
+        "PASS" if not no_trigger else "FAIL",
+        f"{len(wf) - len(no_trigger)}/{len(wf)} have one", no_trigger[:8],
+        caught_incident="no",
+    ))
+    add(Finding(
+        "4.3", "document", "Every workflow names explicit commands",
+        "PASS" if not no_command else "FAIL",
+        f"{len(wf) - len(no_command)}/{len(wf)} name a command", no_command[:8],
+        caught_incident="no",
+    ))
+    add(Finding(
+        "4.4", "document", "Every workflow names a stop/blocked state",
+        "PASS" if not no_stop else "FAIL",
+        f"{len(wf) - len(no_stop)}/{len(wf)} name one", no_stop[:8],
+        caught_incident="no",
+    ))
+
+    # 5.x — skills.
+    sk = ROOT / ".agents/skills"
+    dirs = [p for p in sk.iterdir() if p.is_dir()] if sk.exists() else []
+    flat = [p for p in sk.glob("*.md")] if sk.exists() else []
+    no_skillmd = [p.name for p in dirs if not (p / "SKILL.md").exists()]
+    add(Finding(
+        "5.1", "document", "Every skill directory has SKILL.md",
+        "PASS" if not no_skillmd else "FAIL",
+        f"{len(dirs) - len(no_skillmd)}/{len(dirs)} directories conform", no_skillmd,
+        caught_incident="no",
+    ))
+
+    bad_fm = []
+    for p in dirs:
+        s = p / "SKILL.md"
+        if not s.exists():
+            continue
+        head = read(s)[:1200]
+        if not re.search(r"^name:\s*\S", head, re.M) or not re.search(r"^description:\s*\S", head, re.M):
+            bad_fm.append(p.name)
+    add(Finding(
+        "5.2", "document", "Every SKILL.md declares name and description",
+        "PASS" if not bad_fm else "FAIL",
+        f"{len(dirs) - len(bad_fm)}/{len(dirs)} valid", bad_fm,
+        caught_incident="no",
+    ))
+
+    long_skills = [
+        f"{p.name} ({len(read(p / 'SKILL.md').splitlines())} lines)"
+        for p in dirs
+        if (p / "SKILL.md").exists()
+        and len(read(p / "SKILL.md").splitlines()) > 300
+        and not (p / "references").exists()
+    ]
+    add(Finding(
+        "5.4", "document", "Long skill content lives in references/",
+        "PASS" if not long_skills else "FAIL",
+        "no oversized SKILL.md without references/" if not long_skills
+        else f"{len(long_skills)} oversized", long_skills,
+        caught_incident="no",
+    ))
+
+    legacy = [p.name for p in flat if p.suffix == ".md"]
+    add(Finding(
+        "5.7", "document", "Legacy flat skills are migrated or documented",
+        "OPEN" if legacy else "PASS",
+        f"{len(legacy)} flat skill file(s) remain alongside {len(dirs)} directories; "
+        "no note in .agents/skills/ marks them as intentionally legacy",
+        legacy, caught_incident="no", review_by=review_date(),
+    ))
+
+    # 6.1 — subagent definitions.
+    incomplete = []
+    for p in sorted((ROOT / "agents").glob("*.md")):
+        t = read(p)
+        want = {
+            "tools": bool(re.search(r"^tools:", t, re.M)),
+            "guardrails": "uardrail" in t or "afety" in t,
+            "handoff": bool(re.search(r"(handoff|outputs?|report)", t, re.I)),
+        }
+        if not all(want.values()):
+            incomplete.append(f"{p.name}: missing {', '.join(k for k, v in want.items() if not v)}")
+    add(Finding(
+        "6.1", "document", "Subagents define tools, guardrails, and handoff",
+        "PASS" if not incomplete else "FAIL",
+        f"{len(list((ROOT / 'agents').glob('*.md'))) - len(incomplete)} complete",
+        incomplete, caught_incident="no",
+    ))
+
+    # 8.5 — hooks bounded.
+    settings = ROOT / ".claude/settings.json"
+    unbounded = []
+    try:
+        cfg = json.loads(read(settings) or "{}")
+        for ev, arr in (cfg.get("hooks") or {}).items():
+            for entry in arr:
+                for hk in entry.get("hooks", []):
+                    if "timeout" not in hk:
+                        unbounded.append(f"{ev}:{entry.get('matcher', '*')}")
+    except json.JSONDecodeError as exc:
+        unbounded.append(f"unparseable settings.json: {exc}")
+    add(Finding(
+        "8.5", "document", "Every hook is timeout-bounded",
+        "PASS" if not unbounded else "FAIL",
+        "all hooks declare a timeout" if not unbounded
+        else f"{len(unbounded)} hook(s) with no timeout — a hang blocks the session",
+        unbounded[:10], caught_incident="no",
+    ))
+
+    # 8.3 — secrets excluded.
+    gi = read(ROOT / ".gitignore")
+    patterns = [".env", "*.key", "credentials", "secret"]
+    absent = [p for p in patterns if p not in gi]
+    add(Finding(
+        "8.3", "document", "Secrets are excluded from version control",
+        "PASS" if len(absent) <= 1 else "FAIL",
+        f".gitignore covers {len(patterns) - len(absent)}/{len(patterns)} secret patterns",
+        absent, caught_incident="no",
+    ))
+
+
+# ------------------------------------------------------- Layer A': clause tiers
+
+
+def layer_a_clauses() -> None:
+    """Item 1.5 / 10.5 — the two the incident turned on.
+
+    Counted honestly. A normative clause with no mechanism is not automatically
+    a defect: "do not bury dissent to preserve narrative coherence" cannot have a
+    script and should not pretend to. The defect is that **nothing distinguishes
+    an advisory rule from a load-bearing one**, so a rule that silently lost its
+    enforcement looks exactly like a rule that never needed any.
+    """
+    files = contract_files()
+    total = bound = 0
+    tiered = 0
+    worst: list[tuple[int, str]] = []
+
+    for p in files:
+        text = read(p)
+        if TIER_RE.search(text):
+            tiered += 1
+        n = b = 0
+        for ln in text.splitlines():
+            if NORMATIVE.search(ln):
+                n += 1
+                if MECHANISM.search(ln):
+                    b += 1
+        total += n
+        bound += b
+        if n - b:
+            worst.append((n - b, str(p.relative_to(ROOT))))
+
+    pct = 100 * bound / max(total, 1)
+    add(Finding(
+        "1.5", "document", "Normative clauses name an enforcing mechanism",
+        "FAIL",
+        f"{total} normative clauses across {len(files)} contract files; "
+        f"{bound} ({pct:.0f}%) name a runnable mechanism, {total - bound} are prose only. "
+        "Not all of these need one — but nothing in the corpus says which do.",
+        [f"{n} unbound  {path}" for n, path in sorted(worst, reverse=True)[:8]],
+        caught_incident="no",
+    ))
+
+    # 1.6 — hard mandatory language with nothing behind it.
+    #
+    # This is the closest machine-checkable proxy for the thing that actually
+    # went wrong. Once tiers exist, the audit can only verify that a tier was
+    # *declared*, not that it was declared *honestly* — a load-bearing rule
+    # marked T0 goes green, which is the same worthless self-assertion as a
+    # `retrieved_at` field the capture wrote about itself.
+    #
+    # Language, though, is not self-serving in the same way. A file that says
+    # NEVER and MUST NOT is making a strong promise to whoever reads it. If it
+    # makes several such promises and names no mechanism at all, the promise is
+    # louder than the enforcement, and a reader is entitled to be misled.
+    # Granularity is the whole check. A first version asked whether the FILE
+    # named any mechanism, and passed clean. Tested against the rule that
+    # actually broke — `01_ingest/AGENTS.md` rule 5, "writes only to files inside
+    # 01_ingest/", the rule the 21 direct writes walked straight through — it
+    # did not fire, because that file mentions `bin/prep-ingest` several lines
+    # away on an unrelated clause. One tool named anywhere laundered every
+    # unenforced promise in the file.
+    #
+    # So the unit is the clause, not the file. A promise is bound only if the
+    # sentence making it says what enforces it.
+    hard_unbound: list[str] = []
+    hard_total = 0
+    for p in contract_files():
+        for ln in read(p).splitlines():
+            s = ln.strip()
+            if not HARD_CLAUSE.search(s):
+                continue
+            # numbered/bulleted rules are the normative unit; prose is context
+            if not re.match(r"^(\d+\.|[-*]|\|)", s):
+                continue
+            hard_total += 1
+            if not MECHANISM.search(s):
+                hard_unbound.append(f"{p.relative_to(ROOT)}  ::  {s[:88]}")
+    pct = 100 * (hard_total - len(hard_unbound)) / max(hard_total, 1)
+    add(Finding(
+        "1.6", "document", "Each hard promise names its own enforcement",
+        "FAIL" if hard_unbound else "PASS",
+        f"{hard_total} clauses use MUST / NEVER / PROHIBITED / immutable / read-only "
+        f"language; {len(hard_unbound)} of them name no mechanism in the clause itself "
+        f"({pct:.0f}% bound). These are the strongest promises the corpus makes and the "
+        "least is behind them.",
+        hard_unbound[:10], caught_incident="yes",
+    ))
+
+    # 1.7 — every enforced rule names an honest-failure path.
+    #
+    # The lesson the incident actually taught, and the one most likely to be
+    # dropped from a contract retrofit because it looks like documentation of an
+    # exception. It is not. A rule that demands an outcome an agent cannot
+    # legitimately produce does not get obeyed and does not get refused: it gets
+    # *simulated*. The source quota did not encourage fabrication, it made
+    # honesty unrepresentable, because no field meant "I looked and found
+    # nothing". 107 captures followed.
+    #
+    # So a rule at T1 or above with a Check and no Escape is not half-finished.
+    # It is the dangerous configuration: enforced, unfollowable, and therefore
+    # productive of compliant-looking output.
+    #
+    # See 10_knowledge/agents/2026-08-10__agents__note__every-rule-needs-an-honest-failure-path.md
+    RULE_BLOCK = re.compile(
+        r"(?:^[>\s]*\*\*Binds:\*\*.*?)(?=^\s*$|^##)", re.M | re.S
+    )
+    tiered_rules = 0
+    missing_escape: list[str] = []
+    for p in contract_files():
+        text = read(p)
+        if not TIER_RE.search(text):
+            continue
+        for block in RULE_BLOCK.findall(text):
+            m = TIER_RE.search(block)
+            if not m or m.group(1) == "T0":
+                continue  # T0 is advisory; no escape required, none promised
+            tiered_rules += 1
+            if not re.search(r"^[>\s]*\*\*Escape:\*\*\s*\S", block, re.M):
+                first = block.strip().splitlines()[0][:70]
+                missing_escape.append(f"{p.relative_to(ROOT)}  ::  {first}")
+    add(Finding(
+        "1.7", "document", "Every enforced rule names an honest-failure path",
+        "FAIL" if missing_escape else "PASS",
+        f"{tiered_rules} rule(s) at T1 or above; {len(missing_escape)} name no Escape. "
+        "A rule that is enforced but cannot be honestly failed produces "
+        "compliant-looking output, which is how a source quota produced 107 "
+        "invented papers."
+        if tiered_rules else
+        "no rules declare a tier yet, so this cannot be checked. That is the "
+        "finding, not a pass.",
+        missing_escape[:8], caught_incident="yes",
+    ))
+
+    n_files, n_clauses, detail = coverage_gap()
+    unexplained = [d for d in detail if "genuine blind spot" in d]
+    add(Finding(
+        "0.0", "document", "This audit states its own coverage",
+        "PASS" if not unexplained else "FAIL",
+        f"{n_clauses} normative clauses in {n_files} file(s) sit outside the contract "
+        f"scan. {len(unexplained)} of those file(s) have no argued exclusion — "
+        "an unexplained gap is indistinguishable from an oversight."
+        if unexplained else
+        f"{n_clauses} clauses in {n_files} file(s) are outside scope, every one of them "
+        "under a named and argued exclusion.",
+        (unexplained or detail)[:8], caught_incident="n/a",
+    ))
+
+    add(Finding(
+        "10.5", "document", "Contracts declare an enforcement tier",
+        "FAIL",
+        f"{tiered}/{len(files)} contract files declare a tier (T0 advisory / T1 detected / "
+        "T2 blocked / T3 reconciled). Without a declared tier, an unenforced mandatory "
+        "rule is indistinguishable from an advisory one — which is exactly how "
+        "'raw captures route through ingest' stayed true on paper while 449 bypassed it.",
+        caught_incident="no",
+    ))
+
+
+# -------------------------------------------------------------- Layer B: state
+
+
+def layer_b_state() -> None:
+    """Run the enforcing tools. This is the layer with evidentiary value."""
+
+    # 3.4 / ingest boundary — does every raw capture have an ingest record?
+    code, out = run([str(ROOT / "bin/knowledge-reconcile")])
+    m = re.search(r"VIOLATIONS: (\d+)", out)
+    n = int(m.group(1)) if m else -1
+    add(Finding(
+        "3.4", "state", "Every raw capture in 10_knowledge has an ingest record",
+        "PASS" if n == 0 else ("FAIL" if n > 0 else "BROKEN"),
+        f"{n} `type: raw` capture(s) with no ingest record"
+        if n >= 0 else f"bin/knowledge-reconcile did not report a count (exit {code})",
+        [ln for ln in out.splitlines() if "by month" in ln or "by domain" in ln],
+        caught_incident="yes",
+    ))
+
+    # 3.5 — is `stable` actually gated, AND does the existing population comply?
+    #
+    # Two questions, and the second is the one that bites. A gate that only
+    # guards new writes leaves whatever was already inside untouched — the same
+    # split the write guard has, where layer 2 stops new raws and layer 3
+    # reconciles the 449 that were already there. Reporting only "a gate exists"
+    # would be a document-layer answer wearing a state-layer badge.
+    validator = read(ROOT / "bin/capture-validate")
+    gated = "VERIFIED_STATUSES" in validator and "R6" in validator
+
+    violations = 0
+    files = 0
+    for p in (ROOT / "10_knowledge").rglob("*.md"):
+        head = read(p)[:1200]
+        m = re.search(r'^status:\s*"?([a-z-]+)', head, re.M)
+        if not m or m.group(1) not in ("stable", "audited"):
+            continue
+        files += 1
+        tagline = re.search(r"^tags:.*$", head, re.M)
+        contradicts = bool(tagline and "needs-audit" in tagline.group(0))
+        unevidenced = not re.search(r"^(audit_receipt|verified_by):\s*\S", head, re.M)
+        if contradicts or unevidenced:
+            violations += 1
+
+    add(Finding(
+        "3.5", "state", "`status: stable` is gated, and the existing population complies",
+        "PASS" if (gated and violations == 0) else "FAIL",
+        (f"gate: {'R6 in bin/capture-validate' if gated else 'NONE'}. "
+         f"{violations}/{files} file(s) claiming stable or audited fail it — no "
+         "verification evidence, or a needs-audit tag contradicting the status. "
+         "New writes are blocked; the standing population is the backlog."),
+        caught_incident="no",
+    ))
+
+    # 1.5-state — do the provenance controls actually still run?
+    for tool, args, label, item in (
+        ("bin/capture-validate", ["--help"], "provenance validator", "1.5a"),
+        ("bin/citation-resolvability-sweep", ["--help"], "citation sweep", "1.5b"),
+        ("bin/knowledge-write-guard", [], "write guard (hook)", "1.5c"),
+    ):
+        path = ROOT / tool
+        if not path.exists():
+            add(Finding(item, "state", f"{label} is present and runnable", "FAIL",
+                        f"{tool} does not exist", caught_incident="yes"))
+            continue
+        if not os.access(path, os.X_OK):
+            add(Finding(item, "state", f"{label} is present and runnable", "FAIL",
+                        f"{tool} is not executable", caught_incident="yes"))
+            continue
+        add(Finding(item, "state", f"{label} is present and runnable", "PASS",
+                    tool, caught_incident="yes"))
+
+    # 8.5-state — is the write guard actually wired into settings, not just present?
+    cfg = read(ROOT / ".claude/settings.json")
+    wired = "knowledge-write-guard" in cfg
+    add(Finding(
+        "1.5d", "state", "The write guard is wired into settings, not merely present",
+        "PASS" if wired else "FAIL",
+        "PreToolUse hook on Write|Edit" if wired else
+        "bin/knowledge-write-guard exists but no hook invokes it — a control that is "
+        "installed but not wired is prose with a shebang",
+        caught_incident="yes",
+    ))
+
+    # 7.2 / 7.3 — project state truth.
+    code, out = run([str(ROOT / "bin/sync-project-index"), "--check"], timeout=180)
+    add(Finding(
+        "7.2", "state", "Project states match observed activity",
+        "PASS" if code == 0 else "FAIL",
+        "bin/sync-project-index --check green" if code == 0
+        else f"exit {code}: " + " / ".join(
+            ln.strip() for ln in out.splitlines() if ln.strip())[:400],
+        caught_incident="no",
+    ))
+
+    # 9.1 — telemetry stays out of the knowledge index.
+    gi = read(ROOT / ".gitignore")
+    ignored = "20_live/workflow-metrics" in gi or "20_live/" in gi
+    add(Finding(
+        "9.1", "state", "Volatile telemetry is excluded from version control",
+        "PASS" if ignored else "FAIL",
+        "20_live telemetry is gitignored" if ignored else "20_live is tracked",
+        caught_incident="no",
+    ))
+
+    # 10.1 — "repeated agent mistake -> fix the closest contract or tool."
+    #
+    # This item sat in the judgement pile because nothing recorded agent
+    # mistakes, which made it unfalsifiable in both directions: no evidence of
+    # repeated mistakes, and no evidence of none. `bin/papercut` supplies the
+    # observational axis the audit otherwise lacks entirely (limit L6), so the
+    # item becomes a state check — with the crucial caveat that an empty log is
+    # NOT a pass. Silence here means nobody is recording, not that nothing broke.
+    store = ROOT / "20_live/papercuts"
+    entries = 0
+    if store.exists():
+        for p in store.glob("*.jsonl"):
+            entries += sum(1 for ln in read(p).splitlines() if ln.strip())
+    receipt = store / "last-harvest.json"
+    if entries == 0:
+        add(Finding(
+            "10.1", "state", "Repeated friction is recorded and harvested into fixes",
+            "FAIL",
+            "no papercuts recorded. This is an absence of evidence, not evidence of "
+            "absence — friction that nobody logs looks exactly like friction that did "
+            "not happen, which is the condition that let a flag-named HTML file sit in "
+            "the repo root for six days.",
+            caught_incident="no",
+        ))
+    else:
+        try:
+            r = json.loads(read(receipt) or "{}")
+        except json.JSONDecodeError:
+            r = {}
+        cands = r.get("graduation_candidates", 0)
+        harvested = r.get("entries_seen", 0)
+        stale_by = entries - harvested
+        add(Finding(
+            "10.1", "state", "Repeated friction is recorded and harvested into fixes",
+            "PASS" if (receipt.exists() and stale_by <= 0 and cands == 0) else "FAIL",
+            f"{entries} papercut(s) recorded; last harvest saw {harvested}; "
+            f"{cands} graduation candidate(s) awaiting a fix"
+            + ("" if stale_by <= 0 else f"; {stale_by} unharvested since"),
+            caught_incident="no",
+        ))
+
+    # 8.7 — automations declare what they do when they cannot run.
+    #
+    # The third exit from the honest-failure-path lesson, applied to `bin/`
+    # rather than to prose. A tool that catches every exception and exits 0 has
+    # made a fail-open choice; a tool that exits 1 for both "found problems" and
+    # "crashed" has made its result unreadable. Neither is wrong in itself. Both
+    # are wrong undeclared, because the caller cannot tell which they got.
+    #
+    # `bin/capture-validate` shipped with exactly this defect and it took a
+    # positive control to notice.
+    tools, undeclared, single_code = [], [], []
+    bindir = ROOT / "bin"
+    for p in sorted(bindir.iterdir()):
+        if not p.is_file() or not os.access(p, os.X_OK) or p.suffix == ".pyc":
+            continue
+        text = read(p)
+        if not text.startswith("#!/usr/bin/env python"):
+            continue
+        tools.append(p.name)
+        # Catch `return 0 if ok else 2` as well as plain literals. The first
+        # version missed the conditional form and reported a tool that does
+        # signal failure as one that never can.
+        codes = set(re.findall(r"(?:sys\.)?exit\(\s*(\d)\s*\)", text))
+        codes |= set(re.findall(r"return\s+(\d)\b", text))
+        codes |= set(re.findall(r"else\s+(\d)\b", text))
+        swallows = bool(re.search(r"except\s+(Exception|BaseException)?\s*:", text))
+        declared = bool(re.search(
+            r"fail[- ]open|fail[- ]closed|fails open|fails closed"
+            r"|did not run|exit contract|Exit codes", text, re.I))
+        if swallows and not declared:
+            undeclared.append(p.name)
+        elif len(codes - {"0"}) < 1 and swallows:
+            single_code.append(p.name)
+
+    add(Finding(
+        "8.7", "state", "Automations declare what they do when they cannot run",
+        "PASS" if not undeclared else "FAIL",
+        f"{len(tools)} python tools in bin/; {len(undeclared)} catch every exception "
+        "without stating fail-open or fail-closed anywhere in the file. A caller "
+        "cannot tell 'ran and found nothing' from 'did not run', and the quieter "
+        "reading always looks like the better news.",
+        undeclared[:12], caught_incident="yes",
+    ))
+
+    # 2.6 — does HARNESS.md embed numbers that should live in project outputs?
+    harness = read(ROOT / "HARNESS.md")
+    stale = [
+        ln.strip() for ln in harness.splitlines()
+        if re.search(r"\b\d+/\d+\b", ln) and re.search(r"\b20\d\d-\d\d-\d\d\b", ln)
+    ]
+    add(Finding(
+        "2.6", "document", "HARNESS.md cites project outputs rather than embedding scores",
+        "PASS" if len(stale) <= 2 else "FAIL",
+        f"{len(stale)} line(s) embed a dated score directly in the contract",
+        stale[:4], caught_incident="no",
+    ))
+
+
+# ------------------------------------------------------------- Layer C: replay
+
+
+@dataclass
+class Incident:
+    key: str
+    name: str
+    when: str
+    # The state signature the incident left behind, and the check that must see it.
+    probe: str
+    expect: str
+
+
+# Known failures. Each must still be detectable. This is the positive control:
+# an audit that cannot detect the failures we already suffered is not evidence
+# that there are none.
+INCIDENTS = [
+    Incident(
+        "fabricated-citation", "107 captures citing papers that do not exist",
+        "2026-08-09",
+        "capture-validate sees a fabricated identifier in a synthetic capture",
+        "R2",
+    ),
+    Incident(
+        "ingest-bypass", "449 raw captures written past the ingest boundary",
+        "2026-08-10",
+        "knowledge-reconcile reports unlogged raw captures when they exist",
+        "VIOLATIONS",
+    ),
+    Incident(
+        "direct-write", "21 raw captures hand-written into 10_knowledge",
+        "2026-08-09",
+        "knowledge-write-guard denies a new type: raw under 10_knowledge/",
+        "deny",
+    ),
+    Incident(
+        "source-quota", "a source-count quota that made fabrication the compliant output",
+        "2026-08-09",
+        "research-lane-loop contains no live numeric source quota",
+        "absent",
+    ),
+]
+
+
+def layer_c_replay() -> bool:
+    """Replay known failures against the current checks. Returns True if all alive."""
+    all_alive = True
+
+    # 1. capture-validate must still flag a fabricated identifier.
+    #
+    # The control lives inside the repo on purpose. The first version wrote to
+    # $TMPDIR and the control came back BROKEN — not because the detector had
+    # failed, but because capture-validate crashed on `relative_to` for any path
+    # outside ROOT and exited 1, which was also its "found errors" code. So a
+    # crash and a finding were the same signal. That bug was invisible until
+    # something tried to use the validator as a control, which is the argument
+    # for having controls at all.
+    scratch = ROOT / ".contract-audit-control.md"
+    scratch.write_text(
+        "---\ntitle: \"Control — this citation is invented\"\n"
+        "type: \"raw\"\ndomain: \"knowledge-systems\"\n"
+        "authors: \"Synthetic Control Task Force\"\nyear: 2025\n"
+        "url: \"https://doi.org/10.1145/this-identifier-is-a-control-2025\"\n---\n\n"
+        "# Control\n\nPositive control for bin/contract-audit --selftest.\n",
+        encoding="utf-8",
+    )
+    code, out = run([str(ROOT / "bin/capture-validate"), str(scratch)])
+    # exit 1 = ran and found errors. exit 2 = did not run. Only 1 proves it works.
+    alive = code == 1 and ("R2" in out or "fabricat" in out.lower())
+    all_alive &= alive
+    add(Finding(
+        "C1", "replay", "Control: fabricated identifier is still detected",
+        "PASS" if alive else "BROKEN",
+        "capture-validate flagged a known-bad synthetic DOI (exit 1)" if alive else
+        f"capture-validate did NOT flag a synthetic fabricated DOI (exit {code}). The "
+        "detector that found the 107 is dead or changed shape — treat every clean sweep "
+        "since as void.",
+        [ln.strip() for ln in out.splitlines() if "R2" in ln][:2],
+        caught_incident="yes",
+    ))
+    scratch.unlink(missing_ok=True)
+
+    # 1b. NEGATIVE control. A detector that flags everything is as useless as one
+    # that flags nothing, and it looks far more diligent. This is the check the
+    # 2026-08-09 sweep would have failed without in-batch negative controls.
+    clean = ROOT / ".contract-audit-control-clean.md"
+    clean.write_text(
+        "---\ntitle: \"Attention Is All You Need\"\n"
+        "type: \"raw\"\ndomain: \"knowledge-systems\"\n"
+        "authors: \"Vaswani, A.; Shazeer, N.; Parmar, N.\"\nyear: 2017\n"
+        "url: \"https://arxiv.org/abs/1706.03762\"\n"
+        "fetch_method: \"control — not a real retrieval\"\n"
+        "retrieval_receipt: \"control\"\n---\n\n# Negative control\n",
+        encoding="utf-8",
+    )
+    code_n, out_n = run([str(ROOT / "bin/capture-validate"), str(clean)])
+    quiet = "R2" not in out_n
+    all_alive &= quiet
+    add(Finding(
+        "C1b", "replay", "Negative control: a real identifier is NOT flagged",
+        "PASS" if quiet else "BROKEN",
+        "capture-validate left a genuine arXiv ID alone" if quiet else
+        "capture-validate flagged a REAL identifier (arXiv 1706.03762) as fabricated. "
+        "A detector with a false-positive rate this visible would quarantine real "
+        "literature — the exact mistake the 2026-08-09 triage had to undo by hand.",
+        [ln.strip() for ln in out_n.splitlines() if "R2" in ln][:2],
+        caught_incident="n/a",
+    ))
+    clean.unlink(missing_ok=True)
+
+    # 2. reconcile must be able to say a number at all.
+    code, out = run([str(ROOT / "bin/knowledge-reconcile")])
+    alive = bool(re.search(r"VIOLATIONS: \d+", out))
+    all_alive &= alive
+    add(Finding(
+        "C2", "replay", "Control: reconciliation still reports a count",
+        "PASS" if alive else "BROKEN",
+        "knowledge-reconcile produced a violation count" if alive else
+        "knowledge-reconcile produced no count. A reconciler that cannot report is "
+        "indistinguishable from a clean repo — the captive-portal failure mode.",
+        caught_incident="yes",
+    ))
+
+    # 3. the write guard must still deny.
+    payload = json.dumps({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": str(ROOT / "10_knowledge/knowledge-systems/__control__.md"),
+            "content": "---\ntype: \"raw\"\ntitle: \"control\"\n---\n\nbody\n",
+        },
+    })
+    try:
+        env = {k: v for k, v in os.environ.items() if k != "MAINFRAME_KNOWLEDGE_WRITE"}
+        p = subprocess.run(
+            [str(ROOT / "bin/knowledge-write-guard")], input=payload,
+            capture_output=True, text=True, timeout=10, cwd=ROOT, env=env,
+        )
+        alive = '"deny"' in p.stdout
+        detail_out = p.stdout[:200]
+    except (OSError, subprocess.SubprocessError) as exc:
+        alive, detail_out = False, str(exc)
+    all_alive &= alive
+    add(Finding(
+        "C3", "replay", "Control: write guard still denies a direct raw write",
+        "PASS" if alive else "BROKEN",
+        "guard returned permissionDecision: deny" if alive else
+        "guard did NOT deny a new type: raw under 10_knowledge/. It fails open by design, "
+        "so a silent breakage looks exactly like a working guard. That is why this control "
+        "exists. " + detail_out,
+        caught_incident="yes",
+    ))
+
+    # 4. the quota must stay dead.
+    loop = read(ROOT / "bin/research-lane-loop")
+    live_quota = [
+        ln.strip() for ln in loop.splitlines()
+        if re.search(r"(need|fill to|at least|minimum).{0,20}\b\d+\b.{0,20}(raw|source)", ln, re.I)
+        and not ln.strip().startswith("#")
+    ]
+    alive = not live_quota
+    all_alive &= alive
+    add(Finding(
+        "C4", "replay", "Control: no live source quota has returned",
+        "PASS" if alive else "BROKEN",
+        "no numeric source quota outside comments" if alive else
+        f"{len(live_quota)} line(s) reintroduce a source count — the root cause of the "
+        "2026-08-09 incident",
+        live_quota[:3], caught_incident="yes",
+    ))
+
+    # 5. The clause-level enforcement check must still flag the specific rule
+    #    that failed. `01_ingest/AGENTS.md` rule 5 — "writes only to files inside
+    #    01_ingest/" — is the rule the 21 direct writes of 2026-08-09 walked
+    #    through. A file-level version of check 1.6 passed this file clean,
+    #    because it mentions `bin/prep-ingest` a few lines away on an unrelated
+    #    clause. That near-miss is why the control is pinned to a named clause
+    #    and not to a percentage: a summary statistic can improve while the one
+    #    rule you care about quietly stops being covered.
+    ingest_rules = read(ROOT / "01_ingest/AGENTS.md")
+    target = [
+        ln.strip() for ln in ingest_rules.splitlines()
+        if "Read-only access" in ln or "immutable" in ln
+    ]
+    flagged = [s for s in target if HARD_CLAUSE.search(s) and not MECHANISM.search(s)]
+    alive = bool(flagged)
+    all_alive &= alive
+    add(Finding(
+        "C5", "replay", "Control: the clause that failed on 2026-08-09 is still flagged",
+        "PASS" if alive else "BROKEN",
+        f"{len(flagged)} of {len(target)} target clause(s) still detected as unenforced"
+        if alive else
+        "the enforcement check no longer flags 01_ingest/AGENTS.md rules 3 and 5. Either "
+        "they gained real enforcement (verify it, then update this control) or check 1.6 "
+        "has been loosened and its pass rate no longer means anything.",
+        flagged[:2], caught_incident="yes",
+    ))
+
+    return all_alive
+
+
+# ---------------------------------------------------------- Layer D: judgement
+
+
+# Items that cannot be machine-checked and must not be silently dropped.
+# Dropping them is how a checklist decays into a linter.
+JUDGEMENT = [
+    ("1.1b", "AGENTS.md is current — the rules still describe how work is actually done"),
+    ("1.4", "Local AGENTS files add scoped constraints rather than duplicate root rules"),
+    ("2.1", "HARNESS.md separates patterns, program status, and operating policy"),
+    ("2.2", "Task categories are explicit and still match how work is routed"),
+    ("2.3", "Local/cloud delegation boundaries are current"),
+    ("2.4", "Verification is external to the executing agent in practice, not just on paper"),
+    ("2.5", "MindGraph is described and used as nomination only, never verification"),
+    ("3.3", "High-stakes claims have evidence minimums that are actually applied"),
+    ("4.2", "Workflow steps are numbered, imperative, and testable"),
+    ("4.5", "Workflows do not duplicate skill bodies or project status"),
+    ("5.3", "Skill descriptions front-load task keywords and negative boundaries"),
+    ("5.5", "Skill scripts are used only for deterministic helper work"),
+    ("5.6", "Each skill has at least one happy path and one edge case"),
+    ("6.2", "Repeatable procedures are delegated to skills, not restated in agents/"),
+    ("6.3", "Subagents return distilled summaries, not raw noise"),
+    ("6.4", "Write-heavy parallel subagents have conflict controls"),
+    ("7.4", "Plans include dual MindGraph query passes"),
+    ("7.5", "Workbench truth is inspected before readiness claims"),
+    ("7.6", "Durable lessons are extracted to 10_knowledge/"),
+    ("8.1", "Active Codex config is known and reviewed"),
+    ("8.2", "Sandbox/approval settings match trust level"),
+    ("8.4", "MCP servers are scoped, documented, and consent-aware"),
+    ("8.6", "Tool allowlists/denylists exist for powerful external actions"),
+    ("9.2", "Receipts capture verifier result, scope diff, and completion truth"),
+    ("9.3", "Dashboards do not claim correctness from activity"),
+    ("9.4", "Eval outputs are dated and separate from durable pattern notes"),
+    # 10.1 moved to the state layer on 2026-08-10 — bin/papercut records the
+    # friction that makes it checkable. It is the only item to have graduated
+    # out of this list, and the route it took is the route the others need:
+    # not a better checklist, an instrument that produces evidence.
+    ("10.2", "Architecture tradeoff -> DECISIONS.md"),
+    ("10.3", "Durable lesson -> 10_knowledge/"),
+    ("10.4", "Active status -> project README/log or 20_live"),
+]
+
+
+def layer_d_judgement() -> None:
+    rb = review_date()
+    for item, title in JUDGEMENT:
+        add(Finding(item, "judgement", title, "OPEN",
+                    "not machine-checkable — requires a human read",
+                    caught_incident="no", review_by=rb))
+
+
+# ------------------------------------------------------------------- reporting
+
+
+SYMBOL = {"PASS": "PASS", "FAIL": "FAIL", "OPEN": "OPEN", "BROKEN": "BROKEN", "SKIP": "skip"}
+
+
+def report(controls_alive: bool) -> None:
+    by_layer: dict[str, list[Finding]] = {}
+    for f in RESULTS:
+        by_layer.setdefault(f.layer, []).append(f)
+
+    order = ["replay", "state", "document", "judgement"]
+    names = {
+        "replay": "LAYER C — CONTROLS  (do the checks still fire on known failures?)",
+        "state": "LAYER B — STATE  (what is actually true in the repo)",
+        "document": "LAYER A — DOCUMENT  (what the contracts say; weakest evidence)",
+        "judgement": "LAYER D — JUDGEMENT  (carried open, not machine-checkable)",
+    }
+
+    for layer in order:
+        items = by_layer.get(layer, [])
+        if not items:
+            continue
+        print(f"\n{names[layer]}")
+        print("-" * 78)
+        if layer == "judgement":
+            print(f"  {len(items)} items OPEN, review by {items[0].review_by}")
+            for f in items:
+                print(f"    {f.item:<6} {f.title}")
+            continue
+        for f in sorted(items, key=lambda x: (x.status != "BROKEN", x.status != "FAIL", x.item)):
+            print(f"  {SYMBOL[f.status]:<6} {f.item:<6} {f.title}")
+            if f.detail:
+                for line in _wrap(f.detail, 68):
+                    print(f"                 {line}")
+            for ev in f.evidence[:6]:
+                print(f"                   - {ev[:100]}")
+
+    counts = {s: sum(1 for f in RESULTS if f.status == s) for s in ("PASS", "FAIL", "OPEN", "BROKEN")}
+    print("\n" + "=" * 78)
+    print(f"  PASS {counts['PASS']}   FAIL {counts['FAIL']}   "
+          f"OPEN {counts['OPEN']}   BROKEN {counts['BROKEN']}")
+
+    if not controls_alive:
+        print("\n  *** CONTROLS FAILED — THIS AUDIT IS NOT EVIDENCE ***")
+        print("  A check that no longer fires on a failure it caught before cannot")
+        print("  support a claim that the failure is absent. Fix the control first.")
+    else:
+        n = sum(1 for f in RESULTS if f.layer == "replay")
+        print(f"\n  Controls alive: all {n} still fire, including the negative control.")
+        print("  This bounds rot in the checks. It says nothing about failures we")
+        print("  have not had yet — Layer C is backward-looking by construction.")
+
+    doc_pass = sum(1 for f in RESULTS if f.layer == "document" and f.status == "PASS")
+    print(f"\n  Note: {doc_pass} document-layer PASSes mean the contracts say the right")
+    print("  thing. On 2026-08-08 they also said the right thing. Weight Layer B.")
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def write_register(path: Path) -> None:
+    lines = [
+        "---",
+        'title: "MainFrame contract register"',
+        'domain: "agents"',
+        'type: "index"',
+        f'created: "{date.today().isoformat()}"',
+        f'as_of: "{date.today().isoformat()}"',
+        'source: "Generated by bin/contract-audit — do not hand-edit"',
+        "---",
+        "",
+        "# MainFrame contract register",
+        "",
+        "Generated by `bin/contract-audit`. Every row is one item from the",
+        "2026-06-22 architecture audit checklist, with the layer that checks it and",
+        "what that check found.",
+        "",
+        "**Read the layer column before the status column.** A document-layer PASS",
+        "means a file says the right thing; it is not evidence the rule holds. Every",
+        "document-layer item passed on 2026-08-08, the day before 107 fabricated",
+        "citations were found in the corpus those documents govern.",
+        "",
+        "| Item | Layer | Rule | Status | Would it have caught 2026-08-09? | Review by |",
+        "|------|-------|------|--------|----------------------------------|-----------|",
+    ]
+    for f in sorted(RESULTS, key=lambda x: [int(n) if n.isdigit() else 99
+                                            for n in re.findall(r"\d+", x.item)] or [99]):
+        caught = {"yes": "yes", "no": "**no**", "n/a": "—"}[f.caught_incident]
+        lines.append(
+            f"| {f.item} | {f.layer} | {f.title} | {f.status} | {caught} | {f.review_by or '—'} |"
+        )
+    lines += [
+        "",
+        "## Judgement items",
+        "",
+        f"{sum(1 for f in RESULTS if f.layer == 'judgement')} items cannot be machine-checked.",
+        "They are carried OPEN rather than dropped, because dropping them is how a",
+        "checklist quietly becomes a linter and stops asking the questions that need a",
+        f"person. Review interval: {REVIEW_INTERVAL_DAYS} days.",
+        "",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--selftest", action="store_true", help="Layer C controls only")
+    ap.add_argument("--layer", choices=["document", "state", "judgement", "replay"])
+    ap.add_argument("--register", type=str, default="")
+    ap.add_argument("--json", type=str, default="")
+    ap.add_argument("--fail-on-broken", action="store_true")
+    args = ap.parse_args()
+
+    if not CHECKLIST.exists():
+        print(f"WARNING: source checklist not found at {CHECKLIST.relative_to(ROOT)}",
+              file=sys.stderr)
+
+    controls_alive = True
+    if args.selftest:
+        controls_alive = layer_c_replay()
+    else:
+        controls_alive = layer_c_replay()
+        if args.layer in (None, "state"):
+            layer_b_state()
+        if args.layer in (None, "document"):
+            layer_a_documents()
+            layer_a_clauses()
+        if args.layer in (None, "judgement"):
+            layer_d_judgement()
+
+    report(controls_alive)
+
+    if args.register:
+        write_register(Path(args.register))
+        print(f"\nwrote register: {args.register}")
+
+    if args.json:
+        Path(args.json).write_text(json.dumps({
+            "as_of": date.today().isoformat(),
+            "controls_alive": controls_alive,
+            "findings": [vars(f) for f in RESULTS],
+        }, indent=2), encoding="utf-8")
+        print(f"wrote json: {args.json}")
+
+    if args.fail_on_broken and not controls_alive:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

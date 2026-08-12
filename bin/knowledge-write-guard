@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""PreToolUse hook — a new raw capture may not be hand-written into 10_knowledge/.
+
+## Why this exists
+
+`01_ingest` was documented as the mandatory path into durable knowledge. Measured
+on 2026-08-10, it was not being treated as mandatory:
+
+    10_knowledge/ holds 2,879 files.
+    1,132 (39%) have no ingest-log record at all.
+    449 of those are `type: raw` — captures that MUST route through 01_ingest.
+    395 of the 449 were written in the preceding ten days.
+
+The 2026-08-07 fabricated-citation batch is inside that population (see
+`20_live/security/2026-08-09__fabricated-source-captures-in-10-knowledge.md`).
+Its 21 files were written straight into `10_knowledge/`, which is exactly why the
+"never auto-route without confirmation" guarantee never engaged: nothing was
+routed. And the provenance gate added to `01_ingest/minion.py` cannot help, because
+a direct write never reaches the minion.
+
+A convention that 39% of writes ignore is not a control. This makes it one.
+
+## What it blocks, and what it deliberately does not
+
+BLOCKS  creating a **new** `type: raw` file under `10_knowledge/`.
+        That is the capture-bypass path and the only thing measured as a problem.
+
+ALLOWS  edits to existing files. Remediation, quarantine banners, status changes
+        and re-sourcing all need this — the 2026-08-09 cleanup touched 144 files
+        and a blanket ban would have blocked all of it.
+
+ALLOWS  notes, syntheses, indexes and run-notes. Those are authored in place by
+        design; the research loop's own step 5 tells you to write one. 86% of
+        notes have no ingest record and that is correct, not a violation.
+
+ALLOWS  anything when MAINFRAME_KNOWLEDGE_WRITE=1, which is how the minion and a
+        deliberate operator get through.
+
+## Fail-open, on purpose
+
+If this guard throws, cannot parse its input, or is unsure, it **allows the write**
+and says nothing. A guard that breaks the session when it has a bug is worse than
+the problem it prevents. Its job is to make the wrong path inconvenient and
+visible, not to be a load-bearing security boundary.
+
+Install as a PreToolUse hook matching Write|Edit.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+
+KNOWLEDGE_DIR = "10_knowledge/"
+
+# Authored-in-place types. Anything here is a synthesis product, not a capture.
+AUTHORED_TYPES = {
+    "note", "index", "source-literature-run", "synthesis", "project",
+    "lab-report", "adr", "decision", "incident-finding", "draft",
+}
+
+DENY_MESSAGE = """\
+Blocked: a new raw capture may not be written directly into 10_knowledge/.
+
+  {path}
+
+Raw captures must enter through the ingest pipeline, which is where provenance is
+checked:
+
+  1. write the capture to 00_inbox/
+  2. bin/ingest-minion run --dry-run     # see what would route
+  3. bin/ingest-minion run --apply       # routes, with the provenance gate
+
+The gate rejects any capture carrying url/doi/authors/year without a
+retrieval_receipt. That check is the entire point, and a direct write skips it.
+On 2026-08-09 this bypass was found to account for 449 unlogged raw captures,
+including a batch of 107 with citations to papers that do not exist.
+
+If this file is a synthesis rather than a capture, set `type: note` (or another
+authored type) and it will be allowed.
+
+To override deliberately: MAINFRAME_KNOWLEDGE_WRITE=1
+"""
+
+
+def allow() -> None:
+    sys.exit(0)
+
+
+def deny(path: str) -> None:
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": DENY_MESSAGE.format(path=path),
+        }
+    }))
+    sys.exit(0)
+
+
+def declared_type(content: str) -> str | None:
+    """Read `type:` from frontmatter, if there is any."""
+    if not content.startswith("---"):
+        return None
+    end = content.find("\n---", 3)
+    head = content[:end] if end != -1 else content[:1500]
+    m = re.search(r'^type:\s*"?([A-Za-z-]+)"?', head, re.M)
+    return m.group(1).lower() if m else None
+
+
+def main() -> None:
+    if os.environ.get("MAINFRAME_KNOWLEDGE_WRITE") == "1":
+        allow()
+
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:  # noqa: BLE001 — unparseable input is not the user's problem
+        allow()
+
+    tool = payload.get("tool_name") or payload.get("toolName") or ""
+    args = payload.get("tool_input") or payload.get("toolInput") or {}
+    path = str(args.get("file_path") or args.get("path") or "")
+
+    if KNOWLEDGE_DIR not in path.replace(os.sep, "/"):
+        allow()
+
+    # Edits to existing material are how remediation happens. Never block them.
+    if tool != "Write":
+        allow()
+    if os.path.exists(path):
+        allow()
+
+    content = str(args.get("content") or "")
+    dtype = declared_type(content)
+
+    # No frontmatter at all, or an authored type: not a capture. Let it through.
+    if dtype is None or dtype in AUTHORED_TYPES:
+        allow()
+
+    if dtype == "raw":
+        deny(path)
+
+    allow()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001 — a broken guard must never block work
+        sys.exit(0)

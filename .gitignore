@@ -1,23 +1,30 @@
-# OS
+# OS generated files
 .DS_Store
 .DS_Store?
+
+# Local scratch (client PDFs, renders, throwaway verification) — never commit
+tmp/
 ._*
 .Spotlight-V100
 .Trashes
+ehthumbs.db
+Thumbs.db
 
-# Python
+# Python generated files
 __pycache__/
 *.pyc
-.venv/
-.ruff_cache/
 
-# Personal working state
+# Personal Working State & Logs
 STATE.md
+01_ingest/ingest-log.md
+01_ingest/prep-ingest-log.md
 
-# Local tool config and telemetry
+# Local tool configuration and generated telemetry
 .mcp.json
 .claude/settings.local.json
 20_live/workflow-metrics/
+# Obsidian workspace state — records recent files and layout, which would leak
+# private project names into the public repo
 .obsidian/
 
 # Local databases
@@ -25,43 +32,154 @@ STATE.md
 *.sqlite-shm
 *.sqlite-wal
 
-# Inbox (keep control files only)
+# Inbox (ignore all personal captures). core.ignorecase=true here, so a lowercase
+# index.md whitelist would also un-ignore an uppercase INDEX.md (a personal catalogue
+# lives at 00_inbox/INDEX.md). Keep only the .gitkeep / AGENTS.md control files.
 00_inbox/*
 !00_inbox/.gitkeep
 !00_inbox/AGENTS.md
 
-# Ingest pipelines
+# Ingest Pipelines (ignore files being processed)
 01_ingest/ready/*
 01_ingest/queue/*
 01_ingest/processing/*
 01_ingest/renamed/*
 01_ingest/rejected/*
-01_ingest/ingest-log.md
-01_ingest/prep-ingest-log.md
+01_ingest/audit-receipts/*
 
-# Knowledge domains (keep templates only)
+# Knowledge Domains (ignore personal topics and the generated local index, keep public control files)
 10_knowledge/*
 !10_knowledge/index.template.md
 !10_knowledge/AGENTS.md
 
-# Live state (keep control files only)
+# Live State (ignore personal dashboards and logs, keep base control files)
 20_live/*
 !20_live/index.md
 !20_live/AGENTS.md
 
-# Projects (keep templates only)
+# Projects (ignore personal projects and the generated local index, keep public control files)
 30_projects/*
 !30_projects/index.template.md
 !30_projects/AGENTS.md
+# No project-content exceptions. Claim Audit Lab retired prototypes stay on disk
+# under the project tree (private) — do not re-add a 30_projects whitelist.
 
-# Archive
+# Quant-markets-lab + private ops workstreams — never published from MainFrame.
+# Project trees under 30_projects/* are already ignored; these patterns block
+# operational scripts/orchestrators that live at MainFrame root.
+bin/market-watcher
+bin/markets-track
+bin/price-snapshotter
+bin/quant-portfolio-producer
+bin/valuation-fetch
+bin/income-application
+bin/nd-discovery
+bin/scheduling/
+bin/repo-radar-weekly
+scripts/route_quant_markets_batch.py
+scripts/*quant_market*
+scripts/markets_registry.py
+bin/*market-watcher*
+tests/test_markets_registry.py
+tests/test_quant_strategy_validation.py
+
+# Archive (ignore archived files, keep base control files)
 90_archive/*
 !90_archive/index.md
 !90_archive/AGENTS.md
 
-# Env and secrets
+# Personal skills — methodology, workflow knowledge, and prompt craft stay local, never public
+.agents/skills/writing-style/
+.claude/skills/writing-style/
+.agents/skills/prompt-creation/
+.claude/skills/prompt-creation/
+.agents/skills/skill-creation/
+.claude/skills/skill-creation/
+# Project-specific skill parked at root (canonical home: 30_projects/income-engine/)
+.agents/skills/income-engine-process-control/
+.claude/skills/income-engine-process-control/
+scripts/eval_writing_style.py
+scripts/ai_detect_check.py
+scripts/eval_samples/
+
+# Private project tooling stays local
+bin/epistemic
+
+# Project-specific or archived root workflows (prefer 30_projects/<slug>/ or 90_archive/)
+.context/workflows/rolling-second-brain-migration.md
+.context/workflows/image-lab-operating.md
+.context/workflows/pixel-sprite-generation.md
+
+# Additional dev caches and local agent client configs (prevent leakage of settings/telemetry paths)
+.ruff_cache/
+.antigravity/
+.codex/
+
+# Volatile generated artifacts from session/audit/synthesis tools (defense-in-depth under 20_live/*)
+# These must never enter the public repo even if the broad 20_live/* rule is bypassed
+20_live/last-handoff-draft.md
+20_live/epistemic-audit/
+20_live/epistemic-audit/pending-review/sweep-*.md
+20_live/epistemic-audit/pending-review/bridge-sweep-*.md
+
+# Workstation local state & config
+workstation/settings.json
+workstation/workstation/tasks.json
+workstation/workstation/agents.json
+
+# Private outreach apparatus — kept local, never public
+.context/workflows/boardy-meeting-lifecycle.md
+.context/workflows/contact-website-gauge.md
+.context/workflows/website-audit.md
+bin/contact-gauge
+bin/website-audit
+scripts/contact_gauge.py
+scripts/website_audit.py
+
+# Private methodology tooling — kept local, never public
+EVAL_METHODOLOGY.md
+.context/workflows/eval-methodology.md
+.context/workflows/process-evaluation.md
+.context/templates/eval-output.md
+.context/templates/methodology-approach.md
+bin/eval-registry
+scripts/eval_registry.py
+tests/test_eval_registry.py
+
+# Local voice extracts for writing-style idiolect (private)
+.context/voice-corpus/
+
+# determinism-cost sealed instrument (DISCLOSURE)
+30_projects/determinism-cost/studies/S3-discriminative-instrument/sealed/corpus-*/
+30_projects/determinism-cost/studies/S3-discriminative-instrument/sealed/**/claims.json
+30_projects/determinism-cost/studies/S3-discriminative-instrument/sealed/**/documents.json
+30_projects/determinism-cost/studies/S3-discriminative-instrument/sealed/**/worlds.json
+
+
+# determinism-cost sealed-derived materials
+30_projects/determinism-cost/studies/S3-discriminative-instrument/pilot/blind-sheet-12.md
+30_projects/determinism-cost/studies/S3-discriminative-instrument/agent-panel/items-blind.jsonl
+30_projects/determinism-cost/outputs/
+
+# Secrets — pattern-based, everywhere in the tree.
+# Until 2026-08-10 no secret pattern existed here at all. Real API keys were safe
+# only incidentally, because they happened to live under 30_projects/*, which is
+# ignored wholesale. A .env in bin/, workstation/, 01_ingest/ or the repo root
+# would have been committed. Protection that holds by coincidence does not
+# generalize, and the coincidence is invisible until it stops being true.
 .env
 .env.*
-
-# Node (if workstation added later)
-node_modules/
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+client_secret*.json
+service-account*.json
+*secret*.yaml
+*secret*.yml
+*.token
+.netrc
+30_projects/determinism-cost/studies/S3-discriminative-instrument/pilot/batch_01.html
+.aider*

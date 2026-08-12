@@ -32,12 +32,41 @@ function parseArgs(argv) {
     positional: [],
   };
 
-  for (let i = 0; i < argv.length; i += 1) {
+  // A value-taking option must never swallow the next flag.
+  //
+  // Found 2026-08-10: a 24 KB file named `--fail-on-overflow` had been sitting in
+  // the MainFrame repo root since 2026-08-04. Someone ran
+  //
+  //     render-markdown-pdf.mjs in.md out.pdf --keep-html --fail-on-overflow
+  //
+  // and `--keep-html` took `--fail-on-overflow` as its output path. The stray
+  // file is the harmless half. The real damage is that `failOnOverflow` stayed
+  // false, so **the overflow check the caller explicitly asked for never ran**,
+  // the script exited 0, and a PDF shipped with no layout verification and no
+  // warning that there had been none.
+  //
+  // A guard that is requested but silently not in the path is worse than no
+  // guard, because it produces confidence instead of caution.
+  let i = 0;
+  const takesValue = (flag) => {
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith("--")) {
+      throw new Error(
+        `${flag} expects a value, but got ` +
+        `${next === undefined ? "end of arguments" : `the flag ${next}`}. ` +
+        `If you meant both, write: ${flag} <path> ${next ?? ""}`.trimEnd(),
+      );
+    }
+    i += 1;
+    return next;
+  };
+
+  for (; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--css") parsed.css.push(argv[++i]);
-    else if (arg === "--config") parsed.config = argv[++i];
-    else if (arg === "--chrome") parsed.chrome = argv[++i];
-    else if (arg === "--keep-html") parsed.keepHtml = argv[++i];
+    if (arg === "--css") parsed.css.push(takesValue("--css"));
+    else if (arg === "--config") parsed.config = takesValue("--config");
+    else if (arg === "--chrome") parsed.chrome = takesValue("--chrome");
+    else if (arg === "--keep-html") parsed.keepHtml = takesValue("--keep-html");
     else if (arg === "--fail-on-overflow") parsed.failOnOverflow = true;
     else if (arg === "--help" || arg === "-h") {
       usage();
