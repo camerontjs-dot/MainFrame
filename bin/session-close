@@ -20,6 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DRAFT_REL = Path("20_live") / "last-handoff-draft.md"
 FEED_REL = Path("20_live") / "workstation" / "session-close-feed.jsonl"
 CHECKPOINT_HEADING = "## Session Checkpoints (auto)"
+# Mirrors STALE_DAYS in bin/handoff.
+STALE_HANDOFF_DAYS = 21
+# The producer registry. Every entry must resolve to an action below; the
+# coverage test is what stops it from becoming another unread checklist.
+CONSUMPTION_REL = Path(".context") / "consumption.json"
 SNAPSHOT_CAP = 5
 ACTIVITY_WINDOW_DAYS = 14
 # Bounded per-project scan keeps --checkpoint inside the 5s hook budget even
@@ -30,6 +35,11 @@ SKIP_DIR_NAMES = {
     ".pytest_cache", "dist", "build", ".cache",
 }
 WEEKLY_EVAL_STALE_DAYS = 8  # matches bin/eval-schedule check (ADR-036)
+# Matches GRADUATION_THRESHOLD in bin/papercut: two entries is the point at
+# which a cluster can exist, so it is the point at which the last harvest's
+# conclusions may already be out of date. Any higher and the prompt arrives
+# after the repeat it exists to catch.
+PAPERCUT_HARVEST_TRIGGER = 2
 
 
 @dataclass(frozen=True)
@@ -177,31 +187,33 @@ def derive_active_projects(root: Path,
     """
     if now_ts is None:
         now_ts = datetime.now().timestamp()
-    projects_dir = root / "30_projects"
-    if not projects_dir.is_dir():
-        return []
+    lifecycle_dirs = [root / "30_projects", root / "40_operations"]
     candidates: list[dict[str, object]] = []
-    for entry in sorted(projects_dir.iterdir()):
-        if not entry.is_dir() or entry.name.startswith("."):
+    for lifecycle_dir in lifecycle_dirs:
+        if not lifecycle_dir.is_dir() or lifecycle_dir.is_symlink():
             continue
-        signals: list[tuple[str, float]] = []
-        mtime = latest_mtime(entry)
-        if mtime is not None:
-            signals.append(("files", mtime))
-        commit = nested_repo_last_commit(entry, run_command)
-        if commit is not None:
-            signals.append(("commit", commit))
-        if not signals:
-            continue
-        signal, ts = max(signals, key=lambda item: item[1])
-        age_hours = max(0.0, (now_ts - ts) / 3600)
-        if age_hours > window_days * 24:
-            continue
-        candidates.append({
-            "project": entry.name,
-            "signal": signal,
-            "age_hours": round(age_hours, 1),
-        })
+        for entry in sorted(lifecycle_dir.iterdir()):
+            if not entry.is_dir() or entry.is_symlink() or entry.name.startswith("."):
+                continue
+            signals: list[tuple[str, float]] = []
+            mtime = latest_mtime(entry)
+            if mtime is not None:
+                signals.append(("files", mtime))
+            commit = nested_repo_last_commit(entry, run_command)
+            if commit is not None:
+                signals.append(("commit", commit))
+            if not signals:
+                continue
+            signal, ts = max(signals, key=lambda item: item[1])
+            age_hours = max(0.0, (now_ts - ts) / 3600)
+            if age_hours > window_days * 24:
+                continue
+            candidates.append({
+                "project": entry.name,
+                "path": str(entry.relative_to(root)),
+                "signal": signal,
+                "age_hours": round(age_hours, 1),
+            })
     candidates.sort(key=lambda item: item["age_hours"])
     return candidates[:limit]
 
@@ -477,6 +489,353 @@ def papercut_action(root: Path) -> "CloseAction":
     )
 
 
+def papercut_harvest_action(root: Path) -> "CloseAction":
+    """Prompt a harvest when the log has grown past the last reading of it.
+
+    `papercut_action` above closes the recording half of the loop. Nothing closed
+    the reading half: `bin/papercut harvest` is the step that turns a pile of
+    entries into "this address is the defect", and the only thing that ever
+    called for it was `bin/contract-audit` item 10.1 — a check that reports the
+    backlog after the fact rather than at the moment someone could act on it.
+
+    Deliberately `manual`, never `auto`. Harvesting writes
+    `20_live/papercuts/last-harvest.json`, and 10.1 reads that receipt. Running
+    the harvest from `--apply` would satisfy the audit with a receipt attesting
+    to a report that no one read — a green check standing in for the work it was
+    built to measure. The receipt has to mean a person looked.
+
+    Triggers on *unread growth*, not on open issues. A papercut log is
+    append-only with no resolved state, so "graduation candidates exist" stays
+    true forever once a cluster forms, and a demand that can never be satisfied
+    becomes wallpaper within a week. Standing candidates are reported in the
+    reason line either way; only new material makes the action needed.
+    """
+    store = root / "20_live" / "papercuts"
+    if not store.exists():
+        return CloseAction(
+            name="papercut-harvest", kind="manual", needed=False,
+            reason="no papercut store yet",
+        )
+
+    total = 0
+    diagnosed = 0
+    for path in sorted(store.glob("*.jsonl")):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            if not ln.strip():
+                continue
+            total += 1
+            try:
+                kind = json.loads(ln).get("kind", "")
+            except (json.JSONDecodeError, AttributeError):
+                # Unreadable lines count toward the total and not toward the
+                # diagnosed set. A parse failure is not evidence of an auto stub.
+                continue
+            if kind not in ("auto", "suggestion"):
+                diagnosed += 1
+
+    if total == 0:
+        return CloseAction(
+            name="papercut-harvest", kind="manual", needed=False,
+            reason="papercut store is empty — nothing to harvest",
+        )
+
+    receipt = store / "last-harvest.json"
+    try:
+        r = json.loads(receipt.read_text(encoding="utf-8")) if receipt.exists() else None
+    except (OSError, json.JSONDecodeError):
+        r = None
+
+    if not isinstance(r, dict):
+        return CloseAction(
+            name="papercut-harvest", kind="manual", needed=True,
+            reason=(f"{total} papercut(s) recorded and never harvested — "
+                    "run `bin/papercut harvest`"),
+        )
+
+    cands = r.get("graduation_candidates", 0)
+    standing = f"; {cands} standing graduation candidate(s)" if cands else ""
+
+    # Receipts written before the auto hold-out landed carry no `auto_stubs`
+    # key, so diagnosed-at-harvest is unknowable from them. Fall back to total
+    # growth rather than guessing, which errs toward prompting.
+    if "auto_stubs" in r:
+        seen = r.get("observations_seen", 0) - r.get("auto_stubs", 0)
+        new = diagnosed - seen
+        unit = "diagnosed papercut(s)"
+    else:
+        new = total - r.get("entries_seen", 0)
+        unit = "papercut(s)"
+
+    if new >= PAPERCUT_HARVEST_TRIGGER:
+        return CloseAction(
+            name="papercut-harvest", kind="manual", needed=True,
+            reason=(f"{new} new {unit} since the last harvest "
+                    f"({r.get('harvested_at', 'unknown')[:10]}) — "
+                    f"enough to form a cluster; run `bin/papercut harvest`{standing}"),
+        )
+    return CloseAction(
+        name="papercut-harvest", kind="manual", needed=False,
+        reason=(f"harvest current as of {r.get('harvested_at', 'unknown')[:10]} "
+                f"({total} recorded, {max(new, 0)} unread){standing}"),
+    )
+
+
+def _handoff_json(root: Path, run_command: RunCommand) -> list[dict] | None:
+    """Open handoffs via bin/handoff, or None when the tool cannot be read."""
+    try:
+        proc = run_command([str(root / "bin" / "handoff"), "list", "--json"])
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return payload if isinstance(payload, list) else None
+
+
+def handoff_lifecycle_action(root: Path, run_command: RunCommand) -> CloseAction:
+    """Report the open handoff set and what closing the session owes it.
+
+    A handoff is an object with a lifecycle (open -> consumed/superseded), so
+    session close has two obligations: consume what this session finished, and
+    emit a handoff for work that outlives it.
+    """
+    handoffs = _handoff_json(root, run_command)
+    if handoffs is None:
+        return CloseAction(
+            name="handoff-lifecycle", kind="warn", needed=True,
+            reason="could not read open handoffs — run `bin/handoff check`",
+        )
+    if not handoffs:
+        return CloseAction(
+            name="handoff-lifecycle", kind="manual", needed=True,
+            reason="no open handoffs — emit one with `bin/handoff emit` if work "
+                   "outlives this session",
+        )
+    stale = [h for h in handoffs if (h.get("age_days") or 0) > STALE_HANDOFF_DAYS]
+    stale_note = f", {len(stale)} stale" if stale else ""
+    return CloseAction(
+        name="handoff-lifecycle", kind="manual", needed=True,
+        reason=f"{len(handoffs)} open handoff(s){stale_note} — "
+               "`bin/handoff consume <id> --apply` for anything this session "
+               "finished; `bin/handoff emit` for what it starts",
+    )
+
+
+def handoff_digest_lines(root: Path, run_command: RunCommand) -> list[str]:
+    """Open handoffs as digest bullets, newest-blocking-first."""
+    handoffs = _handoff_json(root, run_command)
+    if handoffs is None:
+        return ["(could not read handoffs — run `bin/handoff check`)"]
+    if not handoffs:
+        return ["None open."]
+    rank = {"high": 0, "medium": 1, "low": 2}
+    handoffs.sort(key=lambda h: (rank.get(str(h.get("urgency")), 3), h.get("updated", "")))
+    lines = []
+    for h in handoffs:
+        age = h.get("age_days")
+        age_s = f", {age}d open" if age is not None else ""
+        lines.append(
+            f"- {h.get('to_project','?')} — {h.get('urgency','?')} · "
+            f"`{h.get('next_loop','?')}`{age_s} — {h.get('id','?')}"
+        )
+    return lines
+
+
+def _tool_json(root: Path, argv: list[str], run_command: RunCommand):
+    """A tool's --json payload, or None when it cannot be read.
+
+    None is deliberately distinct from an empty result: "the check did not run"
+    and "the check found nothing" must never render the same, which is the
+    distinction bin/capture-validate had to be taught the hard way.
+    """
+    try:
+        proc = run_command([str(root / "bin" / argv[0]), *argv[1:]])
+    except Exception:  # noqa: BLE001 — a close check must not crash the hook
+        return None
+    if not (proc.stdout or "").strip():
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def idle_runs_action(root: Path, run_command: RunCommand) -> CloseAction:
+    """Idle runs that produced an artifact and never got a terminal state.
+
+    The rule this enforces is the one this repo breaks most: nothing may be
+    generated that has no scheduled consumption pass. bin/idle-dispatch was
+    built to close the actuation gap and reproduced it within three days —
+    33 starts against 18 finishes. The dispatcher was never the missing piece.
+    """
+    payload = _tool_json(root, ["idle-queue", "backlog", "--json"], run_command)
+    if payload is None:
+        return CloseAction(
+            name="idle-runs", kind="warn", needed=True,
+            reason="could not read the idle run backlog — run `bin/idle-queue backlog`",
+        )
+    open_n = int(payload.get("open") or 0)
+    if not open_n:
+        return CloseAction(
+            name="idle-runs", kind="manual", needed=False,
+            reason="no idle runs waiting on a reader",
+        )
+    stale_n = int(payload.get("stale") or 0)
+    oldest = payload.get("oldest_days")
+    detail = f", {stale_n} past {payload.get('stale_days')}d" if stale_n else ""
+    if oldest:
+        detail += f" (oldest {oldest}d)"
+    return CloseAction(
+        name="idle-runs", kind="manual", needed=True,
+        reason=f"{open_n} idle run(s) unreviewed{detail} — "
+               "`bin/idle-queue finish <run> --outcome <label>`, or "
+               "`bin/idle-queue abandon <run>` if nobody is going to read it",
+    )
+
+
+def scheduled_jobs_action(root: Path, run_command: RunCommand) -> CloseAction:
+    """launchd jobs that failed, half-succeeded, or went quiet.
+
+    `degraded` is the state worth surfacing separately: measured 2026-08-26,
+    repo-radar wrote its digest and then died on DNS, and the only thing recorded
+    anywhere was the exit 1. Silence read as health for three days.
+    """
+    payload = _tool_json(root, ["scheduled-run", "--json"], run_command)
+    if payload is None:
+        return CloseAction(
+            name="scheduled-jobs", kind="warn", needed=True,
+            reason="could not read launchd job health — run `bin/scheduled-run --check`",
+        )
+    bad = [j for j in payload if j.get("status") in ("degraded", "failed", "stale")]
+    if not bad:
+        return CloseAction(
+            name="scheduled-jobs", kind="warn", needed=False,
+            reason=f"{len(payload)} scheduled job(s), all healthy",
+        )
+    summary = ", ".join(f"{j.get('label','?').removeprefix('com.mainframe.')} "
+                        f"{j.get('status')}" for j in bad[:4])
+    return CloseAction(
+        name="scheduled-jobs", kind="warn", needed=True,
+        reason=f"{len(bad)}/{len(payload)} scheduled job(s) need attention — "
+               f"{summary} — `bin/scheduled-run --check`",
+    )
+
+
+def ingest_lane_action(root: Path, changed: list[str]) -> CloseAction:
+    """What this session added to the ingest lane and did not route.
+
+    Deliberately scoped to this session's own contribution. The standing lane is
+    282 files deep; reporting that number every close would be a permanent red,
+    and a permanent red is a warning nobody reads. What a session owes is what it
+    added.
+    """
+    added = [f for f in changed if f.startswith("01_ingest/") or f.startswith("00_inbox/")]
+    if not added:
+        return CloseAction(
+            name="ingest-lane", kind="manual", needed=False,
+            reason="this session added nothing to the ingest lane",
+        )
+    return CloseAction(
+        name="ingest-lane", kind="manual", needed=True,
+        reason=f"{len(added)} file(s) added to the ingest lane this session — "
+               "route or reject them rather than leaving them to age",
+    )
+
+
+def leak_scan_action(root: Path, run_command: RunCommand) -> CloseAction:
+    """Machine paths or credentials this session could still remove.
+
+    Scoped to the working tree with `--no-history`, for two reasons. It runs in
+    0.27s against 13.9s for the full scan, and this hook has a budget. And
+    history is a 127-string backlog needing a filter-repo rewrite — reporting it
+    at every close would be a permanent red, which is a warning nobody reads.
+    Growth of that backlog is guarded by `.leak-scan-baseline` on the weekly
+    run instead.
+
+    Untracked files count here. Until 2026-08-27 the scanner never read them,
+    so it reported clean on files it had never opened.
+    """
+    try:
+        proc = run_command([str(root / "bin" / "repo-leak-scan"),
+                            str(root), "--no-history"])
+    except Exception:  # noqa: BLE001 — a close check must not crash the hook
+        return CloseAction(
+            name="leak-scan", kind="warn", needed=True,
+            reason="could not run the leak scan — run `bin/repo-leak-scan --no-history`",
+        )
+    if proc.returncode == 0:
+        return CloseAction(
+            name="leak-scan", kind="warn", needed=False,
+            reason="no machine paths or credentials in the working tree",
+        )
+    if proc.returncode != 1:
+        # ADR-052: 2 means the tool could not run. That is never a pass.
+        return CloseAction(
+            name="leak-scan", kind="warn", needed=True,
+            reason=f"leak scan could not complete (exit {proc.returncode}) — "
+                   "run `bin/repo-leak-scan --no-history`",
+        )
+    offenders = sorted({
+        line.split(":", 1)[0]
+        for line in (proc.stdout or "").splitlines()
+        if ":" in line and not line.startswith((" ", "\x1b", "=", "T", "#"))
+    })
+    named = ", ".join(offenders[:3]) if offenders else "see the scan output"
+    return CloseAction(
+        name="leak-scan", kind="warn", needed=True,
+        reason=f"leak(s) in the working tree — {named} — "
+               "remove them or declare them in `.leak-scan-allow`",
+    )
+
+
+def brainstorm_sync_action(root: Path, run_command: RunCommand) -> CloseAction:
+    """Drift between the brainstorm dump, its mirror, and SOURCE.md.
+
+    Deliberately runs without `--fetch`: pin, orphans and index are local reads
+    that cost nothing, and a SessionEnd hook must not depend on the network.
+    The `behind` check reports not-assessable here and is covered by the weekly
+    job instead.
+
+    Measured 2026-08-27, all four had drifted at once — the mirror 30 commits
+    behind, the pin three days stale, a capture orphaned in the mirror for nine
+    days, and 8 of 14 captures missing from the index.
+    """
+    payload = _tool_json(root, ["brainstorm-sync", "--json"], run_command)
+    if payload is None:
+        return CloseAction(
+            name="brainstorm-sync", kind="warn", needed=True,
+            reason="could not read brainstorm sync state — run `bin/brainstorm-sync`",
+        )
+    drifted = [c for c in payload if c.get("state") == "drift"]
+    if not drifted:
+        return CloseAction(
+            name="brainstorm-sync", kind="warn", needed=False,
+            reason="brainstorm mirror, pin and index agree",
+        )
+    return CloseAction(
+        name="brainstorm-sync", kind="warn", needed=True,
+        reason=f"{len(drifted)} brainstorm drift(s) — "
+               + "; ".join(str(c.get("detail", "")) for c in drifted[:2]),
+    )
+
+
+def consumption_registry(root: Path) -> list[dict]:
+    """Registered producers. Raises nothing — an unreadable registry is reported
+    by the coverage test, not by crashing a SessionEnd hook."""
+    path = root / CONSUMPTION_REL
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("producers", [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def check_session(root: Path, project: str | None = None,
                   run_command: RunCommand = default_run_command,
                   apply: bool = False) -> SessionCloseResult:
@@ -492,8 +851,13 @@ def check_session(root: Path, project: str | None = None,
     else:
         result.actions.append(CloseAction(
             name="state-md-narrative", kind="manual", needed=True,
-            reason="update STATE.md narrative (what changed, what remains, blockers, handoff)",
+            reason="update STATE.md narrative (what changed, what remains, blockers); "
+                   "the Current Handoff section comes from `bin/handoff state-block`",
         ))
+
+    # Handoff lifecycle: work that outlives the session becomes a linked file
+    # with a consumption state, not another paragraph in STATE.md.
+    result.actions.append(handoff_lifecycle_action(root, run_command))
 
     if project is None:
         project = detect_project_from_state(state_path) if state_exists else None
@@ -529,6 +893,15 @@ def check_session(root: Path, project: str | None = None,
         ))
 
     result.actions.append(papercut_action(root))
+    result.actions.append(papercut_harvest_action(root))
+
+    # Producers registered in .context/consumption.json. Each must land an
+    # action here or tests/test_session_close.py fails.
+    result.actions.append(idle_runs_action(root, run_command))
+    result.actions.append(scheduled_jobs_action(root, run_command))
+    result.actions.append(leak_scan_action(root, run_command))
+    result.actions.append(brainstorm_sync_action(root, run_command))
+    result.actions.append(ingest_lane_action(root, changed))
 
     knowledge_changed = any(f.startswith("10_knowledge/") for f in changed)
     if knowledge_changed:
@@ -612,6 +985,9 @@ def check_session(root: Path, project: str | None = None,
             digest_lines = ["# Session Handoff Draft (auto-generated)", ""]
             digest_lines.append(f"Date: {date.today().isoformat()}")
             digest_lines.append("Active project: " + (project or "(from STATE.md)"))
+            digest_lines.append("")
+            digest_lines.append("## Open handoffs")
+            digest_lines.extend(handoff_digest_lines(root, run_command))
             digest_lines.append("")
             digest_lines.append("## Quick Signals (paste/edit into STATE.md)")
             # Ingest status
@@ -697,7 +1073,7 @@ def main() -> int:
                       help="fast prompt-free snapshot: append a dated block to "
                            "20_live/last-handoff-draft.md and a record to the "
                            "tracker feed (wired to the PreCompact hook)")
-    parser.add_argument("--project", help="project slug under 30_projects/")
+    parser.add_argument("--project", help="lifecycle slug under 30_projects/ or 40_operations/")
     parser.add_argument("--feed", action="store_true",
                         help="with --check/--apply: append the machine-readable "
                              "result to 20_live/workstation/session-close-feed.jsonl "

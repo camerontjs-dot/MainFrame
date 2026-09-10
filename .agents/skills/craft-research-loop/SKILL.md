@@ -67,4 +67,4 @@ bin/craft-research-loop promote --project <slug> --trial <id> --to knowledge|exp
 - `.context/workflows/craft-research-loop.md`
 - `.context/templates/craft-trial.md`
 - research-lane-loop, project-experiment-loop
-- Reference implementation: `30_projects/image-generation-lab/outputs/RESEARCH_PROOF_INDEX.md`
+- Reference implementation: `local-only: 30_projects/<slug>/outputs/RESEARCH_PROOF_INDEX.md`

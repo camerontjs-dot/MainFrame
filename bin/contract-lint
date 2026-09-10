@@ -1,0 +1,867 @@
+#!/usr/bin/env python3
+"""Check one contract file against the Binds/Tier/Check/Escape format, before it lands.
+
+## The gap this fills
+
+`bin/contract-audit` measures the whole corpus and reports adoption. That is the
+right instrument for *how bad is it*, and the wrong one for *is the file I am
+about to commit correct*. Measured 2026-08-23:
+
+    10.5  contracts declare a tier ................  2 / 135 files
+    1.6   hard promises bound at clause level .....  138 clauses, 124 unbound (10%)
+    1.5   normative clauses name a mechanism ......  680 clauses,  39 bound  (6%)
+    1.7   T1+ rules name an Escape ...............   7 rules,    0 missing
+
+1.7 is the tell. **Where the format is used it works.** The gap is propagation,
+so the fix is a per-file check cheap enough to run on every edit, plus templates
+at `.context/templates/contracts/`.
+
+## The failure this is really built to catch
+
+The clause format is parsed with real regexes, and a `**Binds:**` block is
+terminated by a blank line. So this:
+
+    > **Binds:** any agent writing here
+    > **Tier:** T2 (blocked)
+    >
+    > **Check:** bin/some-tool
+    > **Escape:** route through 00_inbox/
+
+parses as a block with no Check and no Escape. It *looks* adopted to a human
+reader and reads as unenforced to every tool. A contract can lose its
+enforcement to one blank line, silently — which is check 1.5's stated defect
+("a rule that silently lost its enforcement looks exactly like a rule that never
+needed any") reproduced at the level of typography.
+
+That is L1 below, and it is the whole reason this runs pre-commit.
+
+## The ratchet
+
+Corpus-wide adoption is 2/135, so a lint that demanded adoption everywhere would
+fail 133 files on the first run and be disabled within a day. Instead:
+
+    a file that has NOT adopted the format ....... reported, never blocking
+    a file that HAS adopted it ................... may not regress
+
+Regression is the thing worth blocking, because it is the thing that happens
+silently. Growth is left to the templates and to 10.5's corpus number.
+
+## Fail-closed, on purpose
+
+Unlike `bin/knowledge-write-guard` (fail-open — a broken guard must not block
+work), this is a **checker**, and a checker that cannot read its input must not
+report clean. Unreadable file, bad regex, unexpected shape: exit 2, say so.
+
+    exit 0   checked, no blocking findings
+    exit 1   checked, blocking findings (regression, or --strict with findings)
+    exit 2   could not check — never confuse this with a pass
+
+Verify: bin/contract-lint --selftest
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+sys.path.insert(0, str(ROOT))
+from scripts.mainframe_paths import rel_to_root  # noqa: E402
+
+# ---------------------------------------------------------------- the grammar
+#
+# These MUST stay byte-identical to the ones in bin/contract-audit, or lint and
+# audit disagree about what adoption means and the number nobody trusts is the
+# one that gets ignored. tests/test_contract_lint.py extracts both and asserts
+# equality, so drift fails a test rather than being discovered in an incident.
+
+NORMATIVE = re.compile(
+    r"\b(MUST(?! not)|MUST NOT|NEVER|ALWAYS|SHALL|REQUIRED|PROHIBITED"
+    r"|[Dd]o not|must not|may not|never|only|strictly)\b"
+)
+
+MECHANISM = re.compile(
+    r"(bin/[a-z0-9._-]+"           # a tool
+    r"|\.claude/settings"          # config
+    r"|PreToolUse|PostToolUse|hook"
+    r"|pytest|test_[a-z_]+|selftest"
+    r"|--check\b|--apply\b|--dry-run\b|--fail-on"
+    r"|\.gitignore"
+    r")"
+)
+
+TIER_RE = re.compile(r"^[>\s]*(?:\*\*)?Tier:?(?:\*\*)?:?\s*(T[0-3])\b", re.M)
+
+HARD_CLAUSE = re.compile(
+    r"\b(MUST NOT|MUST|NEVER|Never|never|PROHIBITED|prohibited|SHALL"
+    r"|may not|must not|strictly|immutable|read-only|only to|exclusive)\b"
+)
+
+RULE_BLOCK = re.compile(
+    r"(?:^[>\s]*\*\*Binds:\*\*.*?)(?=^\s*$|^##)", re.M | re.S
+)
+
+# Local to the lint: locating block starts so a truncated block can be reported
+# with a line number the author can jump to.
+BINDS_LINE = re.compile(r"^[>\s]*\*\*Binds:\*\*", re.M)
+FIELD = {
+    "Tier": re.compile(r"^[>\s]*\*\*Tier:\*\*\s*\S", re.M),
+    "Check": re.compile(r"^[>\s]*\*\*Check:\*\*\s*\S", re.M),
+    "Escape": re.compile(r"^[>\s]*\*\*Escape:\*\*\s*\S", re.M),
+}
+CHECK_NONE = re.compile(r"^[>\s]*\*\*Check:\*\*\s*(none|n/?a)\b", re.M | re.I)
+
+# A field `--fix` scaffolded and nobody finished. This exists so the scaffold is
+# safe to insert: `**Escape:** TODO` satisfies FIELD["Escape"] and would silence
+# L5, turning a repair tool into a way to launder an unenforced rule. L9 keeps
+# the file blocking until a human writes the words.
+PLACEHOLDER = re.compile(
+    r"^[>\s]*\*\*(Binds|Tier|Check|Escape):\*\*\s*(?:TODO|FIXME|<[^>\n]*>)", re.M
+)
+
+# Canonical field order, used when scaffolding a missing field back into place.
+FIELD_ORDER = ("Binds", "Tier", "Check", "Escape")
+
+FIELD_HINT = {
+    "Binds": "TODO — who or what this constrains",
+    "Tier": "TODO — T0 advisory / T1 detected / T2 blocked / T3 reconciled",
+    "Check": "TODO — name a runnable tool, hook, or test; if none exists, the honest tier is T0",
+    "Escape": "TODO — the named, cheap, non-penalized way to comply when you cannot meet the letter",
+}
+
+# Any line that *announces* a tier, however it is punctuated. L6 is then "this
+# line declares a tier and TIER_RE will not match it", which is the only
+# definition that matters — the audit is the reader being satisfied here.
+#
+# An earlier version tried to express this as one negative-lookahead regex and
+# fired on every correct block: `Tier:?(?:\*\*)?:?\s*` can backtrack to consume
+# only `Tier:`, leaving `**` to satisfy `(?!T[0-3])(\S+)`. Caught by the
+# selftest's negative control, which is what that control is for.
+TIER_LINE = re.compile(r"^[>\s]*(?:\*\*)?\s*Tier\s*(?:\*\*)?\s*:", re.I)
+
+# A contract file is anything carrying normative weight over agent behaviour.
+# Enumerated, not remembered — the deny-list mistake has been made four times in
+# this investigation, including once inside the tool built to catch it.
+CONTRACT_GLOBS = (
+    "AGENTS.md", "HARNESS.md", "EPISTEMIC_STANCE.md", "DECISIONS.md",
+    "**/AGENTS.md", "**/decisions.md",
+    ".context/workflows/*.md", ".agents/skills/**/SKILL.md", "agents/*.md",
+)
+SKIP_DIRS = {
+    ".git", ".venv", "node_modules", "__pycache__", "90_archive",
+    ".pytest_cache", ".ruff_cache", "tmp",
+}
+# Templates describe the format; they are not themselves in force.
+SKIP_PARTS = (".context/templates/",)
+
+
+@dataclass(frozen=True)
+class Finding:
+    code: str
+    line: int
+    blocking: bool
+    message: str
+    detail: str = ""
+
+
+class Unreadable(RuntimeError):
+    """Raised when a file cannot be checked. Never reported as clean."""
+
+
+# ------------------------------------------------------------------- checking
+
+
+def read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — surfaced as exit 2, never as clean
+        raise Unreadable(f"{path}: {exc}") from exc
+
+
+def line_of(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+def adopted(text: str) -> bool:
+    """Has this file taken on the format at all?"""
+    return bool(TIER_RE.search(text))
+
+
+def lint_text(text: str) -> list[Finding]:
+    """Every finding for one contract file's contents.
+
+    `blocking` marks the ones that fail an adopted file. Non-blocking findings
+    are reported for every file and block nothing, because 133 of 135 files have
+    not adopted the format yet and a lint that fails all of them gets turned off.
+    """
+    out: list[Finding] = []
+    has_format = adopted(text)
+
+    matches = list(RULE_BLOCK.finditer(text))
+    lines = text.splitlines()
+
+    for m in matches:
+        block = m.group(0)
+        ln = line_of(text, m.start())
+        first = block.strip().splitlines()[0][:60]
+
+        missing = [name for name, rx in FIELD.items() if not rx.search(block)]
+
+        # L1 — the fields exist, just past a blank line that ended the block.
+        #
+        # This is the silent-zero-adoption trap and the reason this runs
+        # pre-commit: the file looks adopted to a human and reads as unenforced
+        # to every tool. Distinguished from L2 by looking at what follows the
+        # block — "you forgot the Escape" and "your Escape is unparsed" need
+        # different fixes, and only one of them is invisible.
+        if missing:
+            after = "\n".join(lines[line_of(text, m.end()) - 1:][:6])
+            stranded = [n for n in missing if FIELD[n].search(after)]
+            if stranded:
+                out.append(Finding(
+                    "L1", ln, True,
+                    f"rule block ends early — {', '.join(stranded)} "
+                    "follow(s) a blank line and will not be parsed",
+                    "remove the blank line, or prefix it with '>' to keep the "
+                    "block open",
+                ))
+            remaining = [n for n in missing if n not in stranded]
+            if remaining:
+                out.append(Finding(
+                    "L2", ln, True,
+                    f"rule block missing {', '.join(remaining)}",
+                    first,
+                ))
+
+        tm = TIER_RE.search(block)
+        tier = tm.group(1) if tm else None
+
+        if tier and tier != "T0":
+            if CHECK_NONE.search(block):
+                out.append(Finding(
+                    "L3", ln, True,
+                    f"{tier} declares 'Check: none' — a tier above T0 claims a "
+                    "mechanism exists; if there is none the honest tier is T0",
+                    first,
+                ))
+            elif not MECHANISM.search(block):
+                out.append(Finding(
+                    "L4", ln, False,
+                    f"{tier} names no runnable mechanism in the block",
+                    "Check should name a bin/ tool, hook, pytest path, or "
+                    "--check/--apply/--dry-run flag",
+                ))
+            if not FIELD["Escape"].search(block):
+                out.append(Finding(
+                    "L5", ln, True,
+                    f"{tier} names no Escape — an enforced rule with no honest "
+                    "way to fail manufactures violations",
+                    first,
+                ))
+
+    # L9 — a scaffolded field nobody filled in. Always blocking: an unfinished
+    # rule is the one state that must not be committable, or `--fix` becomes a
+    # way to make an unenforced rule look enforced.
+    for m in PLACEHOLDER.finditer(text):
+        out.append(Finding(
+            "L9", line_of(text, m.start()), True,
+            f"{m.group(1)} is still a scaffold placeholder",
+            "written by `--fix`; replace it with the real words before committing",
+        ))
+
+    # L6 — a Tier line that is not T0..T3 reads as no tier at all.
+    for i, raw in enumerate(text.splitlines(), start=1):
+        if not TIER_LINE.match(raw):
+            continue
+        if TIER_RE.match(raw):
+            continue
+        value = raw.split(":", 1)[-1].strip().strip("*").strip() or "(empty)"
+        out.append(Finding(
+            "L6", i, True,
+            f"Tier value {value!r} is not T0/T1/T2/T3",
+            "the audit's TIER_RE will not match it, so the rule reads as untiered",
+        ))
+
+    # L7 — hard promises standing outside any rule block. Reported everywhere,
+    # blocking only where the file has shown it knows how to bind them.
+    covered = set()
+    for m in matches:
+        lo = line_of(text, m.start())
+        covered.update(range(lo - 6, lo + m.group(0).count("\n") + 2))
+
+    loose: list[str] = []
+    for i, raw in enumerate(text.splitlines(), start=1):
+        s = raw.strip()
+        if not HARD_CLAUSE.search(s):
+            continue
+        if not re.match(r"^(\d+\.|[-*]|\|)", s):
+            continue  # numbered/bulleted rules are the normative unit
+        if i in covered or MECHANISM.search(s):
+            continue
+        loose.append(f"L{i}: {s[:80]}")
+    if loose:
+        out.append(Finding(
+            "L7", 0, False,
+            f"{len(loose)} hard clause(s) (MUST/NEVER/immutable/read-only) name "
+            "no mechanism and sit outside any rule block",
+            "\n".join(f"        {x}" for x in loose[:6]),
+        ))
+
+    # L8 — the file makes normative claims and has not adopted the format.
+    # Never blocking. This is the corpus-wide backlog, not a defect in this edit.
+    if not has_format:
+        n = sum(1 for ln in text.splitlines() if NORMATIVE.search(ln))
+        if n:
+            out.append(Finding(
+                "L8", 0, False,
+                f"{n} normative clause(s), no Binds/Tier/Check/Escape block",
+                "start from .context/templates/contracts/agents-md.template.md",
+            ))
+
+    return out
+
+
+# ------------------------------------------------------------------ repairing
+#
+# Adoption is 14/153 and the corpus is growing faster than adoption (114 -> 153
+# since 2026-08-23, while adopted went 4 -> 14). A lint that only names what is
+# wrong leaves the compliant route strictly longer than the non-compliant one:
+# write the sentence, then recall four field names, then author a mechanism.
+# So the lint repairs what it can.
+#
+# What it may repair is bounded by honesty, not by difficulty:
+#
+#   typography  the author already wrote the right words and lost them to a
+#               blank line (L1) or a bold marker (L6). Intent is on the page;
+#               repairing it invents nothing. Fixed outright.
+#   content     a missing Escape cannot be invented. Scaffolded as a visibly
+#               unfinished TODO that L9 blocks on, so starting is one command
+#               and finishing dishonestly is not available.
+#
+# That boundary is the whole design. Cross it and this becomes a tool for
+# manufacturing green contracts, which is the failure it was built against.
+
+MAX_PASSES = 40
+
+
+def _prefix_of(line: str) -> str:
+    """The '> ' quoting a rule block is written with, so repairs match it."""
+    return re.match(r"^([>\s]*)", line).group(1) or "> "
+
+
+def fix_pass(text: str) -> tuple[str, str | None]:
+    """Apply at most one repair. Returns (text, description or None if settled).
+
+    One edit per pass, because every insertion shifts the line numbers the next
+    repair would be computed from. The caller loops.
+    """
+    lines = text.splitlines()
+    trailing = "\n" if text.endswith("\n") else ""
+
+    def joined() -> str:
+        return "\n".join(lines) + trailing
+
+    # R1 — a tier value wrapped in bold, which TIER_RE cannot see. This is the
+    # defect found in 10_knowledge/AGENTS.md rule 5: the file others are told to
+    # copy had silently lost a tier to markup.
+    for i, raw in enumerate(lines):
+        if not TIER_LINE.match(raw) or TIER_RE.match(raw):
+            continue
+        fixed = re.sub(r"(\*\*Tier:\*\*\s*)\*\*(.*?)\*\*\s*$", r"\1\2", raw)
+        if fixed != raw:
+            lines[i] = fixed
+            return joined(), f"L{i + 1}: unbolded the tier value so it parses as a tier"
+
+    # R2 — a blank line severing a block from its own Check and Escape. The
+    # silent-zero-adoption trap; the fields are right there, six lines down.
+    for m in RULE_BLOCK.finditer(text):
+        block = m.group(0)
+        missing = [n for n, rx in FIELD.items() if not rx.search(block)]
+        if not missing:
+            continue
+        bl = line_of(text, m.end())
+        after = "\n".join(lines[bl - 1:][:6])
+        stranded = [n for n in missing if FIELD[n].search(after)]
+        if stranded and bl - 1 < len(lines) and not lines[bl - 1].strip():
+            lines[bl - 1] = _prefix_of(lines[line_of(text, m.start()) - 1]).rstrip() or ">"
+            return joined(), (f"L{bl}: reopened the rule block — a blank line was "
+                              f"hiding {', '.join(stranded)}")
+
+    # R3 — a field that is genuinely absent. Scaffolded, never invented.
+    for m in RULE_BLOCK.finditer(text):
+        block = m.group(0)
+        start = line_of(text, m.start())
+        span = block.rstrip("\n").count("\n") + 1
+        bl = start + span
+        after = "\n".join(lines[bl - 1:][:6]) if bl - 1 < len(lines) else ""
+
+        present: dict[str, int] = {}
+        for name, rx in FIELD.items():
+            hit = rx.search(block)
+            if hit:
+                present[name] = start + block.count("\n", 0, hit.start())
+        present["Binds"] = start
+
+        for name in FIELD_ORDER:
+            if name in present or FIELD.get(name, PLACEHOLDER).search(after):
+                continue  # present, or stranded past a blank line — R2's job
+            before = [n for n in FIELD_ORDER[:FIELD_ORDER.index(name)] if n in present]
+            anchor_line = present[before[-1]] if before else start
+            prefix = _prefix_of(lines[start - 1])
+            lines.insert(anchor_line, f"{prefix}**{name}:** {FIELD_HINT[name]}")
+            return joined(), (f"L{anchor_line + 1}: scaffolded a missing {name} "
+                              f"— fill it in, L9 blocks until you do")
+
+    return text, None
+
+
+def fix_text(text: str) -> tuple[str, list[str]]:
+    """Repair until settled. Returns (text, what changed)."""
+    repairs: list[str] = []
+    for _ in range(MAX_PASSES):
+        text, what = fix_pass(text)
+        if what is None:
+            return text, repairs
+        repairs.append(what)
+    repairs.append(f"stopped after {MAX_PASSES} passes — repair did not settle")
+    return text, repairs
+
+
+SCAFFOLD = """## N. State the rule as one sentence in the imperative.
+
+{prefix}**Binds:** {binds}
+{prefix}**Tier:** {tier}
+{prefix}**Check:** {check}
+{prefix}**Escape:** {escape}
+"""
+
+
+TIER_LABEL = {"T0": "advisory", "T1": "detected", "T2": "blocked", "T3": "reconciled"}
+
+
+def scaffold(tier: str) -> str:
+    """A correct empty block. T0 comes pre-filled, because 'no mechanism' is a
+    legitimate answer and making the honest tier the cheapest one to write is
+    the point."""
+    hint = dict(FIELD_HINT)
+    if tier == "T0":
+        hint["Check"] = "none"
+        hint["Escape"] = "n/a"
+    return SCAFFOLD.format(
+        prefix="> ",
+        binds=hint["Binds"],
+        tier=f"{tier} ({TIER_LABEL[tier]})",
+        check=hint["Check"],
+        escape=hint["Escape"],
+    )
+
+
+def contract_files() -> list[Path]:
+    seen: dict[Path, None] = {}
+    for pattern in CONTRACT_GLOBS:
+        for p in ROOT.glob(pattern):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(ROOT).as_posix()
+            if any(part in SKIP_DIRS for part in p.relative_to(ROOT).parts):
+                continue
+            if any(rel.startswith(s) for s in SKIP_PARTS):
+                continue
+            seen[p] = None
+    return sorted(seen)
+
+
+def is_contract(path: Path) -> bool:
+    try:
+        rel = path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return False  # outside the repo: not our contract corpus
+    if any(rel.startswith(s) for s in SKIP_PARTS):
+        return False
+    name = path.name
+    return (
+        name in {"AGENTS.md", "HARNESS.md", "EPISTEMIC_STANCE.md",
+                 "DECISIONS.md", "decisions.md", "SKILL.md"}
+        or rel.startswith(".context/workflows/")
+        or (rel.startswith("agents/") and name.endswith(".md"))
+    )
+
+
+# -------------------------------------------------------------------- reports
+
+
+def report(path: Path, findings: list[Finding], text: str, quiet: bool) -> bool:
+    """Print one file's result. Returns True if it has blocking findings."""
+    rel = rel_to_root(path, ROOT)
+    blocking = [f for f in findings if f.blocking] if adopted(text) else []
+
+    if not findings:
+        if not quiet:
+            state = "adopted" if adopted(text) else "no normative clauses"
+            print(f"  OK      {rel}  ({state})")
+        return False
+
+    if quiet and not blocking:
+        return False
+
+    print(f"\n  {'FAIL' if blocking else 'note'}    {rel}"
+          f"{'' if adopted(text) else '  [not adopted — reported, not blocking]'}")
+    for f in findings:
+        mark = "!" if (f.blocking and adopted(text)) else "-"
+        where = f":{f.line}" if f.line else ""
+        print(f"    {mark} {f.code}{where}  {f.message}")
+        if f.detail:
+            for dl in f.detail.splitlines():
+                print(f"        {dl.strip() if not dl.startswith('        ') else dl}")
+    return bool(blocking)
+
+
+def changed_files() -> list[Path]:
+    """Staged contract files, for pre-commit use."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "diff", "--cached", "--name-only",
+             "--diff-filter=ACM"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout
+    except Exception as exc:  # noqa: BLE001 — a checker must not report clean
+        raise Unreadable(f"git diff --cached failed: {exc}") from exc
+    return [ROOT / line for line in out.splitlines() if line.strip()]
+
+
+# ------------------------------------------------------- grammar drift control
+
+
+# The patterns that must stay identical to bin/contract-audit's. RULE_BLOCK and
+# the rest are shared vocabulary; a divergence means lint and audit disagree
+# about what a rule *is*.
+GRAMMAR = {
+    "NORMATIVE": NORMATIVE,
+    "MECHANISM": MECHANISM,
+    "TIER_RE": TIER_RE,
+    "HARD_CLAUSE": HARD_CLAUSE,
+    "RULE_BLOCK": RULE_BLOCK,
+}
+
+
+def audit_patterns() -> dict[str, str]:
+    """Extract `NAME = re.compile("...")` pattern literals from bin/contract-audit.
+
+    Uses the AST rather than a regex over source, because the audit writes its
+    patterns as implicitly-concatenated string literals across many lines and
+    any textual comparison would be measuring formatting, not grammar.
+    """
+    import ast
+
+    audit = ROOT / "bin" / "contract-audit"
+    try:
+        tree = ast.parse(audit.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — surfaced as exit 2, never as clean
+        raise Unreadable(f"{audit}: {exc}") from exc
+
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in GRAMMAR:
+            continue
+        call = node.value
+        if not (isinstance(call, ast.Call) and call.args):
+            continue
+        try:
+            found[target.id] = ast.literal_eval(call.args[0])
+        except Exception:  # noqa: BLE001 — a non-literal pattern is a mismatch
+            continue
+    return found
+
+
+def grammar_drift() -> list[tuple[str, str]]:
+    """Names where this file and the audit disagree, with why. Empty == in sync."""
+    theirs = audit_patterns()
+    out: list[tuple[str, str]] = []
+    for name, rx in GRAMMAR.items():
+        if name not in theirs:
+            out.append((name, "not found in bin/contract-audit"))
+        elif theirs[name] != rx.pattern:
+            out.append((name, "pattern differs"))
+    return out
+
+
+# ------------------------------------------------------------------- selftest
+
+
+SELFTEST_GOOD = """## 1. Raw captures enter through ingest.
+
+> **Binds:** any client writing a raw file
+> **Tier:** T2 (blocked)
+> **Check:** `bin/knowledge-write-guard` (PreToolUse hook on Write)
+> **Escape:** write to `00_inbox/` and run `bin/ingest-minion run --apply`
+"""
+
+# A *real* blank line, not a '>'-prefixed one. `RULE_BLOCK`'s terminator is
+# `^\s*$`, so a line containing '>' keeps the block open and is harmless; only
+# a genuinely empty line severs it. Getting this fixture wrong the first time is
+# what proved the check needed to distinguish L1 from L2 at all.
+SELFTEST_TRUNCATED = """## 1. Raw captures enter through ingest.
+
+> **Binds:** any client writing a raw file
+> **Tier:** T2 (blocked)
+
+> **Check:** `bin/knowledge-write-guard`
+> **Escape:** write to `00_inbox/`
+"""
+
+SELFTEST_CONTINUED = """## 1. Raw captures enter through ingest.
+
+> **Binds:** any client writing a raw file
+> **Tier:** T2 (blocked)
+>
+> **Check:** `bin/knowledge-write-guard`
+> **Escape:** write to `00_inbox/`
+"""
+
+SELFTEST_NO_ESCAPE = """## 1. Raw captures enter through ingest.
+
+> **Binds:** any client writing a raw file
+> **Tier:** T2 (blocked)
+> **Check:** `bin/knowledge-write-guard`
+"""
+
+SELFTEST_FAKE_T2 = """## 1. Raw captures enter through ingest.
+
+> **Binds:** any client
+> **Tier:** T2 (blocked)
+> **Check:** none
+> **Escape:** ask an operator
+"""
+
+SELFTEST_HONEST_T0 = """## 1. Do not tidy this folder.
+
+> **Binds:** any agent
+> **Tier:** T0 (advisory)
+> **Check:** none
+> **Escape:** n/a
+"""
+
+
+SELFTEST_BOLD_TIER = """## 1. Do not tidy this folder.
+
+> **Binds:** any agent
+> **Tier:** **T0 (advisory). Nothing checks this.**
+> **Check:** none
+> **Escape:** n/a
+"""
+
+SELFTEST_SCAFFOLDED = """## 1. Raw captures enter through ingest.
+
+> **Binds:** any client writing a raw file
+> **Tier:** T2 (blocked)
+> **Check:** `bin/knowledge-write-guard`
+> **Escape:** TODO — the named, cheap, non-penalized way to comply
+"""
+
+
+def selftest() -> int:
+    """Prove the lint still fires on the shapes it exists to catch.
+
+    A checker that passes everything is indistinguishable from a checker that is
+    broken, so each case asserts a specific code fires — and the honest-T0 and
+    good cases assert that nothing fires, which is the negative control.
+    """
+    cases = [
+        ("clean block fires nothing", SELFTEST_GOOD, None),
+        ("blank line truncates a block", SELFTEST_TRUNCATED, "L1"),
+        ("'>' continuation line is not a truncation", SELFTEST_CONTINUED, None),
+        ("T2 without an Escape", SELFTEST_NO_ESCAPE, "L5"),
+        ("T2 claiming 'Check: none'", SELFTEST_FAKE_T2, "L3"),
+        ("honest T0 fires nothing", SELFTEST_HONEST_T0, None),
+        ("a bolded tier value reads as untiered", SELFTEST_BOLD_TIER, "L6"),
+        ("an unfilled scaffold blocks", SELFTEST_SCAFFOLDED, "L9"),
+    ]
+    failed = 0
+    print("contract-lint selftest")
+    for name, text, expect in cases:
+        codes = {f.code for f in lint_text(text)}
+        ok = (expect in codes) if expect else not codes
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}"
+              f"{'' if ok else f'  (expected {expect or "no findings"}, got {sorted(codes) or "none"})'}")
+        failed += 0 if ok else 1
+
+    # Repair controls.
+    #
+    # `--fix` writes to contract files, so each repair asserts two things: that
+    # it closes the finding it claims to, and that it does not close one it must
+    # not. The last case is the one that matters — a repair that silenced L5 by
+    # writing a plausible Escape would be this tool defeating its own purpose.
+    repairs = [
+        ("unbolding a tier clears L6", SELFTEST_BOLD_TIER, "L6", None),
+        ("reopening a block clears L1", SELFTEST_TRUNCATED, "L1", None),
+        ("scaffolding a missing Escape clears L5", SELFTEST_NO_ESCAPE, "L5", "L9"),
+    ]
+    for name, text, closes, leaves in repairs:
+        before = {f.code for f in lint_text(text)}
+        fixed, what = fix_text(text)
+        after = {f.code for f in lint_text(fixed)}
+        settled, _ = fix_pass(fixed)
+        ok = (closes in before and closes not in after and bool(what)
+              and (leaves is None or leaves in after)
+              and settled == fixed)
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}"
+              f"{'' if ok else f'  (before {sorted(before)}, after {sorted(after)})'}")
+        failed += 0 if ok else 1
+
+    # The repair boundary, stated as a control: a scaffolded rule must never
+    # reach zero findings on its own. Cheap to start, impossible to finish
+    # dishonestly — that property is the reason --fix is allowed to write at all.
+    fixed, _ = fix_text(SELFTEST_NO_ESCAPE)
+    honest = bool([f for f in lint_text(fixed) if f.blocking])
+    print(f"  {'PASS' if honest else 'FAIL'}  a scaffold cannot pass as a finished rule")
+    failed += 0 if honest else 1
+
+    # Negative control on the grammar itself.
+    #
+    # Lint and audit must agree on what adoption means, or the number nobody
+    # trusts is the one that gets ignored. Compared by extracting the audit's
+    # own `X = re.compile(...)` literals from its AST, not by substring search:
+    # a fuzzy match here would pass while the two drifted, which is the exact
+    # class of false-green this whole program exists to kill.
+    audit = ROOT / "bin" / "contract-audit"
+    if not audit.is_file():
+        print(
+            "  SKIP  grammar matches bin/contract-audit "
+            "(optional/deferred; not in this tree)"
+        )
+    else:
+        try:
+            mismatch = grammar_drift()
+        except Unreadable as exc:
+            print(f"  FAIL  grammar matches bin/contract-audit (unreadable: {exc})")
+            failed += 1
+        else:
+            ok = not mismatch
+            print(f"  {'PASS' if ok else 'FAIL'}  grammar matches bin/contract-audit "
+                  f"({'in sync, ' + str(len(GRAMMAR)) + ' patterns' if ok else 'DRIFTED'})")
+            for name, why in mismatch:
+                print(f"        {name}: {why}")
+            failed += 0 if ok else 1
+
+    total = len(cases) + len(repairs) + 2  # + scaffold-honesty + grammar drift
+    print(f"\n  {total - failed}/{total} passed")
+    return 1 if failed else 0
+
+
+# ----------------------------------------------------------------------- main
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Check contract files against the Binds/Tier/Check/Escape format.",
+    )
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--file", action="append", metavar="PATH",
+                   help="lint one contract file (repeatable)")
+    g.add_argument("--all", action="store_true",
+                   help="lint the whole contract corpus and report adoption")
+    g.add_argument("--changed", action="store_true",
+                   help="lint staged contract files (pre-commit mode)")
+    g.add_argument("--selftest", action="store_true",
+                   help="prove the lint still fires on known-bad shapes")
+    g.add_argument("--scaffold", metavar="TIER", nargs="?", const="T2",
+                   choices=("T0", "T1", "T2", "T3"),
+                   help="print a correct empty rule block to paste (default T2)")
+    ap.add_argument("--fix", action="store_true",
+                    help="repair what can be repaired without inventing content, "
+                         "and scaffold the rest as TODO (blocks on L9 until filled). "
+                         "Use with --file or --changed.")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 on any finding, including in unadopted files")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print only files with blocking findings")
+    args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    if args.scaffold:
+        print(scaffold(args.scaffold), end="")
+        return 0
+
+    if args.fix and args.all:
+        # 153 files, 228 findings. A corpus-wide rewrite is a decision, not a
+        # lint invocation, and it would bury the one edit worth reviewing.
+        print("contract-lint: --fix needs --file or --changed, not --all",
+              file=sys.stderr)
+        return 2
+
+    if args.all:
+        paths = contract_files()
+    elif args.changed:
+        paths = [p for p in changed_files() if p.exists() and is_contract(p)]
+        if not paths:
+            return 0
+    else:
+        paths = []
+        for raw in args.file:
+            p = Path(raw)
+            p = p if p.is_absolute() else (Path.cwd() / p)
+            if not p.exists():
+                print(f"contract-lint: no such file: {raw}", file=sys.stderr)
+                return 2
+            paths.append(p.resolve())
+
+    blocking = 0
+    findings_total = 0
+    adopted_n = 0
+
+    for p in paths:
+        text = read(p)
+        if args.fix:
+            fixed, repairs = fix_text(text)
+            if repairs:
+                p.write_text(fixed, encoding="utf-8")
+                print(f"\n  FIXED   {rel_to_root(p, ROOT)}")
+                for r in repairs:
+                    print(f"    + {r}")
+                text = fixed
+        if adopted(text):
+            adopted_n += 1
+        fs = lint_text(text)
+        findings_total += len(fs)
+        if report(p, fs, text, args.quiet):
+            blocking += 1
+        if args.strict and fs:
+            blocking += 0 if adopted(text) else 1
+
+    if args.all:
+        pct = 100 * adopted_n / max(len(paths), 1)
+        print(f"\n  {adopted_n}/{len(paths)} contract file(s) declare a tier "
+              f"({pct:.0f}% adopted) · {findings_total} finding(s) · "
+              f"{blocking} file(s) blocking")
+        print("  Unadopted files are reported, never blocking. Adopted files "
+              "may not regress.")
+    elif not args.quiet and not findings_total:
+        print(f"  {len(paths)} file(s) checked, no findings.")
+
+    return 1 if blocking else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Unreadable as exc:
+        print(f"contract-lint: could not check — {exc}", file=sys.stderr)
+        print("This is exit 2, not a pass.", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(2)
+    except Exception as exc:  # noqa: BLE001 — fail closed, never silently clean
+        print(f"contract-lint: unexpected failure — {exc!r}", file=sys.stderr)
+        print("This is exit 2, not a pass.", file=sys.stderr)
+        sys.exit(2)

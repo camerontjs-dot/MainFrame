@@ -1,6 +1,7 @@
 ---
 name: mindgraph-retrieval
-description: Use when an agent needs to retrieve durable knowledge or active project context from MainFrame's local graph-augmented search engine (MindGraph). It provides instructions on CLI/MCP commands and prevents hallucination of non-existent search verbs. Triggers on: "query mindgraph", "search mindgraph", "mindgraph query", "retrieve knowledge", "find in knowledge base", "query knowledge", "query projects", "mindgraph-refresh", "mindgraph doctor", "mindgraph status".
+description: >-
+  Use when an agent needs to retrieve durable knowledge or active project context from MainFrame's local graph-augmented search engine (MindGraph). It provides instructions on CLI/MCP commands and prevents hallucination of non-existent search verbs. Triggers on: "query mindgraph", "search mindgraph", "mindgraph query", "retrieve knowledge", "find in knowledge base", "query knowledge", "query projects", "mindgraph-refresh", "mindgraph doctor", "mindgraph status".
 status: active
 ---
 

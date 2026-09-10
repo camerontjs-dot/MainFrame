@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load session context files in a fixed order for progressive disclosure.
+"""List session context and applicable contracts for progressive disclosure.
 
 Unit 2.2: fail closed when a selected project does not resolve.
 MPE-024: prefer structured focus (20_live/focus/current.yaml); STATE.md is
@@ -9,6 +9,7 @@ narrative fallback and must not invent compound slugs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -23,8 +24,10 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from focus_authority import load_focus  # noqa: E402
+from lifecycle_identity import IdentityError, resolve_record  # noqa: E402
 
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BATCH_BYTES = 8000
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,8 @@ class ContextEntry:
     exists: bool
     size: int | None
     note: str
+    required: bool = False
+    section: str | None = None
 
 
 @dataclass
@@ -49,18 +54,54 @@ class SessionOpenResult:
     focus_path: str | None = None
     focus_errors: list[str] = field(default_factory=list)
     focus_warnings: list[str] = field(default_factory=list)
+    task_path: str | None = None
+    path_error: str | None = None
+    intent: str = "arrival"
+    intent_error: str | None = None
+    task: str | None = None
+    focused_project: str | None = None
+    plan: str | None = None
+    plan_status: str = "not_requested"
+    plan_error: str | None = None
+    plan_candidates: list[dict] = field(default_factory=list)
+    read_batches: list[dict] = field(default_factory=list)
+    read_errors: list[str] = field(default_factory=list)
+
+    @property
+    def missing_required(self) -> list[str]:
+        return [e.path for e in self.entries if e.required and not e.exists]
 
     @property
     def ok(self) -> bool:
-        required = {"AGENTS.md", "STATE.md"}
-        found = {e.path for e in self.entries if e.exists}
-        if not required.issubset(found):
+        if self.missing_required:
             return False
-        if self.project_error:
+        if self.project_error or self.path_error or self.intent_error or self.plan_error or self.read_errors:
             return False
         if self.project is not None and self.project_exists is False:
             return False
         return True
+
+    @property
+    def context_status(self) -> str:
+        return "unread" if self.ok else "incomplete"
+
+    @property
+    def stop_when(self) -> list[str]:
+        common = [
+            "Read every required batch completely; recover any truncated output before relying on it.",
+            "State the requested task, governing sources, applicable constraints, relevant unknowns, and next useful step.",
+            "Report incomplete context before dependent claims or action; file presence does not establish reading or readiness.",
+        ]
+        if self.intent == "arrival":
+            return common + [
+                "Describe the lifecycle map and recorded focus with its freshness caveat, then stop at workspace orientation.",
+                "Before project-specific diagnosis or recommendations, switch to resume with that project.",
+            ]
+        return common + [
+            "Verify the relevant plan, coordination, Git/worktrees, candidate/experiment identity and direct receipts under the reconstruction workflow.",
+            "Use existing valid receipts for status questions; rerun checks only for changed source, missing evidence, or an explicit test request.",
+            "After reconstruction, answer the request; load an action workflow only when that action is authorized.",
+        ]
 
 
 def is_valid_project_slug(label: str) -> bool:
@@ -91,33 +132,171 @@ def detect_project_from_state(state_path: Path) -> str | None:
     return None
 
 
-def find_active_phase_plan(plans_dir: Path) -> Path | None:
-    if not plans_dir.is_dir():
+def entry(order: int, rel: str, root: Path, note: str,
+          *, required: bool = False, section: str | None = None) -> ContextEntry:
+    full = root / rel
+    exists = full.is_file()
+    size = full.stat().st_size if exists else None
+    return ContextEntry(order=order, path=rel, exists=exists, size=size,
+                        note=note, required=required, section=section)
+
+
+def _entry_bytes(root: Path, item: ContextEntry) -> tuple[bytes, str]:
+    path = root / item.path
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("context file resolves outside MainFrame")
+    data = path.read_bytes()
+    source_hash = hashlib.sha256(data).hexdigest()
+    data.decode("utf-8")  # A non-text prerequisite must not become a partial read.
+    if item.section == "@latest":
+        lines = data.splitlines(keepends=True)
+        headings = [i for i, line in enumerate(lines) if line.startswith(b"## ")]
+        if len(headings) > 1:
+            return b"".join(lines[:headings[1]]), source_hash
+    elif item.section:
+        lines = data.splitlines(keepends=True)
+        marker = ("## " + item.section).encode()
+        start = next((i for i, line in enumerate(lines) if line.strip() == marker), None)
+        if start is not None:
+            end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith(b"## ")), len(lines))
+            return b"".join(lines[start:end]), source_hash
+        # Older contracts are read in full rather than silently omitted.
+    return data, source_hash
+
+
+def build_read_batches(result: SessionOpenResult, root: Path) -> None:
+    for item in result.entries:
+        if not item.exists:
+            continue
+        try:
+            data, source_hash = _entry_bytes(root, item)
+            start = 0
+            while start < len(data):
+                end = min(start + BATCH_BYTES, len(data))
+                if end < len(data):
+                    newline = data.rfind(b"\n", start, end)
+                    if newline >= start:
+                        end = newline + 1
+                    else:
+                        while end > start and data[end] & 0xC0 == 0x80:
+                            end -= 1
+                result.read_batches.append({
+                    "id": len(result.read_batches) + 1, "path": item.path,
+                    "required": item.required, "section": item.section,
+                    "start_byte": start, "end_byte": end, "bytes": end - start,
+                    "source_sha256": source_hash,
+                })
+                start = end
+        except (OSError, ValueError, UnicodeError) as exc:
+            result.read_errors.append(f"{item.path}: {exc}")
+
+
+def read_batch(result: SessionOpenResult, root: Path, batch_id: int) -> dict:
+    if batch_id < 1 or batch_id > len(result.read_batches):
+        raise ValueError(f"batch must be between 1 and {len(result.read_batches)}")
+    batch = result.read_batches[batch_id - 1]
+    item = next(e for e in result.entries if e.path == batch["path"])
+    data, source_hash = _entry_bytes(root, item)
+    if source_hash != batch["source_sha256"]:
+        raise ValueError("source changed after routing; reopen the context list")
+    return {**batch, "content": data[batch["start_byte"]:batch["end_byte"]].decode("utf-8")}
+
+
+def select_plan(result: SessionOpenResult, root: Path, project_dir: Path,
+                explicit_plan: str | None) -> Path | None:
+    plans_dir = project_dir / "plans"
+    if plans_dir.exists() and (not plans_dir.is_dir() or not plans_dir.resolve().is_relative_to(project_dir.resolve())):
+        result.plan_error = "plans/ must be a directory inside the selected project"
+        result.plan_status = "invalid"
         return None
-    for plan in sorted(plans_dir.glob("*.md")):
-        text = plan.read_text(encoding="utf-8")
-        if not text.startswith("---\n"):
+    if explicit_plan:
+        candidate = (root / explicit_plan).resolve()
+        if not candidate.is_relative_to(plans_dir.resolve()) or not candidate.is_file():
+            result.plan_error = "--plan must be an existing file inside the selected project's plans/"
+            result.plan_status = "invalid"
+            return None
+        result.plan_status = "explicit"
+        return candidate
+    if not plans_dir.is_dir():
+        result.plan_status = "none"
+        return None
+    tokens = set(re.findall(r"[a-z0-9]+", (result.task or "").lower())) - {
+        "the", "a", "an", "and", "or", "for", "to", "of", "in", "work", "project", "mainframe", "process", "eval",
+    }
+    candidates = []
+    for plan in sorted(plans_dir.rglob("*.md")):
+        if not plan.is_file() or not plan.resolve().is_relative_to(plans_dir.resolve()):
             continue
-        end = text.find("\n---", 4)
-        if end == -1:
+        try:
+            with plan.open(encoding="utf-8", errors="replace") as handle:
+                text = handle.read(4096)
+        except OSError as exc:
+            result.plan_error = f"cannot inspect plan metadata: {plan.relative_to(root)}: {exc}"
+            result.plan_status = "incomplete"
+            return None
+        fm = text.split("---", 2)[1] if text.startswith("---\n") and text.count("---") >= 2 else ""
+        if not re.search(r"^status:\s*[\"']?active[\"']?\s*$", fm, re.MULTILINE):
             continue
-        for fm_line in text[4:end].splitlines():
-            if ":" not in fm_line:
-                continue
-            key, value = fm_line.split(":", 1)
-            if key.strip() == "status" and value.strip().strip('"').strip("'") == "active":
-                return plan
+        title_match = re.search(r"^title:\s*(.+)$", fm, re.MULTILINE)
+        title = title_match.group(1).strip().strip("\"'") if title_match else plan.stem
+        terms = set(re.findall(r"[a-z0-9]+", (plan.stem + " " + title).lower()))
+        candidates.append({"path": str(plan.relative_to(root)), "title": title, "matched_terms": sorted(tokens & terms)})
+    candidates.sort(key=lambda p: (-len(p["matched_terms"]), p["path"]))
+    result.plan_candidates = candidates
+    if not candidates:
+        result.plan_status = "none"
+    elif tokens and candidates[0]["matched_terms"] and (len(candidates) == 1 or len(candidates[0]["matched_terms"]) > len(candidates[1]["matched_terms"])):
+        result.plan_status = "task_match_candidate"
+        return root / candidates[0]["path"]
+    else:
+        result.plan_status = "ambiguous" if tokens else "task_needed"
     return None
 
 
-def entry(order: int, rel: str, root: Path, note: str) -> ContextEntry:
-    full = root / rel
-    exists = full.exists()
-    size = full.stat().st_size if exists else None
-    return ContextEntry(order=order, path=rel, exists=exists, size=size, note=note)
+def _project_contracts(result: SessionOpenResult, root: Path,
+                       project_dir: Path, order: int) -> int:
+    """Inspect only the selected project's ancestors, never sibling trees."""
+    order += 1
+    lifecycle_contract = (
+        "40_operations/AGENTS.md"
+        if project_dir.parent.name == "40_operations"
+        else "30_projects/AGENTS.md"
+    )
+    result.entries.append(entry(order, lifecycle_contract, root,
+                                "project lifecycle contract", required=True))
+    directories = [project_dir]
+    if result.task_path is not None and result.path_error is None:
+        target = (root / result.task_path).resolve()
+        project_root = project_dir.resolve()
+        if not target.is_relative_to(project_root):
+            result.path_error = "--path must stay inside the selected project"
+        elif not target.exists():
+            result.path_error = "--path does not exist; use an existing parent directory"
+        else:
+            directory = target if target.is_dir() else target.parent
+            result.task_path = str(target.relative_to(root))
+            current = project_dir
+            for part in directory.relative_to(project_root).parts:
+                current = current / part
+                directories.append(current)
+
+    for directory in directories:
+        contract = directory / "AGENTS.md"
+        # A broken symlink or a directory named AGENTS.md must remain visible.
+        if contract.exists() or contract.is_symlink():
+            order += 1
+            result.entries.append(entry(order, str(contract.relative_to(root)),
+                                        root, "local contract", required=True))
+    order += 1
+    result.entries.append(entry(
+        order, ".context/workflows/project-resume-and-candidate-lifecycle.md",
+        root, "project reconstruction before planning or acting", required=True,
+    ))
+    return order
 
 
-def _apply_project(result: SessionOpenResult, root: Path, order: int) -> int:
+def _apply_project(result: SessionOpenResult, root: Path, order: int,
+                   explicit_plan: str | None = None) -> int:
     if not result.project:
         return order
     raw = result.project.strip()
@@ -125,7 +304,7 @@ def _apply_project(result: SessionOpenResult, root: Path, order: int) -> int:
         result.project_error = (
             "compound or invalid project label cannot resolve to a project slug; "
             "set structured focus primary.project or STATE Active Project to a "
-            "single 30_projects/<slug> name"
+            "single lifecycle slug"
         )
         result.degraded = True
         result.project_exists = False
@@ -142,10 +321,18 @@ def _apply_project(result: SessionOpenResult, root: Path, order: int) -> int:
         return order
 
     slug = raw
-    project_dir = root / "30_projects" / slug
-    readme_rel = f"30_projects/{slug}/README.md"
+    try:
+        record = resolve_record(root, slug)
+    except IdentityError as exc:
+        result.project_error = f"selected lifecycle identity is unresolved: {exc}"
+        result.project_exists = False
+        result.degraded = True
+        return order
+    project_dir = record.path
+    order = _project_contracts(result, root, project_dir, order)
+    readme_rel = f"{record.relative_path(root)}/README.md"
     result.project_path = readme_rel
-    readme_entry = entry(order + 1, readme_rel, root, "active project")
+    readme_entry = entry(order + 1, readme_rel, root, "selected project", required=True)
     order += 1
     result.entries.append(readme_entry)
     result.project_exists = readme_entry.exists
@@ -153,27 +340,65 @@ def _apply_project(result: SessionOpenResult, root: Path, order: int) -> int:
         result.project_error = f"selected project path missing: {readme_rel}"
         result.degraded = True
     else:
-        plans_dir = project_dir / "plans"
-        phase_plan = find_active_phase_plan(plans_dir)
+        project_metadata = project_dir / "PROJECT.md"
+        if project_metadata.exists():
+            order += 1
+            result.entries.append(entry(
+                order, str(project_metadata.relative_to(root)), root,
+                "project coordination metadata (public-mirror convention)", required=True,
+            ))
+        for filename in ("methodology-approach.md", "log.md", "decisions.md"):
+            path = project_dir / filename
+            if path.exists() or path.is_symlink():
+                order += 1
+                result.entries.append(entry(order, str(path.relative_to(root)), root,
+                                            "project coordination; latest entry only for logs/decisions; follow relevant older evidence",
+                                            required=True, section="@latest" if filename in {"log.md", "decisions.md"} else None))
+        phase_plan = select_plan(result, root, project_dir, explicit_plan)
         if phase_plan:
             order += 1
             plan_rel = str(phase_plan.relative_to(root))
-            result.entries.append(entry(order, plan_rel, root, "active phase plan"))
+            result.plan = plan_rel
+            result.entries.append(entry(order, plan_rel, root,
+                                        "explicit plan" if explicit_plan else "task-matched plan candidate; verify against this task",
+                                        required=bool(explicit_plan)))
     return order
 
 
-def build_context(root: Path, project: str | None = None) -> SessionOpenResult:
+def build_context(root: Path, project: str | None = None,
+                  task_path: str | None = None, *, intent: str | None = None,
+                  task: str | None = None, plan: str | None = None) -> SessionOpenResult:
+    root = root.resolve()
     result = SessionOpenResult()
+    result.intent = intent or ("resume" if project else "arrival")
+    result.task = task
+    if result.intent not in {"arrival", "resume"}:
+        result.intent_error = "intent must be arrival or resume"
+    if result.intent == "arrival" and (project or task_path or plan):
+        result.intent_error = "arrival does not enter a project; use --intent resume with --project"
+    if plan and not project:
+        result.plan_error = "--plan requires an explicit --project"
+    result.task_path = task_path
+    if task_path is not None and project is None:
+        result.path_error = "--path requires an explicit --project"
     order = 0
 
     order += 1
-    result.entries.append(entry(order, "AGENTS.md", root, "root control file"))
+    result.entries.append(entry(order, "AGENTS.md", root, "root control file", required=True))
 
     order += 1
-    result.entries.append(entry(order, "STATE.md", root, "workspace state"))
+    result.entries.append(entry(order, "HARNESS.md", root, "harness contract", required=True,
+                                section="Session orientation" if result.intent == "arrival" else None))
+
+    order += 1
+    result.entries.append(entry(order, "STATE.md", root, "workspace narrative", required=True))
+
+    order += 1
+    result.entries.append(entry(order, ".context/workflows/session-open.md", root,
+                                "routing, complete reads and stopping point", required=True))
 
     # 1) Explicit flag wins
-    if project:
+    if project and result.intent == "resume":
         result.project = project
         result.project_source = "flag"
     else:
@@ -184,17 +409,18 @@ def build_context(root: Path, project: str | None = None) -> SessionOpenResult:
             result.focus_revision = focus.revision
             result.focus_errors = list(focus.errors)
             result.focus_warnings = list(focus.warnings)
+            result.focused_project = focus.primary_project
             order += 1
             result.entries.append(
                 entry(order, result.focus_path, root, "structured focus authority")
             )
-            if focus.ok and focus.primary_project:
+            if result.intent == "resume" and focus.ok and focus.primary_project:
                 result.project = focus.primary_project
                 result.project_source = "focus"
-            elif focus.errors:
+            if focus.errors:
                 result.degraded = True
         # 3) STATE narrative fallback (migration window)
-        if result.project is None:
+        if result.intent == "resume" and result.project is None:
             detected = detect_project_from_state(root / "STATE.md")
             if detected:
                 result.project = detected
@@ -205,12 +431,15 @@ def build_context(root: Path, project: str | None = None) -> SessionOpenResult:
                         "using STATE.md fallback; structured focus did not supply primary"
                     ]
 
-    order = _apply_project(result, root, order)
+    if result.intent == "resume":
+        order = _apply_project(result, root, order, explicit_plan=plan)
+        if not result.project:
+            result.project_error = "resume requires a project; use --project when focus cannot resolve one"
 
     order += 1
     result.entries.append(
         ContextEntry(order=order, path="(task-local)", exists=False, size=None,
-                     note="load task-local docs manually when ready")
+                     note="load relevant docs/code; use --project and --path for deeper contracts")
     )
 
     order += 1
@@ -219,11 +448,22 @@ def build_context(root: Path, project: str | None = None) -> SessionOpenResult:
                      note="evidence loading deferred")
     )
 
+    build_read_batches(result, root)
+    result.degraded = bool(result.degraded or result.focus_errors or result.focus_warnings or
+                           result.missing_required or result.path_error or
+                           result.project_error or result.intent_error or result.plan_error or result.read_errors)
     return result
 
 
 def print_result(result: SessionOpenResult, root: Path,
                  print_contents: bool = False) -> None:
+    print(f"intent: {result.intent}; context_status: {result.context_status} (reading is not verified)")
+    if result.intent_error:
+        print(f"intent_error: {result.intent_error}")
+    if result.plan_error:
+        print(f"plan_error: {result.plan_error}")
+    for error in result.read_errors:
+        print(f"read_error: {error}")
     if result.project:
         print(f"project: {result.project} (from {result.project_source})")
     else:
@@ -232,12 +472,18 @@ def print_result(result: SessionOpenResult, root: Path,
         print(f"focus_revision: {result.focus_revision}")
     if result.project_error:
         print(f"project_error: {result.project_error}")
+    if result.task_path:
+        print(f"task_path: {result.task_path}")
+    if result.path_error:
+        print(f"path_error: {result.path_error}")
+    if result.missing_required:
+        print(f"missing_required: {', '.join(result.missing_required)}")
     if result.focus_errors:
         print(f"focus_errors: {'; '.join(result.focus_errors)}")
     if result.focus_warnings:
         print(f"focus_warnings: {'; '.join(result.focus_warnings)}")
     if result.degraded:
-        print("status: DEGRADED — session context is not fully valid")
+        print("status: DEGRADED — inspect context errors and freshness warnings")
     print()
 
     for e in result.entries:
@@ -249,48 +495,145 @@ def print_result(result: SessionOpenResult, root: Path,
         else:
             print(f"  {e.order}. {'[MISSING]':>12} {e.path}  — {e.note}")
 
-    if print_contents:
-        print()
-        for e in result.entries:
-            if not e.exists or e.path.startswith("("):
-                continue
-            full = root / e.path
-            print(f"--- BEGIN {e.path} ---")
-            print(full.read_text(encoding="utf-8"), end="")
-            print(f"--- END {e.path} ---")
-            print()
+    print(f"\nplan_status: {result.plan_status}; selected: {result.plan or 'none'}")
+    for candidate in result.plan_candidates:
+        print(f"  plan candidate: {candidate['path']} — {candidate['title']}")
+    print(f"\nread_batches: {len(result.read_batches)}; at most {BATCH_BYTES} content bytes each")
+    for batch in result.read_batches:
+        print(f"  {batch['id']}. {batch['path']} [{batch['start_byte']}:{batch['end_byte']}] required={batch['required']}")
+    for condition in result.stop_when:
+        print(f"  stop when: {condition}")
+    if print_contents and result.read_batches:
+        batch = read_batch(result, root, 1)
+        print(f"\n--- BEGIN {batch['path']} ---")
+        print(batch['content'], end="")
+        print(f"\n--- END {batch['path']} ---")
+        print("Only batch 1 printed. Read the other required batches separately with --read-batch N.")
+
+
+def scheduler_status(root: Path) -> tuple[bool | None, str]:
+    try:
+        proc = subprocess.run([str(root / "bin/eval-schedule"), "check"], cwd=root,
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"unavailable: {type(exc).__name__}"
+    lines = (proc.stdout or proc.stderr).strip().splitlines()
+    return proc.returncode == 0, lines[0] if lines else "unknown"
+
+
+def brain_status(root: Path) -> dict[str, Any]:
+    """Retrieve fast (<2ms, 0 GPU) Brain executive briefing from local SQLite state."""
+    try:
+        sys_path_brain = str(root / "30_projects/mainframe-brain")
+        if sys_path_brain not in sys.path:
+            sys.path.insert(0, sys_path_brain)
+        from engine import storage
+        storage.seed_initial_state()
+        attention = storage.get_attention()
+        cards = storage.get_action_cards(status="pending")
+        lessons = storage.get_lessons(limit=1)
+        p0 = next((a for a in attention if a["priority"] == "P0"), None)
+        return {
+            "available": True,
+            "p0_project": p0["project"] if p0 else None,
+            "p0_reason": p0["reason"] if p0 else None,
+            "pending_action": cards[0]["action"] if cards else None,
+            "recent_lesson": f"[{lessons[0]['domain']}] {lessons[0]['rule']}" if lessons else None,
+        }
+    except Exception:
+        return {"available": False}
+
+
+def record_session_arrival(root: Path, result: SessionOpenResult) -> None:
+    """Ingest session arrival event into Brain sensory afference (<2ms, fails open)."""
+    try:
+        sys_path_brain = str(root / "30_projects/mainframe-brain")
+        if sys_path_brain not in sys.path:
+            sys.path.insert(0, sys_path_brain)
+        from engine import storage
+        storage.add_event(
+            source="session",
+            summary=f"Session arrival: {result.intent} (project={result.project or 'none'})",
+            details=f"task={result.task or 'none'}, ok={result.ok}",
+        )
+    except Exception:
+        pass
 
 
 def main() -> int:
+
     parser = argparse.ArgumentParser(
-        description="Load session context files in fixed order."
+        description="List required context paths; does not establish project readiness."
     )
-    parser.add_argument("--project", help="project slug under 30_projects/")
+    parser.add_argument("--project", help="project slug under 30_projects/ or 40_operations/")
+    parser.add_argument("--intent", choices=("arrival", "resume"),
+                        help="default: arrival; --project implies resume")
+    parser.add_argument("--task", help="brief task phrase used to nominate a relevant active plan")
+    parser.add_argument("--plan", help="explicit existing plan path inside the selected project's plans/")
+    parser.add_argument("--path", help="existing path inside --project; relative to MainFrame or absolute")
     parser.add_argument("--print-contents", action="store_true",
-                        help="print file contents after the checklist")
+                        help="print only the first bounded content batch after the checklist")
+    parser.add_argument("--read-batch", type=int, help="print one numbered content batch; repeat the same routing arguments")
+    parser.add_argument("--expect-hash", help="with --read-batch, reject a changed source SHA-256 from the earlier listing")
     parser.add_argument("--json", action="store_true",
                         help="emit structured JSON instead of human text")
     args = parser.parse_args()
+    if args.path is not None and args.project is None:
+        parser.error("--path requires --project")
+    if args.expect_hash and args.read_batch is None:
+        parser.error("--expect-hash requires --read-batch")
+    if args.read_batch is not None and args.print_contents:
+        parser.error("choose --read-batch or --print-contents")
 
-    result = build_context(ROOT, project=args.project)
+    result = build_context(ROOT, project=args.project, task_path=args.path,
+                           intent=args.intent, task=args.task, plan=args.plan)
+    record_session_arrival(ROOT, result)
 
-    eval_proc = subprocess.run(
-        [str(ROOT / "bin" / "eval-schedule"), "check"],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
-    eval_ok = eval_proc.returncode == 0
-    eval_summary = eval_proc.stdout.strip().splitlines()[0] if eval_proc.stdout.strip() else "unknown"
+    if args.read_batch is not None:
+        try:
+            batch = read_batch(result, ROOT, args.read_batch)
+            if args.expect_hash and args.expect_hash != batch["source_sha256"]:
+                raise ValueError("source hash differs from the earlier listing; reopen context")
+        except (OSError, ValueError, UnicodeError) as exc:
+            print(json.dumps({"ok": False, "context_status": "incomplete", "read_error": str(exc)}))
+            return 1
+        if args.json:
+            print(json.dumps({"ok": result.ok, "context_status": result.context_status,
+                              "reading_verified": False, "batch": batch}, ensure_ascii=False))
+        else:
+            print(f"batch {batch['id']}: {batch['path']}; source_sha256={batch['source_sha256']}")
+            print(batch["content"], end="")
+            print("\nReading is not verified; complete every required batch and the task's stopping conditions.")
+        return 0 if result.ok else 1
+
+    eval_ok, eval_summary = scheduler_status(ROOT)
+    b_stat = brain_status(ROOT)
 
     if args.json:
         out = {
             "ok": result.ok,
+            "intent": result.intent,
+            "intent_error": result.intent_error,
+            "task": result.task,
+            "context_status": result.context_status,
+            "reading_verified": False,
+            "stop_when": result.stop_when,
+            "focused_project": result.focused_project,
+            "plan": result.plan,
+            "plan_status": result.plan_status,
+            "plan_error": result.plan_error,
+            "plan_candidates": result.plan_candidates,
+            "read_batches": result.read_batches,
+            "read_errors": result.read_errors,
+            "batch_content_bytes_max": BATCH_BYTES,
             "project": result.project,
             "project_source": result.project_source,
             "project_path": result.project_path,
             "project_exists": result.project_exists,
             "project_error": result.project_error,
+            "task_path": result.task_path,
+            "path_error": result.path_error,
+            "missing_required": result.missing_required,
             "degraded": result.degraded,
             "focus_revision": result.focus_revision,
             "focus_path": result.focus_path,
@@ -299,12 +642,19 @@ def main() -> int:
             "entries": [asdict(e) for e in result.entries],
             "eval_schedule_ok": eval_ok,
             "eval_schedule_summary": eval_summary,
+            "brain": b_stat,
         }
         json.dump(out, sys.stdout, indent=2)
         print()
     else:
         print_result(result, ROOT, print_contents=args.print_contents)
         print()
+        if b_stat.get("available") and b_stat.get("p0_project"):
+            print(f"brain: [P0] {b_stat['p0_project']} — {b_stat['p0_reason']}")
+            if b_stat.get("pending_action"):
+                print(f"brain-action: pending — {b_stat['pending_action'][:140]}")
+            if b_stat.get("recent_lesson"):
+                print(f"brain-lesson: {b_stat['recent_lesson'][:140]}")
         if eval_ok:
             print(f"eval-schedule: {eval_summary}")
             action_card = ROOT / "20_live" / "eval-registry" / "last-eval-action.md"
@@ -332,7 +682,8 @@ def main() -> int:
                 if primary:
                     print(f"eval-action: {primary[:160]}")
         else:
-            print("eval-schedule: ATTENTION — run `bin/eval-schedule check` and read 20_live/eval-registry/OPERATOR.md")
+            print(f"eval-schedule: ATTENTION — {eval_summary}; affects scheduled-evaluation health, not permission for an unrelated task")
+
 
         if not result.ok:
             print("session-open: FAIL — context is not valid (see project_error / missing entries)")

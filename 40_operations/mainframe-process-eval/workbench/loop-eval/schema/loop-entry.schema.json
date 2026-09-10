@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mainframe-loop-entry",
+  "title": "MainFrame loop catalogue entry",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "tier",
+    "kind",
+    "question",
+    "unit_of_work",
+    "checklist",
+    "status",
+    "last_reviewed"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^(loop|wf|comp|cand)-[a-z0-9]+([a-z0-9-]*[a-z0-9])?$"
+    },
+    "title": { "type": "string", "minLength": 3 },
+    "tier": {
+      "type": "string",
+      "enum": ["well_defined", "underspecified", "candidate"]
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["loop", "workflow", "composition", "skill_process"]
+    },
+    "question": { "type": "string" },
+    "unit_of_work": { "type": "string" },
+    "entry": { "type": "string" },
+    "exit": { "type": "string" },
+    "does_not_own": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "surfaces": {
+      "type": "object",
+      "properties": {
+        "workflow": { "type": ["string", "null"] },
+        "skill": { "type": ["string", "null"] },
+        "bin": { "type": ["string", "null"] },
+        "owner": { "type": ["string", "null"] }
+      }
+    },
+    "edges": {
+      "type": "object",
+      "properties": {
+        "feeds": { "type": "array", "items": { "type": "string" } },
+        "fed_by": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "checklist": {
+      "type": "object",
+      "required": [
+        "unit_of_work",
+        "entry_exit",
+        "close_or_loop_decision",
+        "workflow_contract",
+        "skill_or_agent_procedure",
+        "bin_cli",
+        "dogfood_evidence",
+        "promotion_destinations",
+        "anti_scope",
+        "eval_or_action_surface"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "unit_of_work": { "type": "boolean" },
+        "entry_exit": { "type": "boolean" },
+        "close_or_loop_decision": { "type": "boolean" },
+        "workflow_contract": { "type": "boolean" },
+        "skill_or_agent_procedure": { "type": "boolean" },
+        "bin_cli": { "type": "boolean" },
+        "dogfood_evidence": { "type": "boolean" },
+        "promotion_destinations": { "type": "boolean" },
+        "anti_scope": { "type": "boolean" },
+        "eval_or_action_surface": { "type": "boolean" }
+      }
+    },
+    "score": { "type": "integer", "minimum": 0, "maximum": 10 },
+    "repeat_signal": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "n/a"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "draft", "parked", "declined", "superseded"]
+    },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "notes": { "type": "string" },
+    "last_reviewed": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
+  }
+}

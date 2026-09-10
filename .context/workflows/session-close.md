@@ -30,6 +30,6 @@ A session-close workflow should always update state, write a concise handoff not
 3. **Regenerate indexes:** Run `bin/sync-project-index --write` when project metadata changed. The generated `30_projects/index.md` is local and ignored by Git.
 4. **Refresh retrieval:** Run `bin/mindgraph-refresh` when durable knowledge changed.
 5. **Review telemetry:** Run `bin/workflow-report --days 1` when diagnosing process friction.
-6. **Audit surface (post-ingest verification):** When durable knowledge was changed or a batch/tiered route occurred, run `bin/audit-sweep --dry-run` (or `--apply` after review). See [.context/workflows/audit-sweep.md](.context/workflows/audit-sweep.md). This is the compensating control for review-after (ADR-019).
+6. **Audit surface (post-ingest verification):** When durable knowledge was changed or a batch/tiered route occurred, run the optional/deferred audit-sweep tool if installed (`bin/audit-sweep --dry-run`, or `--apply` after review). This is the compensating control for review-after (ADR-019). It is not part of the first public-core slice.
 7. **Handoff digest (operator load reduction):** `bin/session-close --apply` now writes `20_live/last-handoff-draft.md` with recent signals from ingest-status, audit-sweep, etc. + a template for STATE.md narrative. Review/edit it into STATE.md to lower manual transcription.
 8. **Commit:** Ensure any living documents have their timestamps or logs updated.

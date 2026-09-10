@@ -12,4 +12,4 @@ bin/sync-project-index --write
 
 | Project | State | Goal | Next action | Updated |
 | --- | --- | --- | --- | --- |
-| [Example Project](example-project/README.md) | active | Outcome this project is meant to produce. | Single next step. | YYYY-MM-DD |
+| Example Project (`local-only: 30_projects/<slug>/README.md`) | active | Outcome this project is meant to produce. | Single next step. | YYYY-MM-DD |

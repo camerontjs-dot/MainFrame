@@ -42,7 +42,7 @@ Every parked file gets a `parked_reason:` frontmatter line stating why, in plain
 
 | Rule | Pattern | Disposition |
 | --- | --- | --- |
-| P1 | Empty, untitled, or fragment notes (`Untitled*`, single-thought stubs with no source) | `parked` → `90_archive/second-brain-migration/parked/` |
+| P1 | Empty, untitled, or fragment notes (`Untitled*`, single-thought stubs with no source) | `parked` → `local-only: 90_archive/<migration>/parked/` |
 | P2 | Code, scripts, configs (`.py`, `.sh`, `.bat`, `.ps1`, `.json`, `.jsx`) with no note context | `parked` (adopt into an owning project workbench manually if wanted) |
 | P3 | Exact duplicate by batch-manifest or body hash | `duplicate-removed`; delete the redundant working copy — the canonical copy plus the batch `source-files/` snapshot preserve the bytes (amended 2026-06-10 per operator instruction, ADR-020) |
 | P4 | Binary without a convention name (images, `.docx`, `.rtf`, `.xlsx`) | `parked`; convention-named PDFs go through the minion wrapper instead |
@@ -53,7 +53,7 @@ Every parked file gets a `parked_reason:` frontmatter line stating why, in plain
 
 | Rule | Pattern | Handling |
 | --- | --- | --- |
-| B1 | Old-system operational docs: role prompts, project instructions, system audits and evals, automation guides, product references from pre-MainFrame systems | Adopt into `30_projects/second-brain-migration/raw-materials/legacy-systems/<system>/` with `status: archived` and tag `legacy-system-doc`. Everything stays in the migration project; promotion into active MainFrame projects is a later operator decision (ADR-020). |
+| B1 | Old-system operational docs: role prompts, project instructions, system audits and evals, automation guides, product references from pre-MainFrame systems | Adopt into `local-only: 30_projects/<migration>/raw-materials/legacy-systems/<system>/` with `status: archived` and tag `legacy-system-doc`. Everything stays in the migration project; promotion into active MainFrame projects is a later operator decision (ADR-020). |
 
 ## Routing rules (first match wins)
 

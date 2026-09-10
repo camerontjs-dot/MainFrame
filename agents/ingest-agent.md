@@ -36,7 +36,7 @@ Do not invoke automatically on minion runs. The user controls when judgment work
 
 For organic (non-batch) captures the ingest-agent now delegates the detailed enrichment loop to the reusable skill:
 
-**Invoke the `ingest-source` skill** (see [.agents/skills/ingest-source.md](../.agents/skills/ingest-source.md)) on one file at a time.
+**Invoke the `ingest-source` skill** (see [.agents/skills/ingest-source/SKILL.md](../.agents/skills/ingest-source/SKILL.md)) on one file at a time.
 
 The skill performs:
 - Read + classification proposal (domain/type/tags, using `classify-note` sub-skill where helpful)
@@ -63,9 +63,9 @@ Use when the target files belong to a registered batch (check `bin/ingest-status
 
 1. **Load policy** — read [.context/routing-policy.md](../.context/routing-policy.md). Evaluation order: sensitivity overrides (S), then park rules (P), then routing rules (R); first match wins; no match → Tier B.
 2. **Classify the whole lane in one pass** — for each file record: matched rule (or none), proposed domain, type, tags, canonical filename, tier.
-3. **Emit one review table** — write `review-table.md` into the batch folder (`30_projects/second-brain-migration/raw-materials/batches/<batch-id>/`), or `01_ingest/` for non-batch backlogs. One row per file (file → rule → destination → tier), tier counts at the top, Tier B rows grouped with their open questions, Tier C rows listed separately and never auto-applied.
+3. **Emit one review table** — write `review-table.md` into the local-only batch folder (`local-only: 30_projects/<batch-project>/raw-materials/batches/<batch-id>/`), or `01_ingest/` for non-batch backlogs. One row per file (file → rule → destination → tier), tier counts at the top, Tier B rows grouped with their open questions, Tier C rows listed separately and never auto-applied.
 4. **One approval** — the user approves the table as a whole with line-item corrections. The first full-table review doubles as the ADR-018 baseline: record corrections per rule in the table file so rule-level agreement is measurable.
-5. **Apply Tier A** — set frontmatter, rename to convention, run `bin/prep-ingest run --apply`, then `bin/ingest-minion run --apply`. **Explicitly ensure `needs-audit` (or `needs-verification`) is present in the `tags:` list** for any raw or low-synthesis capture being auto-routed. This is the signal for the post-placement epistemic audit sweep (see [.context/workflows/audit-sweep.md](../.context/workflows/audit-sweep.md)). Append disposition-ledger rows citing the rule that fired (for example `rule:R3`). Apply P-rule parks per policy with `parked` ledger rows.
+5. **Apply Tier A** — set frontmatter, rename to convention, run `bin/prep-ingest run --apply`, then `bin/ingest-minion run --apply`. **Explicitly ensure `needs-audit` (or `needs-verification`) is present in the `tags:` list** for any raw or low-synthesis capture being auto-routed. This is the signal for the post-placement epistemic audit sweep (optional/deferred: `bin/audit-sweep` and its workflow are not in this public-core slice). Append disposition-ledger rows citing the rule that fired (for example `rule:R3`). Apply P-rule parks per policy with `parked` ledger rows.
 6. **Leave Tier B in `ready/`** — tag `routing-exception`, add a one-line `routing_note:`. They surface in `bin/ingest-status` and the next review table; corrections that repeat should graduate into named policy rules by commit.
    For any Tier A items you do apply in batch, double-check that `needs-audit` (or equivalent) made it into the tags list so the new sweep workflow can pick them up.
 7. **Report** — counts routed/parked/excepted per rule, corrections per rule, then run `bin/post-route-enrich --subset <domain>` for each domain that received raw stubs (or `bin/mindgraph-refresh` if notes only).
@@ -86,7 +86,7 @@ See [01_ingest/AGENTS.md](../01_ingest/AGENTS.md) for the defensive constraints 
 
 ## Related
 
-- [planning/mainframe-agent-ingest-plan.md](../../../planning/mainframe-agent-ingest-plan.md) — design plan (v2)
+- `local-only: planning notes` — historical ingest-agent design plan; not part of this tree
 - [DECISIONS.md](../DECISIONS.md) — ADR-009 (two-pass design), ADR-010 (layout convention)
 - [.context/workflows/ingest-minion.md](../.context/workflows/ingest-minion.md) — the deterministic counterpart
 - [.context/primitives.md](../.context/primitives.md) — schema and status lifecycle
