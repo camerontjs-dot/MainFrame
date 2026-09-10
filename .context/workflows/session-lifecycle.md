@@ -20,7 +20,7 @@ related_surfaces:
 do_not_use_for:
   - "project outcome work itself"
   - "replacing eval-schedule or mainframe-doctor"
-updated: "2026-07-23"
+updated: "2026-09-04"
 ---
 
 # Session lifecycle loop
@@ -61,10 +61,14 @@ open (focus/STATE → contract chain) → work → close (check|checkpoint|apply
 
 ### Open
 
-1. Prefer structured focus: `20_live/focus/current.yaml` (ADR-044 / MPE-024).
-2. Run `bin/session-open` (or `--json` / `--project <slug>`).
-3. Load only the progressive chain the script prints (AGENTS → STATE → project → plan → …).
-4. Fail closed if project path does not resolve (Unit 2.2).
+1. Run `bin/session-open --json` for arrival, or add `--project <slug> --task
+   "request"` for project resume. Use `--intent resume` for recorded focus.
+2. Read required content batches separately; recover any truncated response.
+   Arrival stops at the lifecycle map and recorded focus. Project-specific
+   diagnosis or recommendations require the resume route and reconstruction.
+3. Add `--path <repo-relative-path>` with an explicit project for deeper rules.
+4. Report missing relevant context before dependent work. Keep focus freshness
+   and adjacent scheduler warnings separate from permission and task readiness.
 
 Detail: `.context/workflows/session-open.md`.
 

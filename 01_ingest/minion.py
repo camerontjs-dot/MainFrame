@@ -17,7 +17,17 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 
 REQUIRED_KEYS = ("title", "domain", "type", "status", "source", "tags")
-ALLOWED_TYPES = {"raw", "note", "live", "project", "decision"}
+# `hypothesis` is the escape valve six documents already promise: AGENTS.md
+# principle 11, `.context/workflows/deterministic-tool-standard.md`,
+# `deterministic-automation-standard.md`, `ingest-minion.md`, `00_inbox/AGENTS.md`
+# rule 2, and `bin/capture-validate`'s own fix message ("clear these fields and
+# set type: hypothesis"). Until 2026-08-27 it was in none of them that mattered —
+# this set — so following the documented escape produced `unsupported type:
+# hypothesis` and the file was stuck.
+#
+# That is the failure mode principle 11 exists to prevent: an escape route that
+# does not work leaves fabricating the citation as the only way past the gate.
+ALLOWED_TYPES = {"raw", "note", "live", "project", "decision", "plan", "handoff", "hypothesis"}
 ALLOWED_STATUSES = {
     "queued",
     "skimmed",
@@ -29,6 +39,11 @@ ALLOWED_STATUSES = {
     "archived",
     "parked",
 }
+# What may route into 10_knowledge/. Deliberately narrower than ALLOWED_TYPES:
+# `hypothesis` is a valid capture and is NOT durable knowledge, so it stays
+# schema-valid, moves through the pipeline, and stops at this gate with the
+# "not routable in v1" warning until a human decides otherwise. A thought with
+# no source is welcome; it just does not get filed as something known.
 KNOWLEDGE_TYPES = {"note", "raw"}
 RAW_PDF_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})__(?P<domain>[^_]+)__raw__(?P<slug>.+)\.pdf$",
@@ -358,6 +373,19 @@ def _infer_title(body_lines: list[str], path: Path) -> str:
     return slug_to_title(path.stem)
 
 
+DEEP_RESEARCH_INDICATOR_RE = re.compile(
+    r"[\ue200\uE200]cite|[\ue200\uE200]filecite|\*\*Source appendix|## Source appendix",
+    re.IGNORECASE,
+)
+
+
+def is_deep_research_body(body: str, tags: list[str]) -> bool:
+    """Check if content exhibits ChatGPT deep research markers or tags."""
+    if any(t.lower() in {"deep-research", "chatgpt-deep-research", "synthetic-report"} for t in tags):
+        return True
+    return bool(DEEP_RESEARCH_INDICATOR_RE.search(body))
+
+
 def normalize_metadata(
     metadata: dict[str, Any],
     body: str,
@@ -381,6 +409,11 @@ def normalize_metadata(
         md["source"] = f"00_inbox/{original_filename}"
     if not isinstance(md.get("tags"), list):
         md["tags"] = []
+
+    if is_deep_research_body(body, md["tags"]):
+        for req_tag in ("deep-research", "needs-audit"):
+            if req_tag not in md["tags"]:
+                md["tags"].append(req_tag)
 
     body_links = extract_wikilinks(body)
     existing_links = md.get("links") if isinstance(md.get("links"), list) else []
@@ -784,14 +817,21 @@ class IngestMinion:
 
         domain = parsed.metadata.get("domain")
         item_type = parsed.metadata.get("type")
+        project = parsed.metadata.get("project")
         is_known_knowledge_target = (
             isinstance(domain, str)
             and domain in domains
             and isinstance(item_type, str)
             and item_type in KNOWLEDGE_TYPES
         )
+        is_known_project_plan = (
+            isinstance(item_type, str)
+            and item_type in {"plan", "handoff"}
+            and isinstance(project, str)
+            and (self.root / "30_projects" / project).is_dir()
+        )
 
-        if was_strict_valid and is_known_knowledge_target:
+        if was_strict_valid and (is_known_knowledge_target or is_known_project_plan):
             md = normalize_metadata(
                 parsed.metadata,
                 body,
@@ -840,6 +880,12 @@ class IngestMinion:
             source.name,
             force_skimmed=True,
         )
+        if is_deep_research_body(body, md["tags"]) and severity == "info":
+            message = (
+                "normalize frontmatter and stage for agent enrichment (deep research "
+                "report detected; run `bin/deep-research-ingest leads` to classify it as "
+                "inference and file its asserted sources — CAL is not in this path)"
+            )
         target = self.ready / source.name
         if target.exists():
             result.add(
@@ -944,8 +990,24 @@ class IngestMinion:
             self._reject(source, result, apply, f"invalid frontmatter: {exc}")
             return
 
-        domain = metadata["domain"]
-        item_type = metadata["type"]
+        domain = metadata.get("domain", "")
+        item_type = metadata.get("type", "")
+        project = metadata.get("project")
+
+        # Project plan routing
+        if item_type == "plan" and isinstance(project, str) and project:
+            project_dir = self.root / "30_projects" / project
+            if project_dir.is_dir():
+                target = project_dir / "plans" / source.name
+                if target.exists():
+                    result.add("blocked", source, target, "project plan destination already exists", "error")
+                    return
+                result.add("route", source, target, f"route plan markdown to 30_projects/{project}/plans")
+                if apply:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source), target)
+                return
+
         if domain not in domains:
             self._reject(source, result, apply, f"unknown knowledge domain: {domain}")
             return

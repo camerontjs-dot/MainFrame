@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "synthetic": true,
+  "label": "SYNTHETIC — not a private MainFrame evaluation",
+  "entries": [
+    {
+      "id": "loop-synthetic-capture",
+      "title": "Synthetic capture loop",
+      "tier": "well_defined",
+      "kind": "loop",
+      "question": "Does the synthetic capture loop declare a unit of work?",
+      "unit_of_work": "one labelled synthetic capture",
+      "entry": "synthetic inbox item exists",
+      "exit": "synthetic item is classified or rejected",
+      "status": "active",
+      "last_reviewed": "2026-09-10",
+      "score": 8,
+      "surfaces": {},
+      "checklist": {
+        "unit_of_work": true,
+        "entry_exit": true,
+        "close_or_loop_decision": true,
+        "workflow_contract": true,
+        "skill_or_agent_procedure": false,
+        "bin_cli": true,
+        "dogfood_evidence": true,
+        "promotion_destinations": true,
+        "anti_scope": true,
+        "eval_or_action_surface": false
+      }
+    },
+    {
+      "id": "loop-synthetic-thin",
+      "title": "Synthetic thin loop",
+      "tier": "underspecified",
+      "kind": "loop",
+      "question": "Is this synthetic loop still underspecified?",
+      "unit_of_work": "unclear",
+      "status": "draft",
+      "last_reviewed": "2026-09-10",
+      "score": 4,
+      "surfaces": {},
+      "checklist": {
+        "unit_of_work": true,
+        "entry_exit": true,
+        "close_or_loop_decision": false,
+        "workflow_contract": true,
+        "skill_or_agent_procedure": false,
+        "bin_cli": false,
+        "dogfood_evidence": false,
+        "promotion_destinations": false,
+        "anti_scope": true,
+        "eval_or_action_surface": false
+      }
+    }
+  ]
+}

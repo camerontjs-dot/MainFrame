@@ -116,8 +116,7 @@ Do **not** add: research claims outside the synthesis note, new lanes without in
 - `.context/workflows/ingest-minion.md` — step 4
 - `.context/workflows/epistemic-standard.md` — step 5
 - `.context/workflows/research-lane-intake.md` — new lanes only
-- `30_projects/research-lanes-strategy/plans/knowledge-routing.md`
-- `30_projects/research-lanes-strategy/plans/first-principles-research-conventions.md`
+- `local-only: 30_projects/<research-program>/plans/` for operator-specific lane conventions
 
 ## Evaluation
 

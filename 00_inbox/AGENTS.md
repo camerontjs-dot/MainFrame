@@ -39,6 +39,37 @@ it governed, silently.** Reserved: `AGENTS.md`, `README.md`, `index.md`,
 Deliberately checked at the gate rather than here. This folder is meant to be
 frictionless, and a capture zone that argues with you stops being used.
 
+**The Escape did not work until 2026-08-27.** `hypothesis` was absent from
+`ALLOWED_TYPES` in `01_ingest/minion.py`, so taking the documented escape route
+produced `unsupported type: hypothesis` and stranded the file. Six documents
+promised it — AGENTS.md principle 11, two workflow standards, `ingest-minion.md`,
+this rule, and `bin/capture-validate`'s own fix message. None of them was the set
+the gate reads.
+
+That is the exact failure principle 11 names: an escape valve that does not open
+leaves fabricating the citation as the only way past the check. It is now in
+`ALLOWED_TYPES` and deliberately not in `KNOWLEDGE_TYPES` — a hypothesis is a
+valid capture and is not durable knowledge, so it moves through the pipeline and
+stops before `10_knowledge/` for a human to decide.
+
+## 2b. A source lead is not a source.
+
+> **Binds:** captures written by `bin/deep-research-ingest leads`
+> **Tier:** T2 (blocked) at the routing gate, same as rule 2
+> **Check:** `bin/capture-validate` R1 — a lead carries `asserted_doi` /
+> `asserted_url` / `asserted_arxiv`, never `url` / `doi` / `authors` / `year` /
+> `journal` / `venue`
+> **Escape:** n/a. Retrieving the thing is the only way a lead becomes a capture.
+
+A lead records that a language model *asserted* a source exists. Promoting one
+means retrieving it and recording `fetch_method` plus a `retrieval_receipt`.
+
+If the asserted identifier resolves to something unrelated to the claim, that is
+a finding — record it and stop. Do not go looking for a better source to put in
+its place. On 2026-08-19 the resolver did exactly that and attached a
+cultural-studies interview to a report on agent runtimes. See
+`local-only: 20_live/provenance/` for the dated ingest-audit record.
+
 ## 3. Nothing here may be cited.
 
 > **Binds:** any agent answering a question

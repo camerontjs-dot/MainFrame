@@ -74,7 +74,14 @@ class SessionOpenTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         (self.root / "AGENTS.md").write_text("# Agents\n", encoding="utf-8")
+        (self.root / "HARNESS.md").write_text("# Harness\n", encoding="utf-8")
         (self.root / "STATE.md").write_text(STATE_WITHOUT_PROJECT, encoding="utf-8")
+        (self.root / "30_projects").mkdir()
+        (self.root / "30_projects/AGENTS.md").write_text("# Projects\n", encoding="utf-8")
+        workflow = self.root / ".context/workflows/project-resume-and-candidate-lifecycle.md"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text("# Project reconstruction\n", encoding="utf-8")
+        (workflow.parent / "session-open.md").write_text("# Session route\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -84,9 +91,10 @@ class SessionOpenTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIsNone(result.project)
         real_entries = [e for e in result.entries if not e.path.startswith("(")]
-        self.assertEqual(len(real_entries), 2)
+        self.assertEqual(len(real_entries), 4)
         self.assertEqual(real_entries[0].path, "AGENTS.md")
-        self.assertEqual(real_entries[1].path, "STATE.md")
+        self.assertEqual(real_entries[1].path, "HARNESS.md")
+        self.assertEqual(real_entries[2].path, "STATE.md")
 
     def test_open_with_project_flag(self) -> None:
         proj_dir = self.root / "30_projects" / "foo"
@@ -106,7 +114,7 @@ class SessionOpenTests(unittest.TestCase):
         proj_dir.mkdir(parents=True)
         (proj_dir / "README.md").write_text("# Test\n", encoding="utf-8")
 
-        result = build_context(self.root)
+        result = build_context(self.root, intent="resume")
         self.assertEqual(result.project, "test-project")
         self.assertEqual(result.project_source, "state")
         paths = [e.path for e in result.entries]
@@ -132,6 +140,80 @@ class SessionOpenTests(unittest.TestCase):
         result = build_context(self.root)
         self.assertFalse(result.ok)
 
+    def test_missing_harness_cannot_report_valid_context(self) -> None:
+        (self.root / "HARNESS.md").unlink()
+        result = build_context(self.root)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.degraded)
+        self.assertEqual(result.missing_required, ["HARNESS.md"])
+
+    def test_missing_project_contracts_cannot_report_valid_context(self) -> None:
+        project = self.root / "30_projects/foo"
+        project.mkdir()
+        (project / "README.md").write_text("# Foo\n", encoding="utf-8")
+        (self.root / "30_projects/AGENTS.md").unlink()
+        (self.root / ".context/workflows/project-resume-and-candidate-lifecycle.md").unlink()
+        result = build_context(self.root, project="foo")
+        self.assertFalse(result.ok)
+        self.assertIn("30_projects/AGENTS.md", result.missing_required)
+        self.assertIn(".context/workflows/project-resume-and-candidate-lifecycle.md",
+                      result.missing_required)
+
+    def test_task_path_loads_only_its_ancestor_contracts_before_project_content(self) -> None:
+        project = self.root / "30_projects/foo"
+        target = project / "workbench/src/module.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("pass\n", encoding="utf-8")
+        (project / "README.md").write_text("# Public readme\n", encoding="utf-8")
+        (project / "PROJECT.md").write_text("project_state: paused\n", encoding="utf-8")
+        for directory in (project, project / "workbench", project / "raw-materials",
+                          self.root / "30_projects/unrelated"):
+            directory.mkdir(exist_ok=True)
+            (directory / "AGENTS.md").write_text("# Local rule\n", encoding="utf-8")
+
+        result = build_context(self.root, project="foo", task_path=str(target.relative_to(self.root)))
+        self.assertTrue(result.ok)
+        paths = [e.path for e in result.entries]
+        expected = ["AGENTS.md", "HARNESS.md", "30_projects/AGENTS.md",
+                    "30_projects/foo/AGENTS.md", "30_projects/foo/workbench/AGENTS.md",
+                    "30_projects/foo/README.md", "30_projects/foo/PROJECT.md"]
+        self.assertEqual([p for p in paths if p in expected], expected)
+        self.assertNotIn("30_projects/foo/raw-materials/AGENTS.md", paths)
+        self.assertNotIn("30_projects/unrelated/AGENTS.md", paths)
+
+        project_only = build_context(self.root, project="foo")
+        self.assertNotIn("30_projects/foo/workbench/AGENTS.md",
+                         [e.path for e in project_only.entries])
+
+    def test_invalid_task_paths_fail_without_loading_other_contracts(self) -> None:
+        project = self.root / "30_projects/foo"
+        project.mkdir()
+        (project / "README.md").write_text("# Foo\n", encoding="utf-8")
+        outside = self.root / "private-other"
+        outside.mkdir()
+        (outside / "AGENTS.md").write_text("# Other contract\n", encoding="utf-8")
+        (project / "outside-link").symlink_to(outside, target_is_directory=True)
+        for path in ("private-other", "30_projects/foo/missing", "30_projects/foo/outside-link"):
+            with self.subTest(path=path):
+                result = build_context(self.root, project="foo", task_path=path)
+                self.assertFalse(result.ok)
+                self.assertTrue(result.path_error)
+                self.assertNotIn("private-other/AGENTS.md", [e.path for e in result.entries])
+
+    def test_task_path_requires_explicit_project(self) -> None:
+        result = build_context(self.root, task_path=".")
+        self.assertFalse(result.ok)
+        self.assertIn("explicit --project", result.path_error)
+
+    def test_directory_named_contract_is_a_missing_required_file(self) -> None:
+        project = self.root / "30_projects/foo"
+        project.mkdir()
+        (project / "README.md").write_text("# Foo\n", encoding="utf-8")
+        (project / "AGENTS.md").mkdir()
+        result = build_context(self.root, project="foo")
+        self.assertFalse(result.ok)
+        self.assertIn("30_projects/foo/AGENTS.md", result.missing_required)
+
     def test_phase_plan_discovery(self) -> None:
         (self.root / "STATE.md").write_text(STATE_WITH_PROJECT, encoding="utf-8")
         proj_dir = self.root / "30_projects" / "test-project"
@@ -143,11 +225,11 @@ class SessionOpenTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        result = build_context(self.root)
+        result = build_context(self.root, intent="resume", task="first")
         paths = [e.path for e in result.entries]
         self.assertTrue(any("01-first.md" in p for p in paths))
         plan_entry = [e for e in result.entries if "01-first.md" in e.path][0]
-        self.assertEqual(plan_entry.note, "active phase plan")
+        self.assertIn("candidate", plan_entry.note)
 
     def test_skips_non_active_phase_plan(self) -> None:
         (self.root / "STATE.md").write_text(STATE_WITH_PROJECT, encoding="utf-8")
@@ -160,7 +242,7 @@ class SessionOpenTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        result = build_context(self.root)
+        result = build_context(self.root, intent="resume")
         paths = [e.path for e in result.entries]
         self.assertFalse(any("01-done.md" in p for p in paths))
 
@@ -208,7 +290,7 @@ class SessionOpenTests(unittest.TestCase):
             "agent-tracker-eval (Focus Board) + mainframe-process-eval (canaries)\n",
             encoding="utf-8",
         )
-        result = build_context(self.root)
+        result = build_context(self.root, intent="resume")
         self.assertFalse(result.ok)
         self.assertIsNotNone(result.project_error)
         self.assertTrue(result.degraded)
@@ -223,7 +305,7 @@ class SessionOpenTests(unittest.TestCase):
             "# S\n\n## Active Project\n\nmissing-slug\n",
             encoding="utf-8",
         )
-        result = build_context(self.root)
+        result = build_context(self.root, intent="resume")
         self.assertFalse(result.ok)
         self.assertEqual(result.project, "missing-slug")
         self.assertFalse(result.project_exists)

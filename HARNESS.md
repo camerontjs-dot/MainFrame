@@ -1,6 +1,26 @@
 # MainFrame Harness Operating Contract
 
-This file defines how MainFrame treats **agent harnesses** across lifecycle folders. It complements `AGENTS.md` (global agent behavior) and `STATE.md` (current focus). Agents and operators should read this when preparing delegation, evaluating capability, or choosing local vs cloud execution.
+This file defines how MainFrame treats **agent harnesses** across lifecycle folders. It complements `AGENTS.md` (global agent behavior), `20_live/focus/current.yaml` (structured focus), and `STATE.md` (handoff narrative). Start with `bin/session-open`; its reading order and output meanings are in `.context/workflows/session-open.md`.
+
+## Session orientation
+
+Workspace arrival describes the lifecycle map, recorded focus and relevant
+uncertainty, then stops. Read root `AGENTS.md`, this section, `STATE.md`, available
+structured focus, and `.context/workflows/session-open.md`. The remaining harness
+sections are deferred until project resume or an action makes them applicable.
+Recorded focus is attention metadata; it does not authorize work or establish
+project readiness. A workspace arrival does not diagnose the focused project.
+
+For a named project, use `bin/session-open --project <slug> --task "request"`.
+That route requires the full harness, lifecycle/local contracts and reconstruction
+workflow. Use `--intent resume` to select recorded focus explicitly. Read complete
+required batches, keep unknowns visible, and follow current authority into evidence.
+The route does not grant implementation, evaluation, delegation or release authority.
+
+> **Binds:** agents choosing arrival versus project/action context
+> **Tier:** T0 (advisory reading and scope policy)
+> **Check:** none for actual reading; `tests/test_session_open.py` checks emitted routes and bounded content
+> **Escape:** read the full harness when the section or router is unavailable; report missing relevant context and stop before dependent claims or action
 
 ## Definition
 
@@ -15,7 +35,7 @@ session lifecycle, client differences, task categories, and promotion gates.
 
 This file owns durable harness policy. It should not absorb project status,
 repo-specific build commands, raw telemetry, or current scoreboards. Current
-evaluation results live in `30_projects/agent-harness-eval/`; durable patterns
+evaluation results live in `local-only: harness-evaluation project/`; durable patterns
 live in `10_knowledge/agents/`; structural-file updates should be checked
 against `.context/templates/structural-file-profile.md`.
 
@@ -26,7 +46,7 @@ Harness knowledge is split on purpose — different lifecycle, different MindGra
 | Layer | Location | MindGraph DB | Trust | Contents |
 |-------|----------|--------------|-------|----------|
 | **Patterns** | `10_knowledge/agents/` — e.g. `harness-engineering-by-task-category` | `mainframe.sqlite` (default) | Durable, synthesized | Task categories, five subsystems, local/cloud integration patterns, skill routing heuristics |
-| **Program** | `30_projects/agent-harness-eval/outputs/` — e.g. `harness-evaluation-program` | `mainframe-projects.sqlite` | Project status, dated | H0/H1/H2/H3 variants, sealed cases, graduation matrix, next gate |
+| **Program** | `local-only: harness-evaluation outputs/` — e.g. `harness-evaluation-program` | `mainframe-projects.sqlite` | Project status, dated | H0/H1/H2/H3 variants, sealed cases, graduation matrix, next gate |
 | **Contract** | `HARNESS.md` (this file) | Not indexed | Operating policy | Rules that do not change every eval run |
 
 Volatile telemetry (`20_live/workflow-metrics/`) is intentionally **outside** default MindGraph scope. It shows activity, not graduated capability.
@@ -35,7 +55,7 @@ Volatile telemetry (`20_live/workflow-metrics/`) is intentionally **outside** de
 
 | Client | Typical use | Harness surface | Capability evidence |
 |--------|-------------|-----------------|---------------------|
-| **Local Coder** (Aider + Ollama) | Bounded code edits | Task packets, file allowlists, post-hoc verification | `agent-harness-eval` receipts + graduation gate |
+| **Local Coder** (Aider + Ollama) | Bounded code edits | Task packets, file allowlists, post-hoc verification | `local-only: harness-evaluation project` receipts + graduation gate |
 | **Claude Code** | Planning, multi-file judgment | AGENTS.md, skills, hooks | Redacted telemetry; no auto-graduation |
 | **Codex** | Implementation slices | Hooks, permissions | Redacted telemetry; vocabulary TBD |
 | **Grok Build** | Cloud agent sessions | Native project hooks, skills | Redacted telemetry (`client: grok`) |
@@ -44,19 +64,30 @@ Do not infer delegation authority from live telemetry or workstation display alo
 
 ## Planning, execution, verification
 
-1. **Planning authority** — Frontier/cloud agents and the operator produce reviewed task packets. Unresolved design stays out of execution.
-2. **Execution** — Local or cloud agent runs inside scope. Run state goes to receipts, not packet mutation.
-3. **Verification** — External deterministic checks (tests, linters, scope diff, claim-accuracy). MindGraph supplies **context nominations only**, never verification.
+1. **State reconstruction on resume** — Before planning, resolve the current project, repository/worktree, candidate, experiment, dirty/concurrent, and evidence state. Casual “take a look / decide next” language is read-only; it does not authorize implementation or lifecycle mutation. Follow `.context/workflows/project-resume-and-candidate-lifecycle.md`.
+2. **Planning authority** — Frontier/cloud agents and the operator produce reviewed task packets. Unresolved design stays out of execution.
+3. **Execution** — Local or cloud agent runs inside scope. Run state goes to receipts, not packet mutation.
+4. **Verification** — External deterministic checks (tests, linters, scope diff, claim-accuracy). MindGraph supplies **context nominations only**, never verification.
+
+### Execution honesty and tool discipline (ADR-051)
+
+1. **Tool taxonomy:** Explicitly distinguish **Transformers** (data formatting/packet builders — never named `audit` or `evaluate`), **Runners** (execute real models, CLI subprocesses, or databases; fail closed if unavailable), and **Agent Judgment** (explicitly qualitative LLM synthesis).
+2. **Falsification testing:** Tests for evaluators, verifiers, and bridges must include adversarial and disconnection cases (asserting failure when the backend is missing or evidence is contradictory), not merely tautological assertions on internal dictionary keys.
+3. **Live trace receipts:** Evaluation claims and scorecards must reference a persistent execution receipt on disk with an exact path and hash. See `.context/workflows/deterministic-tool-standard.md`.
+4. **Degraded-mode resilience and envelope visibility (ADR-052):** Tools and harness hooks must operate cleanly in degraded states (e.g. offline daemon, unindexed cache). Fallbacks must be deterministic, emitting clear diagnostic receipts. Telemetry and tool errors must expose the "edge of the envelope" (boundary conditions, rate limits, token pressure, timeout thresholds) so agents and operators can calibrate risk rather than encountering silent failure walls.
 
 ### Focus and system health (ADR-044)
 
-- **Focus authority (accepted, not yet implemented):** operator-approved primary attention will live under `20_live/focus/` (`current.yaml` + decision/outcome history). Project READMEs keep lifecycle state; focus does not activate projects (WIP remains ADR-041).
-- **STATE.md:** human handoff narrative; after migration it cites focus revision rather than acting as the parseable project id.
-- **Doctor:** health is a **vector** of claims (`bin/mainframe-doctor` contract accepted; binary ships with Unit 1.3 after WIP activation). Required `unknown` must not aggregate to healthy. Until the doctor exists, treat `session-open ok: true` with a missing project path as a known false-green (reproduced 2026-07-14).
-- Design surfaces: `30_projects/mainframe-process-eval/plans/scalability/`.
+- **Focus authority:** operator-approved primary attention lives under `20_live/focus/` (`current.yaml` + decision/outcome history). Arrival displays focus without entering its project. `bin/session-open --intent resume` prefers structured focus unless `--project` names the task's project. Project coordination files keep lifecycle state; focus does not activate projects (WIP remains ADR-041).
+- **STATE.md:** human handoff narrative that cites the focus revision. Session-open retains it as a visible fallback when structured focus cannot supply a project.
+- **Doctor:** `bin/mainframe-doctor --quick` reports a vector of health checks. Required `unknown` must not aggregate to healthy. Session-open checks required context paths separately; `ok: true` does not establish system health, fresh focus, project readiness, or authorization.
+- Design surfaces: `40_operations/mainframe-process-eval/` (operation-owned plans stay local).
 
 Workflows:
 
+- `.context/workflows/session-open.md` — ordered context references, applicable contracts, and explicit missing-prerequisite reporting
+- `.context/workflows/project-resume-and-candidate-lifecycle.md` — read-only project reconstruction, immutable candidate identity, active experiment visibility, and comparison gates (ADR-054)
+- `.context/workflows/deterministic-tool-standard.md` — deterministic tool taxonomy, fail-closed boundaries, and falsification test standards (ADR-051)
 - `.context/workflows/delegate-local-task.md` — packet prep and isolated execution
 - `.context/workflows/local-coder-run.md` — live local coder discipline
 - `.context/workflows/source-literature.md` — peer-reviewed / institutional source discovery before ingest (ADR-028)
@@ -65,6 +96,7 @@ Workflows:
 - `.context/workflows/epistemic-standard.md` — claim classification, evidence appraisal, confidence language, promotion gate (ADR-029)
 - `.context/workflows/ingest-minion.md` — deterministic inbox → `10_knowledge/` routing
 - `.context/workflows/eval-schedule.md` — scheduled eval suites, launchd, weekly review ritual (ADR-036)
+- `.context/workflows/repo-reconciliation.md` — GitHub-authoritative fetch/classify of registered checkouts; gated fast-forward only (ADR-060)
 - `.context/workflows/project-experiment-loop.md` — measured experiment pass (design → run → harvest → **triage/action**); `bin/project-experiment-loop`
 - `.context/workflows/lab-report.md` — universal researcher lab-report notebook for every decision-bearing test; `bin/lab-report scaffold|check|list`
 - `20_live/eval-registry/last-eval-action.md` — portfolio triage for **all** MainFrame evals (action layer); `last-canary-action.md` is a pointer
@@ -76,7 +108,7 @@ Optimize and graduate harnesses **per task category × model profile × harness 
 
 ## Graduation (local delegation)
 
-Real delegation requires a tuple that passes the strict gate in `agent-harness-eval`:
+Real delegation requires a tuple that passes the strict gate in `local-only: harness-evaluation project`:
 
 - ≥ 8/10 held-out verified passes
 - Zero scope violations
@@ -89,9 +121,9 @@ Local Coder evaluation is **three layers**. Do not collapse them into one score.
 
 | Layer | Question | Owner / artifacts |
 |-------|----------|-------------------|
-| **Public standards** | Is the model coding-agent-shaped? | Calibration only: Aider Polyglot; optional SWE-bench Verified lite. Plan: `30_projects/agent-harness-eval/plans/coding-standard-benchmark-calibration.md` |
-| **Sealed H1 suite** | Does *our* stack pass *our* edit jobs under packet + external verify? | `agent-harness-eval` coding-backend hard screen / multi-path scorecards |
-| **Live receipts** | May it touch real trees under this contract? | This section + verified-done live path |
+| **Public standards** | Is the model coding-agent-shaped? | Calibration only: Aider Polyglot; optional SWE-bench Verified lite. Plan: `local-only: harness-evaluation plans/` |
+| **Sealed H1 suite** | Does *our* stack pass *our* edit jobs under packet + external verify? | `local-only: harness-evaluation project` coding-backend hard screen / multi-path scorecards |
+| **Live receipts** | May it touch real trees under this contract? | This section + local verification-demo path |
 
 HumanEval/MBPP-style completion benches are **not** sufficient for promotion. Public leaderboards do **not** override sealed false-completion or scope gates. Sealed matrices do **not** replace live receipts for graduation.
 
@@ -107,11 +139,11 @@ Minimum live receipt fields:
 - unified ledger label when available (`verified-supported` | `honestly-abstained` | `unsupported-assertion` | `out-of-scope`)
 - trajectory summary when the adapter supports tools: commit-class tags (`lookup` / `verify` / `commit` / `finish`) and `commit_fired`
 
-Public demo instrumentation: `30_projects/verified-done` (`runner/run.py live`, `LEDGER.md`). Private lab matrices remain in `agent-harness-eval`.
+Public demo instrumentation: `local-only: verification-demo project` (`runner/run.py live`, `LEDGER.md`). Private lab matrices remain in `local-only: harness-evaluation project`.
 
 The Local Agent workstation may display only **sanitized aggregates** from the evaluator. Raw prompts, transcripts, diffs, and verifier output stay in the private eval project.
 
-Current matrix status and next gates live in `30_projects/agent-harness-eval/README.md`, `methodology-approach.md`, and dated outputs. This file records the graduation rule, not the live scoreboard.
+Current matrix status and next gates live in `local-only: harness-evaluation README`, `methodology-approach.md`, and dated outputs. This file records the graduation rule, not the live scoreboard.
 
 ## MindGraph: two indexes
 
@@ -142,7 +174,10 @@ Do **not** re-stage for pure `20_live` telemetry, workstation UI, or knowledge-o
   - **Tool contract:** MCP `query(question, scope, …)` and `graph_neighbors(doc_id, scope)` require `scope` ∈ {`knowledge`, `projects`}. Response includes `trust_profile`. No blended scope.
   - **Debug only:** `serve-mcp --db <path>` for single-DB isolation; never the daily default.
 
-MindGraph's active engine source lives in `mindgraph/`. That source project is not automatically folded into the durable knowledge index. Keep sandbox/upgrade work in `30_projects/mindgraph/` and retrieval-quality measurements in `30_projects/mindgraph-eval/`.
+MindGraph's active engine source lives in `30_projects/mindgraph/workbench/`.
+Root `mindgraph/` is the promoted operational artifact; update it through
+`bin/mindgraph-promote`. Engine source is outside the durable knowledge index.
+Retrieval-quality measurements live in `30_projects/mindgraph-eval/`.
 
 Query intent routing:
 

@@ -61,6 +61,12 @@ List observable conditions that external verification can establish.
 
 Name discoveries that require escalation rather than improvisation.
 
+## Resilience & Hazard Considerations (ADR-052)
+
+- **Degraded-mode behavior:** How the implementation behaves if upstream dependencies, models, or external services are unavailable (must fail closed or use explicit fallback).
+- **Escape valves & error shapes:** Explicit intermediate or failure states emitted instead of guessing or swallowing exceptions.
+- **Rollback / retreat pathway:** Safe revert command or worktree cleanup steps if unexpected regressions occur.
+
 ## Expected handoff
 
 Require a concise summary of changed files, verification not claimed as run by

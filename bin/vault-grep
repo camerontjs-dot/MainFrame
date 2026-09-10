@@ -10,6 +10,9 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 1
 fi
 
+# Let ripgrep parse patterns, option values, paths, and stdin itself. Its default
+# filesystem search is MainFrame; an explicit path must not add a root search.
+cd "$ROOT"
 exec rg --no-ignore \
   -g '!.git/' \
   -g '!.venv/' \
@@ -19,4 +22,4 @@ exec rg --no-ignore \
   -g '!.grok/' \
   -g '!node_modules/' \
   -g '!.ruff_cache/' \
-  "$@" "$ROOT"
+  "$@"

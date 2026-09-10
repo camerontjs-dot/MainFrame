@@ -8,8 +8,8 @@ Every rule below declares four things. **Escape** is not a loophole: it is the
 named, cheap, non-penalized way to comply when you cannot meet the letter of the
 rule. A rule without one manufactures violations, because an agent that cannot
 comply and cannot honestly fail will produce something that *looks* like
-compliance. See
-[every-rule-needs-an-honest-failure-path](agents/2026-08-10__agents__note__every-rule-needs-an-honest-failure-path.md).
+compliance. See root `AGENTS.md` principle 11 (degraded-mode and escape-valve discipline)
+and `.context/workflows/deterministic-tool-standard.md`.
 
 Tiers: **T0** advisory · **T1** detected · **T2** blocked · **T3** reconciled.
 
@@ -59,15 +59,16 @@ evidence, and 14 simultaneously carried `needs-audit`.
 > **Binds:** anything reading this folder, including MindGraph
 > **Tier:** T1 (detected)
 > **Check:** `mindgraph` attaches `provenance_warning` to every chunk of a
-> quarantined document, not only the first
+> quarantined document, not only the first, held by
+> `mindgraph/tests/test_citation_trust.py`
 > **Escape:** re-source the claim against real literature and write a new note.
 > The quarantined body may well be correct; it simply has no source behind it.
 
 ## 5. Raw bodies are immutable. Frontmatter may change.
 
 > **Binds:** any edit to a `type: raw` file
-> **Tier:** **T0 (advisory). Nothing checks this.**
-> **Check:** none
+> **Tier:** T0 (advisory)
+> **Check:** none — nothing enforces this today, said plainly
 > **Escape:** n/a
 
 Stated honestly rather than dressed up. Status changes, tags, links and appended

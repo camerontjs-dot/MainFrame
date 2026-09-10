@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Validate the typed cross-lifecycle work inventory.
+
+This command is a derived check.  Direct README authorities remain the path
+resolver; the inventory only reports whether the records and manifest agree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from work_inventory import inventory_payload, validate_manifest  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="validate direct identities and optional typed manifest")
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--root", type=Path, default=ROOT, help="MainFrame root (for shadow fixtures)")
+    parser.add_argument("--manifest", type=Path, default=None, help="typed projects manifest to validate")
+    parser.add_argument("--output", type=Path, default=None, help="write JSON inventory receipt")
+    parser.add_argument("--human-output", type=Path, default=None, help="write a human-readable inventory")
+    args = parser.parse_args(argv)
+    root = args.root.expanduser().resolve()
+    payload = inventory_payload(root)
+    if args.manifest:
+        payload["manifest"] = validate_manifest(root, args.manifest)
+        payload["ok"] = bool(payload["ok"] and payload["manifest"]["ok"])
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if args.human_output:
+        args.human_output.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# MainFrame Work Inventory",
+            "",
+            f"- root: `{root}`",
+            f"- records: {payload['count']}",
+            f"- status: `{'OK' if payload['ok'] else 'BLOCKED'}`",
+            "",
+            "| id | record_type | path | lifecycle_state | README SHA-256 |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for record in payload["records"]:
+            lines.append(
+                "| {id} | {record_type} | `{path}` | {lifecycle_state} | `{readme_sha256}` |".format(
+                    id=record.get("id") or "",
+                    record_type=record.get("record_type") or "",
+                    path=record.get("path") or "",
+                    lifecycle_state=record.get("lifecycle_state") or "",
+                    readme_sha256=record.get("readme_sha256") or "",
+                )
+            )
+        if payload.get("issues"):
+            lines.extend(["", "## Issues", ""])
+            lines.extend(f"- {issue}" for issue in payload["issues"])
+        args.human_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print("mainframe work inventory")
+        print(f"  root: {root}")
+        print(f"  records: {payload['count']}")
+        print(f"  status: {'OK' if payload['ok'] else 'BLOCKED'}")
+        for issue in payload.get("issues", []):
+            print(f"  issue: {issue}")
+        if payload.get("manifest"):
+            print(f"  manifest: {'OK' if payload['manifest']['ok'] else 'BLOCKED'}")
+    return 0 if payload["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
