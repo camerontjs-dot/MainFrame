@@ -1,0 +1,39 @@
+name: Public core
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  public-core:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
+
+      - name: Run public tests
+        run: python -m pytest tests 40_operations/mainframe-process-eval/tests -q
+
+      - name: Exercise public CLIs
+        run: |
+          ./bin/process-eval --help
+          ./bin/process-eval status --json
+          ./bin/contract-lint --help
+          ./bin/contract-lint --selftest
+          ./bin/session-open --help
+          ./bin/session-close --help
+          ./bin/ingest-minion --help
+          ./bin/work-inventory --help
