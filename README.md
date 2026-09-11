@@ -1,24 +1,20 @@
 # MainFrame
 
-MainFrame is a local-first, Markdown-centered operating environment for agent-assisted knowledge work. It separates capture, durable knowledge, volatile state, bounded projects, standing operations, and archive so each can have different update and authority rules.
+A local-first, Markdown-centered operating environment for agent-assisted
+knowledge work. It gives files explicit lifecycle boundaries, deterministic
+control surfaces, retrieval nominations, project/operation identity, and a
+portable self-evaluation engine.
 
-This repository is a **reference implementation**. It contains portable contracts, deterministic control surfaces, synthetic examples, and a bounded self-evaluation engine. It does not contain private knowledge, live state, project evidence, or evaluation history.
-
-## Run the public core
-
-```bash
-git clone https://github.com/camerontjs-dot/MainFrame.git
-cd MainFrame
-
-./bin/process-eval status --json
-uvx --with pytest pytest tests 40_operations/mainframe-process-eval/tests -q
-```
-
-The test surface exercises lifecycle identity, fail-closed duplicate and missing authority behavior, session routing, the process-eval shim, and the bounded public MPE profile. `process-eval status` should resolve `40_operations/mainframe-process-eval` without requiring private evaluation output.
+This repository is a **reference implementation**. It is not a backup of any
+one person's installed MainFrame, and it does not contain private knowledge,
+live state, project evidence, or evaluation receipts.
 
 ## Why it exists
 
-Captures, durable notes, volatile status, bounded projects, and standing operations need different update rules. Mixing them in one pile makes recall and safe updates harder. MainFrame organizes work by **information lifecycle first, topic second**, with explicit authority and fail-closed tools around identity and publication.
+Captures, durable notes, volatile status, bounded projects, and standing
+operations need different update rules. Mixing them in one pile makes recall
+and safe updates harder. MainFrame organizes work by **information lifecycle
+first, topic second**, with fail-closed tools around identity and publication.
 
 ## Architecture
 
@@ -31,7 +27,8 @@ projects, operations, runtime            contracts, engines, tests
         +-----------------------------------------+
 ```
 
-The public tree is cut from a private working tree through a positive allowlist into a fresh directory before publication. Private Git history does not cross that boundary.
+The public tree is produced from a private working repository through a
+deterministic allowlist. Private Git history does not cross that boundary.
 
 ## Lifecycle model
 
@@ -40,78 +37,123 @@ The public tree is cut from a private working tree through a positive allowlist 
 | `00_inbox/` | Fast capture |
 | `01_ingest/` | Normalization and routing |
 | `10_knowledge/` | Durable knowledge |
-| `20_live/` | Volatile-state interfaces and templates, not someone else's live state |
+| `20_live/` | Volatile-state **interfaces and templates**, not someone else's live state |
 | `30_projects/` | Bounded outcome work |
 | `40_operations/` | Standing systems and recurring programs |
 | `90_archive/` | Retired or preserved material |
 
-Lifecycle zones may carry local `AGENTS.md` contracts that refine root policy. Location does not itself decide WIP, focus, health, or approval. Direct file authority outranks indexes and retrieval.
+Lifecycle zones may carry local `AGENTS.md` contracts that refine root
+policy. Location does not itself decide WIP, focus, health, or approval.
+Direct file authority outranks indexes and retrieval.
+
+## Quick demo (synthetic)
+
+The tree under `examples/demo-mainframe/` is labelled synthetic. It is not a
+claim that any private MainFrame passed an evaluation.
+
+```bash
+python3 -c "from pathlib import Path; import sys; sys.path.insert(0,'scripts'); from lifecycle_identity import resolve_record, DuplicateIdentity, MissingIdentity"
+python3 bin/process-eval --help
+python3 bin/process-eval status --json
+```
+
+`status` resolves the portable `mainframe-process-eval` operation in this
+tree. Evaluation **outputs** are local-only and are not part of Git.
 
 ## Projects vs operations
 
-Slugs are unique across `30_projects/` and `40_operations/`. A project is a bounded outcome. An operation is a standing loop. Duplicate slugs and missing README authority fail closed.
+Slugs are unique across `30_projects/` and `40_operations/`. A project is a
+bounded outcome. An operation is a standing loop. Duplicate slugs and missing
+README authority fail closed.
 
-The implementation and tests are in `scripts/lifecycle_identity.py` and `tests/test_lifecycle_identity.py`.
+See `scripts/lifecycle_identity.py` and `tests/test_lifecycle_identity.py`.
 
-## MainFrame Process Evaluation
+## Agent / runtime integration
 
-The portable evaluation engine lives at `40_operations/mainframe-process-eval/`. Generic lifecycle substrate stays at the repository root; evaluation evidence stays local.
+Agents read contracts from `AGENTS.md`, `.context/workflows/`, and
+`.agents/skills/`. `bin/session-open` lists context; it does not prove that
+an agent understood it. Client-specific runtimes are optional.
 
-The public profile includes:
+## Authority and fail-closed boundaries
 
-- operation identity and status;
-- process-evaluation methodology;
-- the real loop-evaluation scorer;
-- labelled synthetic evaluation cases;
-- a bounded `close --write` path whose output remains local-only.
-
-Malformed synthetic catalogue input fails closed. The installed private MainFrame uses a larger `process-eval preflight` pack with additional operational tools. That full pack is not claimed as publicly reproducible here.
-
-## Agent and runtime integration
-
-Agents read contracts from `AGENTS.md`, `.context/workflows/`, and `.agents/skills/`. `bin/session-open` lists context; it does not establish that an agent understood it. Client-specific runtimes are optional.
-
-## Authority boundaries
-
-- Direct README and contract files are authority.
+- Direct README / contract files are authority.
 - Retrieval nominates evidence; it does not establish truth or lifecycle state.
-- Deterministic tools prefer `--check` or dry-run behavior and fail closed on missing identity, duplicate slugs, or broken inputs.
-- Publication uses a positive allowlist. A newly tracked private file does not become public by default.
+- Deterministic tools prefer `--check` / dry-run and fail closed on missing
+  identity, duplicate slugs, or broken publication inputs.
+- Publication uses a positive allowlist. A newly tracked private file does
+  not become public by default.
 
 ## MindGraph retrieval
 
-MindGraph is an optional public component and is not included in this first vNext core. When the retrieval engine is present, returned chunks are nominations. Inspect the underlying note before treating a result as true.
+This vNext slice includes a bounded MindGraph engine snapshot under
+`mindgraph/`. Its base installation provides local Markdown parsing, FTS5
+lexical retrieval, provenance models, and graph traversal. Sentence-transformer
+semantic retrieval and the MCP transports remain optional installation
+profiles; they are not required for the MainFrame lifecycle core.
 
-## Evidence in this tree
+MindGraph returns nominations, not truth, verification, lifecycle authority,
+approval, or factual adjudication. Inspect the underlying note and the
+applicable MainFrame authority before relying on a result. Host-specific
+absolute source roots are not serialized in CLI/MCP result rows.
 
-The public tests and synthetic fixtures are meant to be inspected, not just counted:
+## MainFrame Process Evaluation
 
-- `tests/test_lifecycle_identity.py` exercises project/operation identity and failure cases.
-- `tests/test_public_mpe_synthetic.py` exercises the bounded public evaluation profile.
-- `40_operations/mainframe-process-eval/tests/test_process_eval.py` exercises operation-owned evaluator behavior.
-- `tests/test_session_open.py` and `tests/test_session_open_routes.py` exercise session context and routing behavior.
-- `examples/demo-mainframe/` provides synthetic project, operation, and evaluation fixtures.
+The portable engine lives at `40_operations/mainframe-process-eval/`. Generic
+lifecycle substrate stays at the repository root. Raw evaluation evidence
+stays local. Public methodology, identity, and a bounded synthetic loop-eval
+scoring path are included; private migration archaeology, outputs, receipts,
+and traces are not.
 
-The public branch is also exercised in GitHub Actions using the same public-core test and CLI surfaces.
+The installed private MainFrame uses a larger `process-eval preflight` pack
+involving additional optional operational tools. That full pack is not claimed
+as publicly reproducible in this vNext slice.
 
 ## What is deliberately not included
 
-- Private knowledge bases, inbox contents, and archives
-- Live focus, handoff, or telemetry state
+- Private knowledge bases, inboxes, and archives
+- Live focus/handoff/telemetry state
 - Private project contents
 - Workstation UI
 - Real evaluation outputs, transcripts, and baselines
 - Private Git history
-- The private-to-public exporter itself
+- The private-to-public exporter itself (it stays on the private owner)
+
+## Demonstrated properties
+
+These are backed by inspectable tests in this tree:
+
+- Lifecycle zones have explicit contracts
+- Project and operation types share one identity namespace
+- Duplicate identity fails closed
+- Missing authority fails closed
+- `bin/process-eval` is a shim over operation-owned code
+- Publication candidates are exact allowlisted file sets
+- Synthetic examples are labelled synthetic
 
 ## Limitations
 
 - This is not an autonomous agent framework or enterprise orchestrator.
-- Full process-eval `preflight` talks to adjacent MainFrame tools; some steps are machine-bound and are outside the bounded public profile.
-- MindGraph, Workstation, and many operator CLIs are not in this first vNext core.
-- `session-open` intentionally fails closed when local `STATE.md` authority is absent.
-- No claim is made that a private MainFrame is healthy or that Git contains evaluation history.
+- Full process-eval **preflight** talks to adjacent MainFrame tools; some
+  steps are machine-bound and will skip or fail closed without local setup.
+- MindGraph semantic and MCP extras are optional and are not part of the
+  dependency-light MainFrame core installation.
+- No claim is made that a private MainFrame is healthy or that Git contains
+  evaluation history.
 
-## Publication boundary
+## How this public tree is produced
 
-The public repository keeps its own Git history. A private exporter builds a fresh candidate from an exact private source identity, a positive manifest, and curated public variants. Publication remains a deliberate PR into this repository rather than a mirror or history copy.
+A private exporter (`bin/public-export` on `camerontjs-dot/mainframe-live`)
+builds a fresh directory from an exact private SHA, a positive manifest, and
+named transforms. It never copies `.git`. Publication remains a human PR
+onto public `camerontjs-dot/MainFrame`.
+
+## Setup
+
+```bash
+git clone https://github.com/camerontjs-dot/MainFrame.git
+python3 bin/process-eval --help
+uvx --with pytest pytest tests/test_lifecycle_identity.py tests/test_process_eval_shim.py -q
+```
+
+There is no required cloud account. Local notes you add under lifecycle
+directories stay yours.
