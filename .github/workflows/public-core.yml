@@ -21,11 +21,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pytest
-        run: python -m pip install --disable-pip-version-check pytest
-
+      - name: Install pytest and public MindGraph core
+        run: |
+          python -m pip install --disable-pip-version-check pytest
+          python -m pip install --disable-pip-version-check -e 'mindgraph[dev]'
       - name: Run public tests
         run: python -m pytest tests 40_operations/mainframe-process-eval/tests -q
+
+      - name: Run MindGraph core tests
+        run: python -m pytest mindgraph/tests --ignore=mindgraph/tests/test_mcp.py --ignore=mindgraph/tests/test_shared_mcp.py -q
 
       - name: Exercise public CLIs
         run: |
